@@ -1,0 +1,93 @@
+services:
+
+  # PostgreSQL 16 — source of truth for roster, mapping, and AuthZ (NFR-9).
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: discord_support_hub
+      POSTGRES_USER: hub
+      POSTGRES_PASSWORD: hub_dev_password_change_me
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hub -d discord_support_hub"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Valkey 8 — cache + coordination (queue, locks). Never source of truth.
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Migration runner — runs once and exits.
+  migrate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: builder
+    command: ["/out/migrate"]
+    environment:
+      POSTGRES_DSN: "postgres://hub:hub_dev_password_change_me@postgres:5432/discord_support_hub?sslmode=disable"
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # API server.
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: api
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - ../.env
+    environment:
+      POSTGRES_DSN: "postgres://hub:hub_dev_password_change_me@postgres:5432/discord_support_hub?sslmode=disable"
+      VALKEY_ADDR: "valkey:6379"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/livez || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Worker — asynq task processor.
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: worker
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      VALKEY_ADDR: "valkey:6379"
+    depends_on:
+      valkey:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  postgres_data:

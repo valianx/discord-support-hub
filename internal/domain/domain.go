@@ -1,0 +1,156 @@
+// Package domain contains pure business entities matching the data model.
+// This package MUST NOT import any infrastructure packages (store, queue, discord, etc.).
+// The import-boundary test enforces this constraint (AC-3).
+package domain
+
+import "time"
+
+// UserType classifies a user as either an internal agent or an external collaborator.
+type UserType string
+
+const (
+	UserTypeAgent        UserType = "agent"
+	UserTypeCollaborator UserType = "collaborator"
+)
+
+// SpaceLifecycleState represents the lifecycle of a merchant's support space (FR-7).
+type SpaceLifecycleState string
+
+const (
+	SpaceLifecycleActive   SpaceLifecycleState = "active"
+	SpaceLifecycleResolved SpaceLifecycleState = "resolved"
+	SpaceLifecycleArchived SpaceLifecycleState = "archived"
+)
+
+// ACLState tracks the fail-closed ACL projection status (NFR-4).
+// A space is only treated as accessible when acl_state = ACLStateApplied.
+type ACLState string
+
+const (
+	ACLStatePending  ACLState = "pending"
+	ACLStateApplied  ACLState = "applied"
+	ACLStateDegraded ACLState = "degraded"
+	ACLStateFailed   ACLState = "failed"
+)
+
+// SpaceMemberRole is the only role a collaborator can hold within a space.
+// Agents are not listed in space_members; they access all spaces via the category-level role.
+type SpaceMemberRole string
+
+const SpaceMemberRoleCollaborator SpaceMemberRole = "collaborator"
+
+// JobStatus mirrors asynq task state in Postgres so callers can poll authoritatively.
+type JobStatus string
+
+const (
+	JobStatusPending   JobStatus = "pending"
+	JobStatusActive    JobStatus = "active"
+	JobStatusCompleted JobStatus = "completed"
+	JobStatusRetrying  JobStatus = "retrying"
+	JobStatusArchived  JobStatus = "archived"
+)
+
+// ExpulsionScope controls how far a collaborator removal reaches (FR-19).
+type ExpulsionScope string
+
+const (
+	ExpulsionScopeChannel ExpulsionScope = "channel" // revoke overwrite only (default)
+	ExpulsionScopeServer  ExpulsionScope = "server"  // also remove from guild
+)
+
+// Merchant is a customer that owns exactly one support space (1:1, enforced by UNIQUE).
+// Collaborators are NOT owned by a merchant; their tenant associations derive from space_members.
+type Merchant struct {
+	ID          string
+	ExternalRef string
+	Name        string
+	HelpDeskURL *string
+	IsActive    bool
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// User is an identity in the roster — either an internal agent or an external collaborator.
+// A user is NOT bound to a merchant by column; a collaborator's merchant associations derive
+// from space membership (space_members -> spaces -> merchant), reflecting that one collaborator
+// may hold access across several merchants' spaces. Authorization is always resolved against
+// this table, never against the Discord role (NFR-13).
+type User struct {
+	ID            string
+	Type          UserType
+	IsAdmin       bool // meaningful only for agents; enforced by DB CHECK constraint
+	DiscordUserID *string
+	Email         *string
+	DisplayName   *string
+	ProvisionedAt *time.Time
+	IsActive      bool
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+// Space is the private support channel per merchant (channel mode only in v1, FR-2).
+// The 1:1 merchant↔space constraint is enforced by UNIQUE(merchant_id) on the spaces table.
+type Space struct {
+	ID                string
+	MerchantID        string
+	DiscordChannelID  *string // nil until the worker provisions the channel
+	DiscordCategoryID *string
+	Name              string
+	LifecycleState    SpaceLifecycleState
+	ACLState          ACLState // fail-closed: only "applied" is accessible
+	WelcomeMessageID  *string
+	LastActivityAt    *time.Time
+	ReconciledAt      *time.Time
+	DriftCount        int
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	ArchivedAt        *time.Time
+}
+
+// SpaceMember records a collaborator's desired access to one space (FR-3, FR-4).
+// This is desired state; the worker projects it onto Discord as a per-user permission overwrite.
+// The reconciler revokes any Discord overwrite not backed by a row here (NFR-5).
+type SpaceMember struct {
+	ID               string
+	SpaceID          string
+	UserID           string
+	Role             SpaceMemberRole
+	OverwriteApplied bool
+	InvitedBy        *string
+	CreatedAt        time.Time
+	RevokedAt        *time.Time
+}
+
+// AuditEntry is an append-only record of provisioning, membership, lifecycle, and expulsion
+// actions (FR-14). Stores references (user id, action), never raw tokens.
+type AuditEntry struct {
+	ID            int64
+	ActorAPIKeyID *string
+	ActorUserID   *string
+	Action        string
+	MerchantID    *string
+	SpaceID       *string
+	TargetUserID  *string
+	Scope         *ExpulsionScope
+	Detail        map[string]any
+	CreatedAt     time.Time
+}
+
+// Job mirrors asynq task state in Postgres so callers can poll an authoritative source
+// without reaching into Valkey (which is never source of truth).
+type Job struct {
+	ID          string
+	TaskID      string
+	Kind        string
+	Queue       string
+	Status      JobStatus
+	MerchantID  *string
+	SpaceID     *string
+	UserID      *string
+	Payload     map[string]any
+	Error       *string
+	RetryCount  int
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	CompletedAt *time.Time
+}
