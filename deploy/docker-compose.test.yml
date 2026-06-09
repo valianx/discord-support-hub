@@ -19,21 +19,32 @@ x-app-env: &app-env
   VALKEY_ADDR: "valkey:6379"
   LOG_LEVEL: "info"
 
-  # TEST ONLY — dummy Discord credentials.
-  # Real provisioning (channel/role creation) will fail at Discord; all API
-  # endpoints and the UI work normally with these values.
-  DISCORD_BOT_TOKEN: "test-bot-token-not-real"
-  DISCORD_GUILD_ID: "100000000000000001"
-  DISCORD_AGENT_ROLE_ID: "100000000000000002"  # must differ from guild id (boot guard)
-  DISCORD_CATEGORY_ID: "100000000000000003"
+  # Discord credentials. Defaults are TEST/dummy — with them the UI, auth, and
+  # listing work, but provisioning jobs are accepted (202) and then FAIL at
+  # Discord. To provision for REAL: copy deploy/.env.demo.example to
+  # deploy/.env.demo, fill in your real values, and run compose with
+  #   docker compose --env-file deploy/.env.demo -f deploy/docker-compose.test.yml up -d --build
+  # (deploy/.env.demo is git-ignored — your bot token never touches git.)
+  DISCORD_BOT_TOKEN: "${DISCORD_BOT_TOKEN:-test-bot-token-not-real}"
+  DISCORD_GUILD_ID: "${DISCORD_GUILD_ID:-100000000000000001}"
+  DISCORD_AGENT_ROLE_ID: "${DISCORD_AGENT_ROLE_ID:-100000000000000002}"  # must differ from guild id (boot guard)
+  DISCORD_CATEGORY_ID: "${DISCORD_CATEGORY_ID:-100000000000000003}"
 
-  # TEST ONLY — fixed AES-256-GCM key (base64-encoded 32 bytes).
-  # Never use this value in production. Generate your own: openssl rand -base64 32
-  ENCRYPTION_KEY: "Gk7yssW60Qb46DN6tZ97l9gxxuvXdlsvMU/n2SI5hgo="  # TEST ONLY
+  # OAuth2 (collaborator onboarding) — empty by default; set in deploy/.env.demo if needed.
+  DISCORD_OAUTH_CLIENT_ID: "${DISCORD_OAUTH_CLIENT_ID:-}"
+  DISCORD_OAUTH_CLIENT_SECRET: "${DISCORD_OAUTH_CLIENT_SECRET:-}"
+  DISCORD_OAUTH_REDIRECT_URL: "${DISCORD_OAUTH_REDIRECT_URL:-http://localhost:3000/v1/oauth/discord/callback}"
 
-  # TEST ONLY — fixed HMAC secret (hex-encoded 32 bytes / 64 hex chars).
-  # Never use this value in production. Generate your own: openssl rand -hex 32
-  OAUTH_HMAC_SECRET: "d2344cc14d716cd4d1c360257b68876ad15bd6ff20126cefe2135c5acd021212"  # TEST ONLY
+  # Operator brand: agent nickname suffix (e.g. "- Acme"). Empty = marking off.
+  AGENT_NICKNAME_SUFFIX: "${AGENT_NICKNAME_SUFFIX:-}"
+
+  # AES-256-GCM key (base64 32 bytes) — TEST default; override in deploy/.env.demo.
+  # Generate your own: openssl rand -base64 32
+  ENCRYPTION_KEY: "${ENCRYPTION_KEY:-Gk7yssW60Qb46DN6tZ97l9gxxuvXdlsvMU/n2SI5hgo=}"
+
+  # HMAC secret (hex 32 bytes) — TEST default; override in deploy/.env.demo.
+  # Generate your own: openssl rand -hex 32
+  OAUTH_HMAC_SECRET: "${OAUTH_HMAC_SECRET:-d2344cc14d716cd4d1c360257b68876ad15bd6ff20126cefe2135c5acd021212}"
 
   # Disable the reconcile sweep in the test stack (no real Discord to sweep).
   RECONCILE_SWEEP_CRON: ""
