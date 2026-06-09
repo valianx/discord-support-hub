@@ -35,3 +35,6 @@ Thumbs.db
 /tmp/
 *.local.yaml
 *.local.yml
+
+# Agent workspaces
+/workspaces/
