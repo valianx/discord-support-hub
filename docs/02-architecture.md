@@ -250,9 +250,14 @@ The auth middleware (Gin) extracts the bearer token, hashes it, looks up the act
 
 After authentication, **authorization resolves against Postgres**, never against Discord:
 
-- The middleware/handler loads the relevant roster facts (`users.type`, `users.is_admin`, `space_members`) and decides:
-  - `POST /agents`, `DELETE /agents/{id}` → require **Admin** (`is_admin = true`) — the roster-management safeguard.
-  - Invite / expel / lifecycle → require **Agent** (or the backoffice service principal acting on an agent's behalf).
+- **Control-plane authority.** Roster management and the other control-plane operations require *control-plane authority*, which is conferred by **either** of two Postgres-anchored facts:
+  - a **service API key** whose `api_keys.scope = backoffice` — a server-side value set at key creation (never client-supplied), representing the trusted backoffice caller (§5.1); **or**
+  - a future **user/session principal** with `users.is_admin = true`.
+
+  Both are resolved against Postgres; neither is derived from any client-controllable input (header, body, or a self-asserted role), so there is no privilege-escalation path (CWE-639). The single logical caller in v1 is the backoffice service key.
+- The middleware/handler loads the relevant roster facts (the authenticated principal's `api_keys.scope`, or `users.type` / `users.is_admin` / `space_members`) and decides:
+  - `POST /agents`, `DELETE /agents/{id}`, `GET /agents` → require **control-plane authority** (backoffice-scoped key or `is_admin` user) — the roster-management safeguard.
+  - Invite / expel / lifecycle → require the backoffice service principal (or, later, an Agent/Admin user principal).
   - Read endpoints scoped so a request can only see what the principal is entitled to.
 - **Collaborator entitlement is per-space, not per-merchant.** "Is this principal entitled to space S?" resolves to "does a `space_members` row link this user to S?" — there is no `user → merchant` binding to scope against. A collaborator may hold rows for spaces across several merchants and is entitled only to those. Merchant ownership applies to the **space** (each space has one merchant), not to collaborator scoping.
 - The decision is a pure function of Postgres state. Even if Discord shows someone with the Agent role, if Postgres says `type=collaborator` they are **not** authorized. This is `MANAGE_ROLES` reserved-to-the-bot (NFR-13) made concrete: the Discord role is not a grant, it is a projection.

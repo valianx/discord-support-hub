@@ -3,6 +3,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"strconv"
@@ -118,6 +119,23 @@ func (c *Config) RequirePostgresDSN() error {
 func (c *Config) RequireEncryptionKey() error {
 	if c.EncryptionKey == "" {
 		return fmt.Errorf("config: ENCRYPTION_KEY is required but not set")
+	}
+	return nil
+}
+
+// ValidateEncryptionKey returns an error when ENCRYPTION_KEY is absent or does not
+// decode to exactly 32 bytes (AES-256). Call this at startup before first use so
+// misconfiguration fails loudly rather than on the first encrypt/decrypt call (NFR-6).
+func (c *Config) ValidateEncryptionKey() error {
+	if c.EncryptionKey == "" {
+		return fmt.Errorf("config: ENCRYPTION_KEY is required but not set")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(c.EncryptionKey)
+	if err != nil {
+		return fmt.Errorf("config: ENCRYPTION_KEY is not valid base64: %w", err)
+	}
+	if len(decoded) != 32 {
+		return fmt.Errorf("config: ENCRYPTION_KEY must decode to exactly 32 bytes (AES-256), got %d", len(decoded))
 	}
 	return nil
 }

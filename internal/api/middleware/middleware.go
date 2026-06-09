@@ -1,19 +1,36 @@
 // Package middleware provides Gin middleware for the API layer.
-// RequestID and Recovery are real implementations.
-// Auth (Layer A) and Idempotency are pass-through stubs pending M1 implementation.
+//
+// RequestID and Recovery are real implementations used from M0.
+// Auth (Layer A) is the real API-key authentication middleware (implemented M1).
+// Idempotency is a pass-through stub until M2.
 package middleware
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/valianx/discord-support-hub/internal/authz"
+	"github.com/valianx/discord-support-hub/internal/domain"
+	"github.com/valianx/discord-support-hub/internal/store"
 )
 
-const requestIDHeader = "X-Request-ID"
-const requestIDKey = "request_id"
+const (
+	requestIDHeader = "X-Request-ID"
+	requestIDKey    = "request_id"
+	principalKey    = "principal"
+)
+
+// authStore is the minimal store surface Layer A needs, making it easy to mock in tests.
+type authStore interface {
+	LookupActiveAPIKeyByHash(ctx context.Context, hash []byte) (*domain.APIKey, error)
+	TouchAPIKeyLastUsed(ctx context.Context, id string) error
+}
 
 // RequestID generates a unique request id for each incoming request and stores it in
 // the Gin context and the response header. Downstream handlers use it for log correlation.
@@ -51,26 +68,108 @@ func Recovery() gin.HandlerFunc {
 	}
 }
 
-// Auth is a pass-through stub for Layer A (service API key authentication).
-// In M1 this will: extract the Bearer token, hash it, look up api_keys, inject Principal.
-// TODO(M1): implement real API key authentication.
-func Auth() gin.HandlerFunc {
+// Auth returns the Layer A authentication middleware.
+//
+// It extracts "Authorization: Bearer <key>", hashes the raw key with SHA-256,
+// looks up the active api_keys row in Postgres, and injects a Principal into the
+// Gin context. Requests with a missing, invalid, or revoked key are rejected 401
+// before any handler executes (docs/02-architecture.md §5.1).
+func Auth(s store.Store) gin.HandlerFunc {
+	return authMiddleware(s)
+}
+
+// authMiddleware accepts the narrow interface for easier unit testing.
+func authMiddleware(s authStore) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// TODO(M1): extract bearer token, hash, look up api_keys, inject Principal.
-		// For M0 we let all requests through so the skeleton compiles and routes respond.
+		rawKey, ok := extractBearer(c.GetHeader("Authorization"))
+		if !ok {
+			abortUnauthorized(c, "missing or malformed Authorization header")
+			return
+		}
+
+		hash := authz.HashAPIKey(rawKey)
+		ctx := c.Request.Context()
+
+		apiKey, err := s.LookupActiveAPIKeyByHash(ctx, hash)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				abortUnauthorized(c, "invalid or revoked api key")
+				return
+			}
+			// Unexpected store error — fail closed (deny access, log, 500).
+			reqID, _ := c.Get(requestIDKey)
+			slog.ErrorContext(ctx, "auth: store error during key lookup",
+				"request_id", reqID, "error", err)
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+				"code":    "internal_error",
+				"message": "authentication service unavailable",
+			})
+			return
+		}
+
+		// Update last_used_at asynchronously; failure is non-fatal.
+		go func() {
+			if err := s.TouchAPIKeyLastUsed(context.Background(), apiKey.ID); err != nil {
+				slog.Warn("auth: could not update last_used_at", "key_id", apiKey.ID, "error", err)
+			}
+		}()
+
+		p := &authz.Principal{
+			Type:     authz.PrincipalTypeService,
+			KeyID:    apiKey.ID,
+			KeyScope: apiKey.Scope,
+			// IsAdmin defaults false for service keys not bound to an admin user.
+			// Handler-level enrichment (e.g. user lookup) can set it if needed.
+		}
+		c.Set(principalKey, p)
 		c.Next()
 	}
 }
 
+// GetPrincipal retrieves the authenticated Principal from the Gin context.
+// Returns nil when no principal has been injected (exempt routes, or unauthenticated).
+func GetPrincipal(c *gin.Context) *authz.Principal {
+	v, exists := c.Get(principalKey)
+	if !exists {
+		return nil
+	}
+	p, _ := v.(*authz.Principal)
+	return p
+}
+
 // Idempotency is a pass-through stub for edge-level idempotency (NFR-3, §4.1).
-// In M1/M2 this will: read Idempotency-Key header, check idempotency_keys table,
-// replay stored response on a hit, or insert a pending record on a miss.
-// TODO(M1/M2): implement real idempotency replay.
+// TODO(M2): read Idempotency-Key header, check idempotency_keys table, replay stored
+// response on a hit, insert a pending record on a miss.
 func Idempotency() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// TODO(M1/M2): read Idempotency-Key, check idempotency_keys table.
 		c.Next()
 	}
+}
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+// extractBearer parses "Bearer <token>" from an Authorization header value.
+func extractBearer(header string) (string, bool) {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return "", false
+	}
+	parts := strings.SplitN(header, " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
+		return "", false
+	}
+	token := strings.TrimSpace(parts[1])
+	if token == "" {
+		return "", false
+	}
+	return token, true
+}
+
+func abortUnauthorized(c *gin.Context, msg string) {
+	c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+		"code":    "unauthorized",
+		"message": msg,
+	})
 }
 
 func newRequestID() string {

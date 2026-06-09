@@ -17,6 +17,7 @@ import (
 	"github.com/valianx/discord-support-hub/internal/api"
 	"github.com/valianx/discord-support-hub/internal/config"
 	"github.com/valianx/discord-support-hub/internal/observability"
+	"github.com/valianx/discord-support-hub/internal/queue"
 	"github.com/valianx/discord-support-hub/internal/store/postgres"
 )
 
@@ -38,6 +39,10 @@ func main() {
 		slog.Error("startup: missing required config", "error", err)
 		os.Exit(1)
 	}
+	if err = cfg.ValidateEncryptionKey(); err != nil {
+		slog.Error("startup: invalid encryption key — fix ENCRYPTION_KEY before starting", "error", err)
+		os.Exit(1)
+	}
 
 	ctx := context.Background()
 
@@ -57,11 +62,19 @@ func main() {
 	})
 	defer rdb.Close()
 
-	// Build the Gin router with the real pingers for the readiness probe.
+	// Queue client for handlers that enqueue async jobs (e.g. agent role projection).
+	queueClient := queue.NewClient(cfg.ValkeyAddr, cfg.ValkeyPassword, cfg.ValkeyDB)
+	defer queueClient.Close() //nolint:errcheck
+
+	// Build the Gin router with real auth and handler dependencies.
 	router := api.NewRouter(api.RouterConfig{
-		CORSAllowedOrigins: cfg.CORSAllowedOrigins,
-		PGPinger:           pg,
-		RedisPinger:        &redisPinger{rdb},
+		CORSAllowedOrigins:      cfg.CORSAllowedOrigins,
+		Store:                   pg,
+		QueueClient:             queueClient,
+		DiscordOAuthClientID:    cfg.DiscordOAuthClientID,
+		DiscordOAuthRedirectURL: cfg.DiscordOAuthRedirectURL,
+		PGPinger:                pg,
+		RedisPinger:             &redisPinger{rdb},
 	})
 
 	srv := &http.Server{

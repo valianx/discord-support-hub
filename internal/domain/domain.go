@@ -136,6 +136,39 @@ type AuditEntry struct {
 	CreatedAt     time.Time
 }
 
+// APIKey is a service bearer credential (Layer A). Only the hash is persisted;
+// the raw key is shown once at creation and never stored (§5.1).
+type APIKey struct {
+	ID         string
+	Name       string
+	KeyHash    []byte // SHA-256 of the raw key
+	Scope      string
+	CreatedAt  time.Time
+	LastUsedAt *time.Time
+	RevokedAt  *time.Time
+}
+
+// IsActive reports whether the key has not been revoked.
+func (k *APIKey) IsActive() bool {
+	return k.RevokedAt == nil
+}
+
+// OAuthToken stores an encrypted per-user OAuth2 token (NFR-6, §7).
+// Only ciphertext + nonce + key version are persisted; plaintext never hits the DB.
+type OAuthToken struct {
+	ID                   string
+	UserID               string
+	AccessTokenCipher    []byte
+	AccessTokenNonce     []byte
+	RefreshTokenCipher   []byte // nil if no refresh token
+	RefreshTokenNonce    []byte // nil if no refresh token
+	EncryptionKeyVersion int
+	Scopes               string
+	ExpiresAt            *time.Time
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
+}
+
 // Job mirrors asynq task state in Postgres so callers can poll an authoritative source
 // without reaching into Valkey (which is never source of truth).
 type Job struct {
