@@ -6,6 +6,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/valianx/discord-support-hub/internal/api/handlers"
 	"github.com/valianx/discord-support-hub/internal/api/middleware"
+	"github.com/valianx/discord-support-hub/internal/cache"
 	"github.com/valianx/discord-support-hub/internal/observability"
 	"github.com/valianx/discord-support-hub/internal/queue"
 	"github.com/valianx/discord-support-hub/internal/store"
@@ -23,6 +24,9 @@ type RouterConfig struct {
 
 	// QueueClient is the asynq client used by handlers that enqueue jobs.
 	QueueClient *queue.Client
+
+	// Cache is the Valkey read cache. Handlers use it for space reads.
+	Cache cache.Cache
 
 	// Discord config needed by handlers.
 	DiscordOAuthClientID    string
@@ -64,6 +68,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	h := handlers.NewHandlers(handlers.Config{
 		Store:                   cfg.Store,
 		QueueClient:             cfg.QueueClient,
+		Cache:                   cfg.Cache,
 		DiscordOAuthClientID:    cfg.DiscordOAuthClientID,
 		DiscordOAuthRedirectURL: cfg.DiscordOAuthRedirectURL,
 	})

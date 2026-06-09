@@ -581,6 +581,74 @@ func scanIdempotencyKey(row interface{ Scan(dest ...any) error }) (*domain.Idemp
 	return &ik, nil
 }
 
+// ─── Audit log ───────────────────────────────────────────────────────────────
+
+// InsertAuditEntry appends a row to audit_log.
+// Detail must never contain secrets (NFR-6, FR-14).
+func (s *Store) InsertAuditEntry(ctx context.Context, p store.InsertAuditEntryParams) error {
+	detailJSON, err := marshalPayload(p.Detail)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO audit_log (actor_api_key, actor_user_id, action, merchant_id, space_id, target_user_id, detail)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		p.ActorAPIKeyID, p.ActorUserID, p.Action, p.MerchantID, p.SpaceID, p.TargetUserID, detailJSON,
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: insert audit entry: %w", err)
+	}
+	return nil
+}
+
+// ListSpaces returns spaces with optional filters and cursor-based pagination.
+// Results are ordered by created_at ASC.
+func (s *Store) ListSpaces(ctx context.Context, p store.ListSpacesParams) ([]*domain.Space, error) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+
+	// Build the query dynamically with argument counting.
+	args := make([]any, 0, 4)
+	where := " WHERE 1=1"
+
+	if p.LifecycleState != nil {
+		args = append(args, *p.LifecycleState)
+		where += fmt.Sprintf(" AND lifecycle_state = $%d", len(args))
+	}
+	if p.MerchantID != nil {
+		args = append(args, *p.MerchantID)
+		where += fmt.Sprintf(" AND merchant_id = $%d", len(args))
+	}
+	if p.Cursor != nil {
+		args = append(args, *p.Cursor)
+		where += fmt.Sprintf(" AND created_at > $%d", len(args))
+	}
+
+	args = append(args, limit)
+	query := `SELECT id, merchant_id, discord_channel_id, discord_category_id, name,
+		       lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		       reconciled_at, drift_count, created_at, updated_at, archived_at
+		  FROM spaces` + where + fmt.Sprintf(` ORDER BY created_at ASC LIMIT $%d`, len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list spaces: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*domain.Space
+	for rows.Next() {
+		sp, err := scanSpace(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sp)
+	}
+	return out, rows.Err()
+}
+
 // ─── Outbox ───────────────────────────────────────────────────────────────────
 
 // CreateSpaceWithOutbox writes the desired-state Space row AND an outbox row in
@@ -660,6 +728,29 @@ func (s *Store) ListPendingOutbox(ctx context.Context, limit int) ([]*domain.Out
 		out = append(out, ob)
 	}
 	return out, rows.Err()
+}
+
+// UpdateOutboxPayload replaces the payload on an outbox row identified by its
+// idempotency_key. Only updates rows that have not yet been enqueued (enqueued_at IS NULL)
+// so the relay does not pick up a stale payload.
+func (s *Store) UpdateOutboxPayload(
+	ctx context.Context,
+	idempotencyKey string,
+	payload map[string]any,
+) error {
+	payloadJSON, err := marshalPayload(payload)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx,
+		`UPDATE outbox SET payload = $1
+		 WHERE idempotency_key = $2 AND enqueued_at IS NULL`,
+		payloadJSON, idempotencyKey,
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: update outbox payload: %w", err)
+	}
+	return nil
 }
 
 // StampOutboxEnqueued sets enqueued_at = now() on the named rows.

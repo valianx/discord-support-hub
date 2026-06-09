@@ -65,6 +65,10 @@ func (s *outboxFakeStore) StampOutboxEnqueued(_ context.Context, ids []string) e
 	return nil
 }
 
+func (s *outboxFakeStore) UpdateOutboxPayload(_ context.Context, _ string, _ map[string]any) error {
+	return nil
+}
+
 // outboxFakeStore must also implement the remaining store.Store methods inherited
 // from workerFakeStore — those already panic, which is correct for tests that
 // only exercise the outbox path. The extra methods below override the ones that
@@ -182,6 +186,9 @@ func (s *outboxAtomicStore) ListPendingOutbox(_ context.Context, _ int) ([]*doma
 	return nil, nil
 }
 func (s *outboxAtomicStore) StampOutboxEnqueued(_ context.Context, _ []string) error { return nil }
+func (s *outboxAtomicStore) UpdateOutboxPayload(_ context.Context, _ string, _ map[string]any) error {
+	return nil
+}
 
 func (s *outboxAtomicStore) CreateSpaceWithOutbox(
 	_ context.Context,

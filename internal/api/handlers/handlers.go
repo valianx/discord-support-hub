@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/valianx/discord-support-hub/internal/cache"
 	"github.com/valianx/discord-support-hub/internal/queue"
 	"github.com/valianx/discord-support-hub/internal/store"
 )
@@ -15,6 +16,7 @@ import (
 type Config struct {
 	Store                   store.Store
 	QueueClient             *queue.Client
+	Cache                   cache.Cache
 	DiscordOAuthClientID    string
 	DiscordOAuthRedirectURL string
 }
@@ -23,15 +25,21 @@ type Config struct {
 type Handlers struct {
 	store                   store.Store
 	queueClient             *queue.Client
+	cache                   cache.Cache
 	discordOAuthClientID    string
 	discordOAuthRedirectURL string
 }
 
 // NewHandlers creates a Handlers instance from the provided config.
 func NewHandlers(cfg Config) *Handlers {
+	c := cfg.Cache
+	if c == nil {
+		c = cache.NoopCache{}
+	}
 	return &Handlers{
 		store:                   cfg.Store,
 		queueClient:             cfg.QueueClient,
+		cache:                   c,
 		discordOAuthClientID:    cfg.DiscordOAuthClientID,
 		discordOAuthRedirectURL: cfg.DiscordOAuthRedirectURL,
 	}

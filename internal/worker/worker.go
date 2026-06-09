@@ -11,8 +11,11 @@ import (
 	"log/slog"
 
 	"github.com/hibiken/asynq"
+	"github.com/valianx/discord-support-hub/internal/cache"
 	"github.com/valianx/discord-support-hub/internal/discord"
+	"github.com/valianx/discord-support-hub/internal/lock"
 	"github.com/valianx/discord-support-hub/internal/queue"
+	"github.com/valianx/discord-support-hub/internal/ratelimit"
 	"github.com/valianx/discord-support-hub/internal/store"
 )
 
@@ -34,6 +37,13 @@ type Config struct {
 	DiscordClient  discord.Client
 	DiscordGuildID string
 	AgentRoleID    string
+
+	// M2b: rate limiter, locker, and cache needed by the provision handler.
+	Limiter           ratelimit.Limiter
+	Locker            lock.Locker
+	Cache             cache.Cache
+	EveryoneRoleID    string // Discord @everyone role id (equals guildID in Discord)
+	DefaultCategoryID string // optional default Discord category for spaces without category_id
 }
 
 // provisionMaxRetry is the MaxRetry for the provision queue. Rate-limit retries are
@@ -101,8 +111,23 @@ func registerHandlers(mux *asynq.ServeMux, cfg Config) {
 	roleHandler := newProjectAgentRoleHandler(cfg.Store, cfg.DiscordClient, cfg.DiscordGuildID, cfg.AgentRoleID)
 	mux.HandleFunc(queue.KindProjectAgentRole, roleHandler)
 
-	// Remaining kinds are stubs pending M2/M3/M4.
-	mux.HandleFunc(queue.KindProvisionSpace, stubHandler(queue.KindProvisionSpace))
+	// M2b: real provision_space handler.
+	// fix(NFR-5): wire AgentRoleID (not guildID) so the category allow targets the Agent role,
+	// and defaultCategory so spaces without category_id still receive the Agent allow.
+	provisionHandler := newProvisionSpaceHandler(provisionSpaceConfig{
+		store:           cfg.Store,
+		discord:         cfg.DiscordClient,
+		limiter:         cfg.Limiter,
+		locker:          cfg.Locker,
+		cache:           cfg.Cache,
+		guildID:         cfg.DiscordGuildID,
+		everyoneRoleID:  cfg.EveryoneRoleID,
+		agentRoleID:     cfg.AgentRoleID,
+		defaultCategory: cfg.DefaultCategoryID,
+	})
+	mux.HandleFunc(queue.KindProvisionSpace, provisionHandler)
+
+	// Remaining kinds are stubs pending M3/M4.
 	mux.HandleFunc(queue.KindInviteCollaborator, stubHandler(queue.KindInviteCollaborator))
 	mux.HandleFunc(queue.KindExpelCollaborator, stubHandler(queue.KindExpelCollaborator))
 	mux.HandleFunc(queue.KindChangeLifecycle, stubHandler(queue.KindChangeLifecycle))
