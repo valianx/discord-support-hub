@@ -24,6 +24,14 @@ type Store interface {
 	// GetMerchantByID returns the merchant for the given id.
 	GetMerchantByID(ctx context.Context, id string) (*domain.Merchant, error)
 
+	// GetMerchantByExternalRef returns the merchant with the given external_ref.
+	// Returns ErrNotFound when no row matches.
+	GetMerchantByExternalRef(ctx context.Context, ref string) (*domain.Merchant, error)
+
+	// ListMerchants returns merchants ordered by created_at ASC with optional filters and
+	// cursor-based pagination. Limit of 0 uses the default page size (50).
+	ListMerchants(ctx context.Context, p ListMerchantsParams) ([]*domain.Merchant, error)
+
 	// --- Users ---
 
 	// CreateUser inserts a new user (agent or collaborator).
@@ -390,6 +398,16 @@ type CreateOutboxParams struct {
 type UpdateSpaceLifecycleParams struct {
 	SpaceID        string
 	LifecycleState domain.SpaceLifecycleState
+}
+
+// ListMerchantsParams carries filter and pagination parameters for ListMerchants.
+type ListMerchantsParams struct {
+	// IsActive filters to active (true) or inactive (false) merchants when non-nil.
+	IsActive *bool
+	// Cursor is the last seen created_at value (ISO-8601) for page continuation.
+	Cursor *string
+	// Limit is the maximum number of rows to return. 0 = default (50).
+	Limit int
 }
 
 // ListAuditEntriesParams carries filters and pagination for the audit log endpoint (FR-14).

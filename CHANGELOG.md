@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Merchant registration** — `POST /merchants` (register a merchant by `external_ref` + `name` (+ optional `help_desk_url`); `409` on duplicate `external_ref`), `GET /merchants` (list, cursor pagination + `is_active` filter), `GET /merchants/{merchantId}` (detail). All control-plane gated. Closes the gap where a merchant could never be created via the API.
+
+### Fixed
+- `POST /merchants/{merchantId}/channels` now returns **`404`** (not `500`) for a non-UUID or absent merchant — a malformed id previously fell through the Postgres `uuid` cast (`22P02`) to a generic 500. A UUID guard maps both malformed and absent ids to a clean `404`.
+
+### Added (continued)
 - **POC backoffice frontend** (`web/poc/`) — a single-view backoffice simulator (Vite + React + TypeScript + Tailwind + shadcn/ui) that drives the control-plane API directly: provision a space, list spaces, invite/expel collaborators, change lifecycle, and watch async job status. It is a **local operator tool** — the operator supplies their own service API key at runtime (held in `sessionStorage`, never committed/deployed), with a Vite dev-proxy to the hub (no CORS in dev), a `connect-src` CSP, and a validated-key connection indicator. Not part of the `v0.1.0` API release.
 
 ## [0.1.0] — 2026-06-09

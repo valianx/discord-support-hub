@@ -31,6 +31,8 @@ security:
   - ServiceApiKey: []
 
 tags:
+  - name: Merchants
+    description: Register and list merchants (external customers). Control-plane only.
   - name: Spaces
     description: Provision and manage per-merchant private spaces (channels).
   - name: Collaborators
@@ -45,6 +47,106 @@ tags:
 paths:
 
   # ----------------------------------------------------------------------- #
+  # MERCHANTS
+  # ----------------------------------------------------------------------- #
+  /merchants:
+    post:
+      tags: [Merchants]
+      operationId: registerMerchant
+      summary: Register a merchant (synchronous).
+      description: |
+        Records a new merchant in Postgres - the authorization source of truth - and returns
+        `201` with the created `Merchant`. This is a synchronous Postgres write with **no Discord
+        side-effect** (a merchant owns a space, but the space is provisioned separately via
+        `POST /merchants/{merchantId}/channels`); there is no job to poll.
+
+        The `id` returned here is the merchant UUID used as `{merchantId}` everywhere else in this
+        API (provisioning, filters, audit). The backoffice should persist it.
+
+        `external_ref` is the backoffice's own stable identifier and is **unique**: a second
+        registration with the same `external_ref` returns `409` (it does not create a duplicate).
+        This makes registration safe to retry on the `external_ref` natural key.
+
+        Control-plane authority required (backoffice-scoped service key, NFR-13).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterMerchantRequest'
+      responses:
+        '201':
+          description: Merchant registered. The `id` is the merchant UUID used as `{merchantId}`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Merchant' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: |
+            A merchant with this `external_ref` already exists (UNIQUE constraint), or an
+            `Idempotency-Key` was reused with a different body.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    get:
+      tags: [Merchants]
+      operationId: listMerchants
+      summary: List merchants (cursor pagination).
+      description: |
+        Returns a page of merchants ordered by `created_at` ascending, consistent with the other
+        list endpoints (`GET /channels`, `GET /directory`, `GET /audit`). Cursor pagination:
+        pass the returned `next_cursor` back as `cursor` to fetch the next page; a `null`
+        `next_cursor` means the last page. Control-plane authority required.
+      parameters:
+        - name: is_active
+          in: query
+          required: false
+          description: When set, filters to active (`true`) or inactive (`false`) merchants.
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of merchants.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Merchant' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /merchants/{merchantId}:
+    get:
+      tags: [Merchants]
+      operationId: getMerchant
+      summary: Merchant detail by UUID id.
+      description: |
+        Returns the merchant identified by the UUID `{merchantId}` (the `id` returned by
+        `POST /merchants`). Returns `404` with a `{code, message}` body when no merchant has that
+        id (including when `{merchantId}` is not a well-formed UUID). Control-plane authority required.
+      parameters:
+        - $ref: '#/components/parameters/MerchantId'
+      responses:
+        '200':
+          description: Merchant detail.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Merchant' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ----------------------------------------------------------------------- #
   # SPACES
   # ----------------------------------------------------------------------- #
   /merchants/{merchantId}/channels:
@@ -56,6 +158,11 @@ paths:
         Records desired state and enqueues a provisioning job. The worker creates a Discord
         channel already denied to `@everyone` (fail-closed, NFR-4), applies the category-level
         Agent allow, and persists `discord_channel_id`. Returns `202` with a job handle.
+
+        `{merchantId}` is the merchant **UUID `id`** returned by `POST /merchants` (not the
+        `external_ref`). The merchant must already exist: register it first with `POST /merchants`.
+        When no merchant has this id - or `{merchantId}` is not a well-formed UUID - the response
+        is `404` with a clean `{code: "not_found", message}` body, never `500`.
       parameters:
         - $ref: '#/components/parameters/MerchantId'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -70,7 +177,13 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
+        '404':
+          description: |
+            No merchant exists with the given `{merchantId}` UUID (register one first via
+            `POST /merchants`), or `{merchantId}` is not a well-formed UUID. Body is `{code, message}`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '409': { $ref: '#/components/responses/Conflict' }
 
   /channels:
@@ -519,6 +632,10 @@ components:
       name: merchantId
       in: path
       required: true
+      description: |
+        The merchant **UUID `id`** (the `id` returned by `POST /merchants`), NOT the
+        backoffice `external_ref`. A value that is not a well-formed UUID, or one that matches
+        no merchant, resolves to `404`.
       schema: { type: string, format: uuid }
     SpaceId:
       name: id
@@ -592,6 +709,45 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
 
   schemas:
+
+    RegisterMerchantRequest:
+      type: object
+      description: Body for POST /merchants. `external_ref` is the backoffice's stable id and is unique.
+      required: [external_ref, name]
+      properties:
+        external_ref:
+          type: string
+          minLength: 1
+          description: |
+            Stable identifier from the backoffice. Unique across merchants; a duplicate value
+            returns `409`. Lets the backoffice address a merchant idempotently by its own id.
+        name:
+          type: string
+          minLength: 1
+          description: Human-readable merchant name.
+        help_desk_url:
+          type: [string, 'null']
+          format: uri
+          description: Optional per-merchant help-desk link (FR-15 static parameterization).
+
+    Merchant:
+      type: object
+      description: An external customer. Owns exactly one space (1:1); see POST /merchants/{merchantId}/channels.
+      required: [id, external_ref, name, is_active, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Merchant UUID. This is the `{merchantId}` used elsewhere in the API.
+        external_ref:
+          type: string
+          description: The backoffice's stable id (unique).
+        name: { type: string }
+        help_desk_url:
+          type: [string, 'null']
+          format: uri
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
 
     SpaceLifecycleState:
       type: string
