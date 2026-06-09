@@ -83,6 +83,17 @@ func (s *isolationStore) UpdateSpaceReconciledAt(_ context.Context, _ string) er
 	return nil
 }
 
+// ListActiveProvisionedSpaces satisfies the storeReconcile interface extension added in M5.
+// The hermetic isolation tests operate on individual spaces via ReconcileSpace and do not
+// exercise the full-guild sweep path, so this returns all spaces in the fake.
+func (s *isolationStore) ListActiveProvisionedSpaces(_ context.Context) ([]*domain.Space, error) {
+	out := make([]*domain.Space, 0, len(s.spaces))
+	for _, sp := range s.spaces {
+		out = append(out, sp)
+	}
+	return out, nil
+}
+
 func (s *isolationStore) SetSpaceMemberOverwriteApplied(_ context.Context, id string) (*domain.SpaceMember, error) {
 	for _, members := range s.members {
 		for _, sm := range members {

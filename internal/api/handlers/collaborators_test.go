@@ -297,6 +297,11 @@ func (f *collaboratorFakeStore) GetJobBySpaceIDAndKind(_ context.Context, _, _ s
 	return nil, store.ErrNotFound
 }
 
+// ListActiveProvisionedSpaces satisfies store.Store (added in M5 for the scheduled sweep).
+func (f *collaboratorFakeStore) ListActiveProvisionedSpaces(_ context.Context) ([]*domain.Space, error) {
+	panic("ListActiveProvisionedSpaces")
+}
+
 // ─── Router builders ─────────────────────────────────────────────────────────
 
 // buildCollaboratorRouter builds a minimal Gin engine for collaborator handler tests.

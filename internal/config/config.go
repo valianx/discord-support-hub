@@ -55,6 +55,11 @@ type Config struct {
 
 	// asynq server concurrency (workers per queue process).
 	WorkerConcurrency int // default 10
+
+	// ReconcileSweepCron is the cron expression for the scheduled full-guild reconcile sweep
+	// (M5, AC-5). Uses cron syntax; default is every 5 minutes ("*/5 * * * *").
+	// Set to "" to disable the scheduled sweep (useful for testing).
+	ReconcileSweepCron string // default "*/5 * * * *"
 }
 
 // Load reads all settings from environment variables and applies defaults.
@@ -77,6 +82,7 @@ func Load() (*Config, error) {
 		EncryptionKey:            getEnv("ENCRYPTION_KEY", ""),
 		AgentNicknameSuffix:      getEnv("AGENT_NICKNAME_SUFFIX", ""),
 		LogLevel:                 getEnv("LOG_LEVEL", "info"),
+		ReconcileSweepCron:       getEnv("RECONCILE_SWEEP_CRON", "*/5 * * * *"),
 	}
 
 	var err error

@@ -222,6 +222,12 @@ func (f *agentFakeStore) GetJobBySpaceIDAndKind(_ context.Context, _, _ string) 
 	return nil, store.ErrNotFound
 }
 
+// ListActiveProvisionedSpaces satisfies store.Store (added in M5 for the scheduled sweep).
+// Handler tests do not exercise the reconcile sweep path.
+func (f *agentFakeStore) ListActiveProvisionedSpaces(_ context.Context) ([]*domain.Space, error) {
+	panic("ListActiveProvisionedSpaces")
+}
+
 // ─── Router helpers ───────────────────────────────────────────────────────────
 
 // buildAgentRouter builds a minimal Gin engine for agent endpoint tests.

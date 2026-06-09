@@ -1,8 +1,8 @@
-// reconcile_space.go implements the KindReconcileSpace worker handler (M3, §4.2/§4.3).
+// reconcile_space.go implements KindReconcileSpace and KindReconcileGuild worker handlers.
 //
-// The handler decodes a ReconcileSpacePayload, delegates to the reconcile.Engine,
-// and returns nil on success. Errors from the reconciler are returned as retryable
-// so asynq will retry the sweep on transient failures.
+// KindReconcileSpace (M3, §4.2/§4.3): targeted single-space pass triggered post-mutation.
+// KindReconcileGuild (M5, AC-5): full-guild sweep triggered by the asynq Scheduler on a
+// periodic cron interval. Postgres always wins (NFR-5).
 package worker
 
 import (
@@ -44,5 +44,33 @@ func (h *reconcileSpaceHandler) handle(ctx context.Context, task *asynq.Task) er
 		return fmt.Errorf("reconcile_space: %w", err)
 	}
 	slog.InfoContext(ctx, "reconcile_space: completed", "space_id", payload.SpaceID)
+	return nil
+}
+
+// ─── reconcile:guild handler (M5, AC-5) ───────────────────────────────────────
+
+// reconcileGuildHandler is the KindReconcileGuild asynq handler.
+// Triggered by the asynq Scheduler at the configured cron interval.
+type reconcileGuildHandler struct {
+	engine  *reconcile.Engine
+	guildID string
+}
+
+func newReconcileGuildHandler(engine *reconcile.Engine, guildID string) asynq.HandlerFunc {
+	if engine == nil {
+		return stubHandler(queue.KindReconcileGuild)
+	}
+	h := &reconcileGuildHandler{engine: engine, guildID: guildID}
+	return h.handle
+}
+
+func (h *reconcileGuildHandler) handle(ctx context.Context, _ *asynq.Task) error {
+	slog.InfoContext(ctx, "reconcile_guild: full sweep starting", "guild_id", h.guildID)
+	if err := h.engine.ReconcileGuild(ctx, h.guildID); err != nil {
+		// Partial sweep errors are logged inside ReconcileGuild; return retryable error here
+		// so asynq will retry the sweep on transient failures (e.g. Discord downtime).
+		return fmt.Errorf("reconcile_guild: %w", err)
+	}
+	slog.InfoContext(ctx, "reconcile_guild: full sweep complete", "guild_id", h.guildID)
 	return nil
 }

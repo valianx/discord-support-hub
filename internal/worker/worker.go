@@ -15,6 +15,7 @@ import (
 	"github.com/valianx/discord-support-hub/internal/discord"
 	"github.com/valianx/discord-support-hub/internal/lock"
 	"github.com/valianx/discord-support-hub/internal/oauth"
+	"github.com/valianx/discord-support-hub/internal/observability"
 	"github.com/valianx/discord-support-hub/internal/queue"
 	"github.com/valianx/discord-support-hub/internal/ratelimit"
 	"github.com/valianx/discord-support-hub/internal/reconcile"
@@ -55,6 +56,11 @@ type Config struct {
 
 	// M4: optional nickname suffix for agent marking (FR-24). Empty = disabled.
 	AgentNicknameSuffix string
+
+	// M5: Prometheus metrics instance. Nil → no-op (AC-2 wire-up).
+	// Pass observability.DefaultMetrics (or the instance returned by InitMetrics) to
+	// activate real metric recording on the provision worker path.
+	Metrics *observability.Metrics
 }
 
 // provisionMaxRetry is the MaxRetry for the provision queue. Rate-limit retries are
@@ -133,6 +139,7 @@ func registerHandlers(mux *asynq.ServeMux, cfg Config) {
 		limiter:         cfg.Limiter,
 		locker:          cfg.Locker,
 		cache:           cfg.Cache,
+		metrics:         cfg.Metrics, // fix(AC-2): wire metrics so /metrics reflects real outcomes
 		guildID:         cfg.DiscordGuildID,
 		everyoneRoleID:  cfg.EveryoneRoleID,
 		agentRoleID:     cfg.AgentRoleID,
@@ -158,7 +165,9 @@ func registerHandlers(mux *asynq.ServeMux, cfg Config) {
 	})
 	mux.HandleFunc(queue.KindExpelCollaborator, expelHandler)
 
-	// M3: real reconcile_space handler.
+	// M5: real reconcile_space handler.
+	// The reconcile engine is constructed with a locker in cmd/worker/main.go (SEC-M5-002);
+	// if ReconcileEngine is nil the stub is used.
 	mux.HandleFunc(queue.KindReconcileSpace, newReconcileSpaceHandler(cfg.ReconcileEngine))
 
 	// M4: real lifecycle handler.
@@ -186,8 +195,8 @@ func registerHandlers(mux *asynq.ServeMux, cfg Config) {
 	})
 	mux.HandleFunc(queue.KindApplyNicknameSuffix, nickHandler)
 
-	// KindReconcileGuild remains a stub until M5's scheduled full-guild sweep.
-	mux.HandleFunc(queue.KindReconcileGuild, stubHandler(queue.KindReconcileGuild))
+	// M5: real reconcile_guild handler — runs the full sweep across all active spaces.
+	mux.HandleFunc(queue.KindReconcileGuild, newReconcileGuildHandler(cfg.ReconcileEngine, cfg.DiscordGuildID))
 }
 
 // stubHandler returns an asynq.HandlerFunc that logs receipt and returns nil.

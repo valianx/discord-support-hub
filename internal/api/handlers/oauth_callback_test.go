@@ -223,6 +223,11 @@ func (f *oauthFakeStore) GetJobBySpaceIDAndKind(_ context.Context, _, _ string) 
 	return nil, store.ErrNotFound
 }
 
+// ListActiveProvisionedSpaces satisfies store.Store (added in M5 for the scheduled sweep).
+func (f *oauthFakeStore) ListActiveProvisionedSpaces(_ context.Context) ([]*domain.Space, error) {
+	panic("ListActiveProvisionedSpaces")
+}
+
 // ─── fakeDiscordTransport ─────────────────────────────────────────────────────
 
 // fakeDiscordTransport records requests and returns canned responses.

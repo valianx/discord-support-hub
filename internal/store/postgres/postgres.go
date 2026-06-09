@@ -1135,6 +1135,33 @@ func (s *Store) GetJobBySpaceIDAndKind(ctx context.Context, spaceID, kind string
 	return scanJob(row)
 }
 
+// ListActiveProvisionedSpaces returns all spaces in lifecycle_state=active with a
+// discord_channel_id set. Used by the M5 scheduled full-guild reconcile sweep (AC-5).
+func (s *Store) ListActiveProvisionedSpaces(ctx context.Context) ([]*domain.Space, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, merchant_id, discord_channel_id, discord_category_id, name,
+		       lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		       reconciled_at, drift_count, created_at, updated_at, archived_at
+		FROM spaces
+		WHERE lifecycle_state = 'active'
+		  AND discord_channel_id IS NOT NULL
+		ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list active provisioned spaces: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*domain.Space
+	for rows.Next() {
+		sp, err := scanSpace(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sp)
+	}
+	return out, rows.Err()
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 // marshalPayload converts a map to a JSON byte slice suitable for JSONB columns.
