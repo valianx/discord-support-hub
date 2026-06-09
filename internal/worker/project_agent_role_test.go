@@ -117,14 +117,47 @@ func (f *workerFakeStore) UpsertOAuthToken(_ context.Context, _ store.UpsertOAut
 func (f *workerFakeStore) GetOAuthTokenByUserID(_ context.Context, _ string) (*domain.OAuthToken, error) {
 	panic("GetOAuthTokenByUserID")
 }
+func (f *workerFakeStore) CreateSpace(_ context.Context, _ store.CreateSpaceParams) (*domain.Space, error) {
+	panic("CreateSpace")
+}
 func (f *workerFakeStore) GetSpaceByID(_ context.Context, _ string) (*domain.Space, error) {
 	panic("GetSpaceByID")
+}
+func (f *workerFakeStore) GetSpaceByMerchantID(_ context.Context, _ string) (*domain.Space, error) {
+	panic("GetSpaceByMerchantID")
+}
+func (f *workerFakeStore) UpdateSpaceDiscordChannel(_ context.Context, _ store.UpdateSpaceDiscordChannelParams) (*domain.Space, error) {
+	panic("UpdateSpaceDiscordChannel")
+}
+func (f *workerFakeStore) UpdateSpaceACLState(_ context.Context, _ string, _ domain.ACLState) (*domain.Space, error) {
+	panic("UpdateSpaceACLState")
 }
 func (f *workerFakeStore) CreateJob(_ context.Context, _ store.CreateJobParams) (*domain.Job, error) {
 	panic("CreateJob")
 }
 func (f *workerFakeStore) GetJobByID(_ context.Context, _ string) (*domain.Job, error) {
 	panic("GetJobByID")
+}
+func (f *workerFakeStore) UpdateJobStatus(_ context.Context, _ store.UpdateJobStatusParams) (*domain.Job, error) {
+	panic("UpdateJobStatus")
+}
+func (f *workerFakeStore) InsertIdempotencyKey(_ context.Context, _ store.InsertIdempotencyKeyParams) (*domain.IdempotencyKey, error) {
+	panic("InsertIdempotencyKey")
+}
+func (f *workerFakeStore) GetIdempotencyKey(_ context.Context, _ string) (*domain.IdempotencyKey, error) {
+	panic("GetIdempotencyKey")
+}
+func (f *workerFakeStore) UpdateIdempotencyKeyResponse(_ context.Context, _ store.UpdateIdempotencyKeyResponseParams) error {
+	panic("UpdateIdempotencyKeyResponse")
+}
+func (f *workerFakeStore) CreateSpaceWithOutbox(_ context.Context, _ store.CreateSpaceParams, _ store.CreateOutboxParams) (*domain.Space, *domain.OutboxRow, error) {
+	panic("CreateSpaceWithOutbox")
+}
+func (f *workerFakeStore) ListPendingOutbox(_ context.Context, _ int) ([]*domain.OutboxRow, error) {
+	panic("ListPendingOutbox")
+}
+func (f *workerFakeStore) StampOutboxEnqueued(_ context.Context, _ []string) error {
+	panic("StampOutboxEnqueued")
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

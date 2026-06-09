@@ -26,5 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Agent role projection + reconcile** worker (`project_agent_role`): assigns the Agent role once an agent has joined; re-asserts a missing role and removes the role from a non-agent; `MANAGE_ROLES` reserved to the bot.
   - `cmd/keygen`: mint a backoffice service key — prints the raw key once, stores only its hash.
   - Hardening: DB DSN credentials never logged; `ENCRYPTION_KEY` validated at boot; `secrets.Decrypt` guards short ciphertext.
+- **M2a — Async provisioning foundation** (first half of step 3): the rate-limit / idempotency / locking / job machinery the provisioning vertical sits on.
+  - Distributed token-bucket rate limiter over Valkey (atomic Lua), global + per-route, seeded and penalized from Discord rate-limit headers, with clamping against hostile header values.
+  - Distributed locks (Valkey `SET NX` + fencing-token compare-and-delete release) keyed per space / per merchant.
+  - Three-layer idempotency: edge-replay middleware (request-hash guard, 409 on body mismatch) + asynq `TaskID`/`Unique` + a transactional outbox committed atomically with the desired-state change.
+  - Outbox **relay** with exactly-once enqueue (an `asynq` task-ID conflict is treated as already-enqueued, not a failure loop).
+  - asynq retry/backoff: `RetryDelayFunc` honors `Retry-After`; rate-limit retries are excluded from the failure counter; `SkipRetry` for terminal/fail-closed errors.
+  - Jobs mirror: `GET /jobs/{id}` reads authoritative status from Postgres (never Valkey), gated on control-plane authority.
+  - Read-through Valkey cache helper (TTL + invalidation).
 
 [Unreleased]: https://github.com/valianx/discord-support-hub/commits/main

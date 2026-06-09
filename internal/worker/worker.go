@@ -1,7 +1,8 @@
 // Package worker registers asynq task handlers for all job kinds.
 // M0: stub handlers only.
 // M1: project_agent_role handler is real (assigns/removes Agent role via Discord).
-// M2+: provision, membership, reconcile handlers.
+// M2: rate-limit retry config (RetryDelayFunc, IsFailure, SkipRetry) wired.
+// M2b+: provision, membership handlers.
 package worker
 
 import (
@@ -35,8 +36,13 @@ type Config struct {
 	AgentRoleID    string
 }
 
+// provisionMaxRetry is the MaxRetry for the provision queue. Rate-limit retries are
+// expected flow (IsFailure returns false for them), so the budget is generous (AC-8).
+const provisionMaxRetry = 10
+
 // New creates an asynq.Server with the four-queue topology and handlers registered.
 // Queue priorities match docs/02-architecture.md §3.4.
+// RetryDelayFunc and IsFailure are wired for rate-limit handling (AC-5, AC-8, §3.2).
 func New(cfg Config) *Server {
 	srv := asynq.NewServer(
 		asynq.RedisClientOpt{
@@ -52,8 +58,12 @@ func New(cfg Config) *Server {
 				queue.QueueReconcile:  1, // low
 				queue.QueueMarking:    1, // low
 			},
-			// IsFailure: rate-limit retries are NOT failures — implemented in M2.
-			// TODO(M2): customise IsFailure and RetryDelayFunc for rate-limit handling.
+			// RetryDelayFunc returns Retry-After for rate-limit errors; exponential
+			// backoff for all other transient errors (AC-5, §3.2).
+			RetryDelayFunc: RetryDelayFunc,
+			// IsFailure returns false for rate-limit retries so error-rate metrics
+			// stay honest — rate limiting is expected flow, not a failure (AC-8, NFR-7).
+			IsFailure: IsFailure,
 		},
 	)
 

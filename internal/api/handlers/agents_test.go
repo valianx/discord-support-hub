@@ -124,14 +124,47 @@ func (f *agentFakeStore) UpsertOAuthToken(_ context.Context, _ store.UpsertOAuth
 func (f *agentFakeStore) GetOAuthTokenByUserID(_ context.Context, _ string) (*domain.OAuthToken, error) {
 	panic("GetOAuthTokenByUserID")
 }
+func (f *agentFakeStore) CreateSpace(_ context.Context, _ store.CreateSpaceParams) (*domain.Space, error) {
+	panic("CreateSpace")
+}
 func (f *agentFakeStore) GetSpaceByID(_ context.Context, _ string) (*domain.Space, error) {
 	panic("GetSpaceByID")
+}
+func (f *agentFakeStore) GetSpaceByMerchantID(_ context.Context, _ string) (*domain.Space, error) {
+	panic("GetSpaceByMerchantID")
+}
+func (f *agentFakeStore) UpdateSpaceDiscordChannel(_ context.Context, _ store.UpdateSpaceDiscordChannelParams) (*domain.Space, error) {
+	panic("UpdateSpaceDiscordChannel")
+}
+func (f *agentFakeStore) UpdateSpaceACLState(_ context.Context, _ string, _ domain.ACLState) (*domain.Space, error) {
+	panic("UpdateSpaceACLState")
 }
 func (f *agentFakeStore) CreateJob(_ context.Context, _ store.CreateJobParams) (*domain.Job, error) {
 	panic("CreateJob")
 }
 func (f *agentFakeStore) GetJobByID(_ context.Context, _ string) (*domain.Job, error) {
 	panic("GetJobByID")
+}
+func (f *agentFakeStore) UpdateJobStatus(_ context.Context, _ store.UpdateJobStatusParams) (*domain.Job, error) {
+	panic("UpdateJobStatus")
+}
+func (f *agentFakeStore) InsertIdempotencyKey(_ context.Context, _ store.InsertIdempotencyKeyParams) (*domain.IdempotencyKey, error) {
+	panic("InsertIdempotencyKey")
+}
+func (f *agentFakeStore) GetIdempotencyKey(_ context.Context, _ string) (*domain.IdempotencyKey, error) {
+	panic("GetIdempotencyKey")
+}
+func (f *agentFakeStore) UpdateIdempotencyKeyResponse(_ context.Context, _ store.UpdateIdempotencyKeyResponseParams) error {
+	panic("UpdateIdempotencyKeyResponse")
+}
+func (f *agentFakeStore) CreateSpaceWithOutbox(_ context.Context, _ store.CreateSpaceParams, _ store.CreateOutboxParams) (*domain.Space, *domain.OutboxRow, error) {
+	panic("CreateSpaceWithOutbox")
+}
+func (f *agentFakeStore) ListPendingOutbox(_ context.Context, _ int) ([]*domain.OutboxRow, error) {
+	panic("ListPendingOutbox")
+}
+func (f *agentFakeStore) StampOutboxEnqueued(_ context.Context, _ []string) error {
+	panic("StampOutboxEnqueued")
 }
 
 // ─── Router helpers ───────────────────────────────────────────────────────────

@@ -11,7 +11,7 @@ import (
 
 // Store is the primary storage abstraction.
 // M1 adds: merchants create/get, users create/get/list/deactivate, api_keys lifecycle,
-// oauth_tokens upsert/get. M2+ adds spaces and jobs.
+// oauth_tokens upsert/get. M2 adds spaces, jobs, idempotency, and outbox.
 type Store interface {
 	// Ping checks whether the database is reachable. Used by the readiness probe.
 	Ping(ctx context.Context) error
@@ -78,19 +78,61 @@ type Store interface {
 
 	// --- Spaces ---
 
+	// CreateSpace inserts a new spaces row (desired state before worker provisions it).
+	// Returns ErrConflict when a space for the merchant already exists (1:1 invariant).
+	CreateSpace(ctx context.Context, p CreateSpaceParams) (*domain.Space, error)
+
 	// GetSpaceByID returns the space for the given id.
-	// TODO(M2): implement
 	GetSpaceByID(ctx context.Context, id string) (*domain.Space, error)
+
+	// GetSpaceByMerchantID returns the single space owned by a merchant.
+	// Returns ErrNotFound when no space has been provisioned yet.
+	GetSpaceByMerchantID(ctx context.Context, merchantID string) (*domain.Space, error)
+
+	// UpdateSpaceDiscordChannel stamps discord_channel_id and acl_state on the space
+	// after the worker has provisioned the Discord channel.
+	UpdateSpaceDiscordChannel(ctx context.Context, p UpdateSpaceDiscordChannelParams) (*domain.Space, error)
+
+	// UpdateSpaceACLState updates the acl_state of a space (e.g. applied → degraded).
+	UpdateSpaceACLState(ctx context.Context, spaceID string, state domain.ACLState) (*domain.Space, error)
 
 	// --- Jobs ---
 
-	// CreateJob inserts a jobs mirror row.
-	// TODO(M2): implement
+	// CreateJob inserts a jobs mirror row and returns the created row.
 	CreateJob(ctx context.Context, p CreateJobParams) (*domain.Job, error)
 
 	// GetJobByID returns the job for the given id (Postgres mirror of asynq state).
-	// TODO(M2): implement
+	// Returns ErrNotFound when no row exists for that id.
 	GetJobByID(ctx context.Context, id string) (*domain.Job, error)
+
+	// UpdateJobStatus transitions the jobs row status and optionally sets error/completed_at.
+	UpdateJobStatus(ctx context.Context, p UpdateJobStatusParams) (*domain.Job, error)
+
+	// --- Idempotency ---
+
+	// InsertIdempotencyKey attempts an atomic insert of an idempotency_keys row.
+	// Returns ErrConflict when a row with that key already exists (caller should replay).
+	InsertIdempotencyKey(ctx context.Context, p InsertIdempotencyKeyParams) (*domain.IdempotencyKey, error)
+
+	// GetIdempotencyKey returns the stored record for the given key.
+	// Returns ErrNotFound when the key is not present (or has expired).
+	GetIdempotencyKey(ctx context.Context, key string) (*domain.IdempotencyKey, error)
+
+	// UpdateIdempotencyKeyResponse stores the final response on a pending record.
+	UpdateIdempotencyKeyResponse(ctx context.Context, p UpdateIdempotencyKeyResponseParams) error
+
+	// --- Outbox ---
+
+	// CreateSpaceWithOutbox writes the desired-state Space row AND an outbox row in
+	// one Postgres transaction. This guarantees the committed change is never lost
+	// before the relay enqueues the job (NFR-3 transactional outbox, §4).
+	CreateSpaceWithOutbox(ctx context.Context, sp CreateSpaceParams, ob CreateOutboxParams) (*domain.Space, *domain.OutboxRow, error)
+
+	// ListPendingOutbox returns up to limit outbox rows not yet enqueued (enqueued_at IS NULL).
+	ListPendingOutbox(ctx context.Context, limit int) ([]*domain.OutboxRow, error)
+
+	// StampOutboxEnqueued marks outbox rows as enqueued by setting enqueued_at.
+	StampOutboxEnqueued(ctx context.Context, ids []string) error
 }
 
 // --- Parameter types ---
@@ -130,6 +172,22 @@ type UpsertOAuthTokenParams struct {
 	ExpiresAt            *time.Time
 }
 
+// CreateSpaceParams carries fields for creating a new desired-state space row.
+type CreateSpaceParams struct {
+	MerchantID        string
+	Name              string
+	DiscordCategoryID *string
+	WelcomeMessage    *string
+}
+
+// UpdateSpaceDiscordChannelParams carries the result of the worker's provisioning call.
+type UpdateSpaceDiscordChannelParams struct {
+	SpaceID           string
+	DiscordChannelID  string
+	DiscordCategoryID *string
+	ACLState          domain.ACLState
+}
+
 // CreateJobParams carries the fields for creating a Postgres jobs mirror row.
 type CreateJobParams struct {
 	TaskID     string
@@ -139,6 +197,41 @@ type CreateJobParams struct {
 	SpaceID    *string
 	UserID     *string
 	Payload    map[string]any
+}
+
+// UpdateJobStatusParams carries the transition fields for a job row.
+type UpdateJobStatusParams struct {
+	JobID      string
+	Status     domain.JobStatus
+	Error      *string
+	RetryCount *int
+	Completed  bool // when true, sets completed_at = now()
+}
+
+// InsertIdempotencyKeyParams carries the fields for inserting an idempotency_keys row.
+type InsertIdempotencyKeyParams struct {
+	Key         string
+	RequestHash []byte
+	JobID       *string
+	ExpiresAt   time.Time
+}
+
+// UpdateIdempotencyKeyResponseParams carries the stored response fields.
+type UpdateIdempotencyKeyResponseParams struct {
+	Key          string
+	Status       domain.JobStatus
+	ResponseCode int
+	ResponseBody map[string]any
+	JobID        *string
+}
+
+// CreateOutboxParams carries the fields for inserting an outbox row.
+type CreateOutboxParams struct {
+	Aggregate      string
+	AggregateID    string
+	Kind           string
+	Payload        map[string]any
+	IdempotencyKey string
 }
 
 // --- Sentinel errors ---

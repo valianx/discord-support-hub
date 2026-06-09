@@ -187,3 +187,32 @@ type Job struct {
 	UpdatedAt   time.Time
 	CompletedAt *time.Time
 }
+
+// IdempotencyKey is an edge-level idempotency record for mutating requests (NFR-3).
+// When a key already exists with a stored response, the API replays that response
+// without re-enqueueing a second job. If the key exists with a different body hash,
+// the API returns 409.
+type IdempotencyKey struct {
+	Key          string
+	RequestHash  []byte
+	Status       JobStatus
+	ResponseCode *int
+	ResponseBody map[string]any
+	JobID        *string
+	CreatedAt    time.Time
+	ExpiresAt    time.Time
+}
+
+// OutboxRow is a single entry in the transactional outbox table. The API writes the
+// desired-state change AND an outbox row in one Postgres transaction. The relay picks
+// up pending rows, enqueues the asynq task, and stamps enqueued_at.
+type OutboxRow struct {
+	ID             string
+	Aggregate      string
+	AggregateID    string
+	Kind           string
+	Payload        map[string]any
+	IdempotencyKey string
+	EnqueuedAt     *time.Time
+	CreatedAt      time.Time
+}
