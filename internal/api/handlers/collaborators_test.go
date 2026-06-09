@@ -139,6 +139,12 @@ func (f *collaboratorFakeStore) GetMerchantByID(_ context.Context, id string) (*
 	}
 	return m, nil
 }
+func (f *collaboratorFakeStore) GetMerchantByExternalRef(_ context.Context, _ string) (*domain.Merchant, error) {
+	panic("GetMerchantByExternalRef")
+}
+func (f *collaboratorFakeStore) ListMerchants(_ context.Context, _ store.ListMerchantsParams) ([]*domain.Merchant, error) {
+	panic("ListMerchants")
+}
 
 func (f *collaboratorFakeStore) CreateSpaceMember(_ context.Context, p store.CreateSpaceMemberParams) (*domain.SpaceMember, error) {
 	if f.createMemberErr != nil {

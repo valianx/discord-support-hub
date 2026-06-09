@@ -60,6 +60,7 @@ func (s *Store) Ping(ctx context.Context) error {
 // ─── Merchants ────────────────────────────────────────────────────────────────
 
 // CreateMerchant inserts a new merchant and returns the created row.
+// Returns store.ErrConflict when external_ref already exists (UNIQUE constraint).
 func (s *Store) CreateMerchant(ctx context.Context, p store.CreateMerchantParams) (*domain.Merchant, error) {
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO merchants (external_ref, name, help_desk_url)
@@ -67,7 +68,14 @@ func (s *Store) CreateMerchant(ctx context.Context, p store.CreateMerchantParams
 		RETURNING id, external_ref, name, help_desk_url, is_active, created_at, updated_at`,
 		p.ExternalRef, p.Name, p.HelpDeskURL,
 	)
-	return scanMerchant(row)
+	m, err := scanMerchant(row)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
+			return nil, store.ErrConflict
+		}
+	}
+	return m, err
 }
 
 // GetMerchantByID returns the merchant for the given id.
@@ -78,7 +86,57 @@ func (s *Store) GetMerchantByID(ctx context.Context, id string) (*domain.Merchan
 	return scanMerchant(row)
 }
 
-func scanMerchant(row pgx.Row) (*domain.Merchant, error) {
+// GetMerchantByExternalRef returns the merchant with the given external_ref.
+// Returns store.ErrNotFound when no row matches.
+func (s *Store) GetMerchantByExternalRef(ctx context.Context, ref string) (*domain.Merchant, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, external_ref, name, help_desk_url, is_active, created_at, updated_at
+		FROM merchants WHERE external_ref = $1`, ref)
+	return scanMerchant(row)
+}
+
+// ListMerchants returns merchants ordered by created_at ASC with optional filters
+// and cursor-based pagination. Default limit is 50.
+func (s *Store) ListMerchants(ctx context.Context, p store.ListMerchantsParams) ([]*domain.Merchant, error) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+
+	args := make([]any, 0, 3)
+	where := " WHERE 1=1"
+
+	if p.IsActive != nil {
+		args = append(args, *p.IsActive)
+		where += fmt.Sprintf(" AND is_active = $%d", len(args))
+	}
+	if p.Cursor != nil {
+		args = append(args, *p.Cursor)
+		where += fmt.Sprintf(" AND created_at > $%d", len(args))
+	}
+
+	args = append(args, limit)
+	query := `SELECT id, external_ref, name, help_desk_url, is_active, created_at, updated_at
+		  FROM merchants` + where + fmt.Sprintf(` ORDER BY created_at ASC LIMIT $%d`, len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list merchants: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*domain.Merchant
+	for rows.Next() {
+		m, err := scanMerchant(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func scanMerchant(row interface{ Scan(dest ...any) error }) (*domain.Merchant, error) {
 	var m domain.Merchant
 	err := row.Scan(
 		&m.ID, &m.ExternalRef, &m.Name, &m.HelpDeskURL,

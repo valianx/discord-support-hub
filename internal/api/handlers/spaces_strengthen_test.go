@@ -47,7 +47,7 @@ var _ = store.CreateSpaceParams{}
 //     sets Idempotency-Replay: true, does NOT create a second outbox row.
 func TestProvisionSpace_IdempotentReplay_ExactBodyAndHeader(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-idem-exact", Name: "IdemCo"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000011", Name: "IdemCo"}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), noopCacheInstance())
 	const idemKey = "idem-exact-replay"
@@ -55,7 +55,7 @@ func TestProvisionSpace_IdempotentReplay_ExactBodyAndHeader(t *testing.T) {
 	body := map[string]any{"name": "idem-exact-space"}
 
 	// First call — registers the key, runs the handler, stores the 202.
-	w1 := postJSON(router, "/v1/merchants/merch-idem-exact/channels", body, headers)
+	w1 := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000011/channels", body, headers)
 	if w1.Code != http.StatusAccepted {
 		t.Fatalf("first call: want 202, got %d: %s", w1.Code, w1.Body)
 	}
@@ -79,7 +79,7 @@ func TestProvisionSpace_IdempotentReplay_ExactBodyAndHeader(t *testing.T) {
 	firstOutboxCount := s.outboxRowCount
 
 	// Second call — must replay the stored body, not run the handler again.
-	w2 := postJSON(router, "/v1/merchants/merch-idem-exact/channels", body, headers)
+	w2 := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000011/channels", body, headers)
 	if w2.Code != http.StatusAccepted {
 		t.Fatalf("second call (replay): want 202, got %d: %s", w2.Code, w2.Body)
 	}
@@ -109,14 +109,14 @@ func TestProvisionSpace_IdempotentReplay_ExactBodyAndHeader(t *testing.T) {
 // same Idempotency-Key with a different request body returns 409 idempotency_conflict.
 func TestProvisionSpace_IdempotentConflict_DifferentBody_Returns409(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-idem-conflict", Name: "ConflictCo"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000012", Name: "ConflictCo"}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), noopCacheInstance())
 	const idemKey = "idem-conflict-key"
 	headers := map[string]string{"Idempotency-Key": idemKey}
 
 	// First call — body A.
-	w1 := postJSON(router, "/v1/merchants/merch-idem-conflict/channels",
+	w1 := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000012/channels",
 		map[string]any{"name": "space-A"}, headers)
 	if w1.Code != http.StatusAccepted {
 		t.Fatalf("first call: want 202, got %d: %s", w1.Code, w1.Body)
@@ -124,7 +124,7 @@ func TestProvisionSpace_IdempotentConflict_DifferentBody_Returns409(t *testing.T
 
 	// The key is now registered in the in-memory store.
 	// Second call — body B (different name = different hash).
-	w2 := postJSON(router, "/v1/merchants/merch-idem-conflict/channels",
+	w2 := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000012/channels",
 		map[string]any{"name": "space-B-different"}, headers)
 	if w2.Code != http.StatusConflict {
 		t.Errorf("second call with different body: want 409, got %d: %s", w2.Code, w2.Body)
@@ -147,12 +147,12 @@ func TestProvisionSpace_IdempotentConflict_DifferentBody_Returns409(t *testing.T
 // returns 403 — the authZ gate is consistent regardless of how the principal is absent.
 func TestProvisionSpace_NilPrincipal_Returns403(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-noauth", Name: "NoAuth"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000013", Name: "NoAuth"}
 
 	// Pass nil principal — the middleware injector in buildSpaceRouter skips injection
 	// when principal is nil.
 	router := buildSpaceRouter(s, nil, noopCacheInstance())
-	w := postJSON(router, "/v1/merchants/merch-noauth/channels",
+	w := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000013/channels",
 		map[string]any{"name": "noauth-space"}, nil)
 
 	if w.Code != http.StatusForbidden {
@@ -167,7 +167,7 @@ func TestProvisionSpace_NilPrincipal_Returns403(t *testing.T) {
 // GET /channels/{id} reads Postgres rather than a stale cache entry.
 func TestProvisionSpace_InvalidatesPerSpaceCache(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-percache", Name: "PerCacheCo"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000014", Name: "PerCacheCo"}
 
 	// Customise CreateSpaceWithOutbox so we know the spaceID up front.
 	const spaceID = "space-percache-001"
@@ -199,7 +199,7 @@ func TestProvisionSpace_InvalidatesPerSpaceCache(t *testing.T) {
 
 	// Pre-seed the per-space cache key for this known spaceID.
 	spaceJSON, _ := json.Marshal(map[string]any{
-		"id": spaceID, "merchant_id": "merch-percache", "name": "old-cached-name",
+		"id": spaceID, "merchant_id": "00000000-0000-0000-0000-000000000014", "name": "old-cached-name",
 		"lifecycle_state": "active", "acl_state": "pending",
 		"created_at": "2026-01-01T00:00:00Z",
 	})
@@ -209,7 +209,7 @@ func TestProvisionSpace_InvalidatesPerSpaceCache(t *testing.T) {
 	}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), c)
-	w := postJSON(router, "/v1/merchants/merch-percache/channels",
+	w := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000014/channels",
 		map[string]any{"name": "percache-space"}, nil)
 
 	if w.Code != http.StatusAccepted {
@@ -387,10 +387,10 @@ func assertBodyContainsKey(t *testing.T, label, body, key string) {
 // Failure scenario: if this test fails, the worker can never provision the channel.
 func TestProvisionSpace_OutboxPayloadContainsSpaceID(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-payload-fix", Name: "PayloadFix Corp"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000015", Name: "PayloadFix Corp"}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), noopCacheInstance())
-	w := postJSON(router, "/v1/merchants/merch-payload-fix/channels",
+	w := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000015/channels",
 		map[string]any{"name": "payload-fix-space"}, nil)
 
 	if w.Code != http.StatusAccepted {
@@ -417,7 +417,7 @@ func TestProvisionSpace_OutboxPayloadContainsSpaceID(t *testing.T) {
 	}
 
 	// The space_id in the payload must match the space that was created.
-	wantSpaceID := "space-merch-payload-fix" // generated by the fake store as "space-{merchantID}"
+	wantSpaceID := "space-00000000-0000-0000-0000-000000000015" // generated by fake store as "space-{merchantID}"
 	if spaceIDStr != wantSpaceID {
 		t.Errorf("want space_id=%q in outbox payload, got %q", wantSpaceID, spaceIDStr)
 	}
@@ -434,11 +434,11 @@ func TestProvisionSpace_OutboxPayloadContainsSpaceID(t *testing.T) {
 // Discord's 100-character limit is rejected with 400.
 func TestProvisionSpace_NameTooLong_Returns400(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-longname", Name: "LongName"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000016", Name: "LongName"}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), noopCacheInstance())
 	longName := strings.Repeat("a", 101) // 101 chars > Discord's 100-char limit
-	w := postJSON(router, "/v1/merchants/merch-longname/channels",
+	w := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000016/channels",
 		map[string]any{"name": longName}, nil)
 
 	if w.Code != http.StatusBadRequest {
@@ -456,10 +456,10 @@ func TestProvisionSpace_NameTooLong_Returns400(t *testing.T) {
 // containing ASCII control characters is rejected with 400.
 func TestProvisionSpace_NameWithControlChar_Returns400(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-ctrl", Name: "CtrlChar"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000017", Name: "CtrlChar"}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), noopCacheInstance())
-	w := postJSON(router, "/v1/merchants/merch-ctrl/channels",
+	w := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000017/channels",
 		map[string]any{"name": "valid\x01invalid"}, nil) // 0x01 is a control char
 
 	if w.Code != http.StatusBadRequest {
@@ -471,10 +471,10 @@ func TestProvisionSpace_NameWithControlChar_Returns400(t *testing.T) {
 // is trimmed and the request is accepted (not rejected) for an otherwise valid name.
 func TestProvisionSpace_NameTrimmed_Accepted(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-trim", Name: "TrimCo"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000018", Name: "TrimCo"}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), noopCacheInstance())
-	w := postJSON(router, "/v1/merchants/merch-trim/channels",
+	w := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000018/channels",
 		map[string]any{"name": "  trimmed-space  "}, nil)
 
 	if w.Code != http.StatusAccepted {
@@ -486,11 +486,11 @@ func TestProvisionSpace_NameTrimmed_Accepted(t *testing.T) {
 // containing non-numeric characters is rejected with 400 (must be a Discord snowflake).
 func TestProvisionSpace_InvalidCategoryID_Returns400(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-catid", Name: "CatIDCo"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000019", Name: "CatIDCo"}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), noopCacheInstance())
 	invalidCat := "not-a-snowflake"
-	w := postJSON(router, "/v1/merchants/merch-catid/channels",
+	w := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000019/channels",
 		map[string]any{"name": "valid-name", "category_id": invalidCat}, nil)
 
 	if w.Code != http.StatusBadRequest {
@@ -508,11 +508,11 @@ func TestProvisionSpace_InvalidCategoryID_Returns400(t *testing.T) {
 // Discord snowflake category_id is accepted.
 func TestProvisionSpace_ValidNumericCategoryID_Accepted(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-validcat", Name: "ValidCatCo"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000020", Name: "ValidCatCo"}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), noopCacheInstance())
 	validCat := "1234567890123456789" // valid Discord snowflake (numeric)
-	w := postJSON(router, "/v1/merchants/merch-validcat/channels",
+	w := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000020/channels",
 		map[string]any{"name": "valid-name", "category_id": validCat}, nil)
 
 	if w.Code != http.StatusAccepted {
@@ -527,7 +527,7 @@ func TestProvisionSpace_ValidNumericCategoryID_Accepted(t *testing.T) {
 // list variants become stale on their next read (fix DEFECT-1).
 func TestProvisionSpace_InvalidatesListGenToken(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-gen", Name: "GenCo"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000021", Name: "GenCo"}
 
 	c, mr := newMiniredisCache(t)
 	defer mr.Close()
@@ -542,7 +542,7 @@ func TestProvisionSpace_InvalidatesListGenToken(t *testing.T) {
 	}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), c)
-	w := postJSON(router, "/v1/merchants/merch-gen/channels",
+	w := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000021/channels",
 		map[string]any{"name": "gen-space"}, nil)
 
 	if w.Code != http.StatusAccepted {
@@ -566,9 +566,9 @@ func TestProvisionSpace_InvalidatesListGenToken(t *testing.T) {
 // GET /channels/{id} reads Postgres rather than a stale pending entry.
 func TestProvisionSpace_InvalidatesPerSpaceCacheOnProvision(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-pscache", Name: "PerSpaceCacheCo"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000022", Name: "PerSpaceCacheCo"}
 
-	const spaceID = "space-merch-pscache"
+	const spaceID = "space-00000000-0000-0000-0000-000000000022"
 	s.createSpaceWithOutbox = func(sp store.CreateSpaceParams, ob store.CreateOutboxParams) (*domain.Space, *domain.OutboxRow, error) {
 		s.outboxRowCount++
 		space := &domain.Space{
@@ -597,7 +597,7 @@ func TestProvisionSpace_InvalidatesPerSpaceCacheOnProvision(t *testing.T) {
 	}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), c)
-	w := postJSON(router, "/v1/merchants/merch-pscache/channels",
+	w := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000022/channels",
 		map[string]any{"name": "pscache-space"}, nil)
 
 	if w.Code != http.StatusAccepted {

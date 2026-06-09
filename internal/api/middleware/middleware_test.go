@@ -41,6 +41,12 @@ func (n *noopStore) CreateMerchant(_ context.Context, _ store.CreateMerchantPara
 func (n *noopStore) GetMerchantByID(_ context.Context, _ string) (*domain.Merchant, error) {
 	panic("GetMerchantByID not stubbed")
 }
+func (n *noopStore) GetMerchantByExternalRef(_ context.Context, _ string) (*domain.Merchant, error) {
+	panic("GetMerchantByExternalRef not stubbed")
+}
+func (n *noopStore) ListMerchants(_ context.Context, _ store.ListMerchantsParams) ([]*domain.Merchant, error) {
+	panic("ListMerchants not stubbed")
+}
 func (n *noopStore) CreateUser(_ context.Context, _ store.CreateUserParams) (*domain.User, error) {
 	panic("CreateUser not stubbed")
 }

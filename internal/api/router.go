@@ -117,6 +117,11 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 func registerV1Routes(v1 *gin.RouterGroup, h *handlers.Handlers, s store.Store) {
 	idem := middleware.Idempotency(s)
 
+	// Merchants — register, list, detail.
+	v1.POST("/merchants", idem, h.RegisterMerchant)
+	v1.GET("/merchants", h.ListMerchants)
+	v1.GET("/merchants/:merchantId", h.GetMerchant)
+
 	// Spaces — provision + reads + lifecycle + welcome sync.
 	v1.POST("/merchants/:merchantId/channels", idem, h.ProvisionSpace)
 	v1.GET("/channels", h.ListSpaces)

@@ -122,9 +122,12 @@ func (h *Handlers) ProvisionSpace(c *gin.Context) {
 		return
 	}
 
-	merchantID := c.Param("merchantId")
-	if merchantID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"code": "validation_error", "message": "merchantId is required"})
+	// fix(AC-8): reject non-UUID merchantId with 404 before hitting the store.
+	// A non-UUID value (e.g. an external_ref string) would cause Postgres SQLSTATE 22P02
+	// on the uuid cast, which is not ErrNoRows → the generic 500 handler would fire.
+	// Both malformed and absent UUIDs map to 404 (they are indistinguishable to the caller).
+	merchantID, ok := parseUUIDParam(c, "merchantId")
+	if !ok {
 		return
 	}
 

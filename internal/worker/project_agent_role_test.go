@@ -126,6 +126,12 @@ func (f *workerFakeStore) CreateMerchant(_ context.Context, _ store.CreateMercha
 func (f *workerFakeStore) GetMerchantByID(_ context.Context, _ string) (*domain.Merchant, error) {
 	panic("GetMerchantByID")
 }
+func (f *workerFakeStore) GetMerchantByExternalRef(_ context.Context, _ string) (*domain.Merchant, error) {
+	panic("GetMerchantByExternalRef")
+}
+func (f *workerFakeStore) ListMerchants(_ context.Context, _ store.ListMerchantsParams) ([]*domain.Merchant, error) {
+	panic("ListMerchants")
+}
 func (f *workerFakeStore) CreateUser(_ context.Context, _ store.CreateUserParams) (*domain.User, error) {
 	panic("CreateUser")
 }

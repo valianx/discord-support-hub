@@ -276,10 +276,10 @@ func getJSON(router *gin.Engine, path string, headers map[string]string) *httpte
 // request returns 202 + Location header pointing to the job resource (AC-1).
 func TestProvisionSpace_Returns202WithLocation(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-001", Name: "ACME"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000001", Name: "ACME"}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), cache.NoopCache{})
-	w := postJSON(router, "/v1/merchants/merch-001/channels",
+	w := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000001/channels",
 		map[string]any{"name": "acme-support"}, nil)
 
 	if w.Code != http.StatusAccepted {
@@ -307,10 +307,10 @@ func TestProvisionSpace_Returns202WithLocation(t *testing.T) {
 // CreateSpaceWithOutbox is called exactly once (the atomic transaction, AC-1).
 func TestProvisionSpace_SpaceAndOutboxCommittedAtomically(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-002", Name: "Beta Corp"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000002", Name: "Beta Corp"}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), cache.NoopCache{})
-	w := postJSON(router, "/v1/merchants/merch-002/channels",
+	w := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000002/channels",
 		map[string]any{"name": "beta-support"}, nil)
 
 	if w.Code != http.StatusAccepted {
@@ -325,11 +325,11 @@ func TestProvisionSpace_SpaceAndOutboxCommittedAtomically(t *testing.T) {
 // on the idempotency_keys row (the M2a missing caller, AC-1).
 func TestProvisionSpace_IdempotencyKeyStored(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-003", Name: "Gamma Inc"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000003", Name: "Gamma Inc"}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), cache.NoopCache{})
 	headers := map[string]string{"Idempotency-Key": "idem-key-001"}
-	w := postJSON(router, "/v1/merchants/merch-003/channels",
+	w := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000003/channels",
 		map[string]any{"name": "gamma-support"}, headers)
 
 	if w.Code != http.StatusAccepted {
@@ -353,14 +353,14 @@ func TestProvisionSpace_IdempotencyKeyStored(t *testing.T) {
 // replays the stored 202 without a second outbox row (AC-1, three-layer idempotency).
 func TestProvisionSpace_IdempotentReplay(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-004", Name: "Delta LLC"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000004", Name: "Delta LLC"}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), cache.NoopCache{})
 	headers := map[string]string{"Idempotency-Key": "idem-key-replay"}
 	body := map[string]any{"name": "delta-support"}
 
 	// First call — creates the space.
-	w1 := postJSON(router, "/v1/merchants/merch-004/channels", body, headers)
+	w1 := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000004/channels", body, headers)
 	if w1.Code != http.StatusAccepted {
 		t.Fatalf("first call: want 202, got %d: %s", w1.Code, w1.Body)
 	}
@@ -371,7 +371,7 @@ func TestProvisionSpace_IdempotentReplay(t *testing.T) {
 	// The idempotency store updates happen via UpdateIdempotencyKeyResponse.
 	// We verify the second call replays (Idempotency-Replay: true header) or at minimum
 	// does NOT commit a second outbox row.
-	w2 := postJSON(router, "/v1/merchants/merch-004/channels", body, headers)
+	w2 := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000004/channels", body, headers)
 	// Either 202 replay OR the middleware already set Idempotency-Replay.
 	if w2.Code != http.StatusAccepted {
 		t.Fatalf("second call: want 202, got %d: %s", w2.Code, w2.Body)
@@ -391,10 +391,10 @@ func TestProvisionSpace_IdempotentReplay(t *testing.T) {
 // returns 400 validation_error (AC-1 input validation).
 func TestProvisionSpace_MissingName_Returns400(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-005", Name: "Epsilon"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000005", Name: "Epsilon"}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), cache.NoopCache{})
-	w := postJSON(router, "/v1/merchants/merch-005/channels",
+	w := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000005/channels",
 		map[string]any{"welcome_message": "hello"}, nil)
 
 	if w.Code != http.StatusBadRequest {
@@ -421,10 +421,10 @@ func TestProvisionSpace_UnknownMerchant_Returns404(t *testing.T) {
 // (not control-plane) gets 403 (authZ gate, AC-1).
 func TestProvisionSpace_NonControlPlane_Returns403(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-006", Name: "Zeta"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000006", Name: "Zeta"}
 
 	router := buildSpaceRouter(s, spacesCollaboratorPrincipal(), cache.NoopCache{})
-	w := postJSON(router, "/v1/merchants/merch-006/channels",
+	w := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000006/channels",
 		map[string]any{"name": "zeta-support"}, nil)
 
 	if w.Code != http.StatusForbidden {
@@ -436,7 +436,7 @@ func TestProvisionSpace_NonControlPlane_Returns403(t *testing.T) {
 // deletes the spaces:list cache key so the next GET /channels reads Postgres.
 func TestProvisionSpace_InvalidatesListCache(t *testing.T) {
 	s := newSpacesFakeStore()
-	s.merchant = &domain.Merchant{ID: "merch-007", Name: "Eta Corp"}
+	s.merchant = &domain.Merchant{ID: "00000000-0000-0000-0000-000000000007", Name: "Eta Corp"}
 
 	c, mr := newMiniredisCache(t)
 	defer mr.Close()
@@ -448,7 +448,7 @@ func TestProvisionSpace_InvalidatesListCache(t *testing.T) {
 	}
 
 	router := buildSpaceRouter(s, spacesControlPlanePrincipal(), c)
-	w := postJSON(router, "/v1/merchants/merch-007/channels",
+	w := postJSON(router, "/v1/merchants/00000000-0000-0000-0000-000000000007/channels",
 		map[string]any{"name": "eta-support"}, nil)
 
 	if w.Code != http.StatusAccepted {
