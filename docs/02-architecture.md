@@ -23,7 +23,7 @@ Where the design depends on an exact signature, it is quoted inline below.
 
 ```mermaid
 flowchart LR
-  subgraph Zippy["Zippy backoffice (policy / origin of action)"]
+  subgraph Backoffice["Backoffice (policy / origin of action)"]
     BO[Staffer action:\n invite agent, open space]
   end
   subgraph Hub["discord-support-hub (mechanism)"]
@@ -50,7 +50,7 @@ flowchart LR
   API -. writes desired state .-> PG
 ```
 
-**Layer 1 — Zippy backoffice (origin of action).** A human staffer performs the operational decision ("invite this agent", "open a space for merchant X"). The hub ships **no human UI** in v1; the backoffice is the API consumer.
+**Layer 1 — backoffice (origin of action).** A human staffer performs the operational decision ("invite this agent", "open a space for merchant X"). The hub ships **no human UI** in v1; the backoffice is the API consumer.
 
 **Layer 2 — hub Postgres (authorization source of truth).** Every roster fact lives here: a merchant owns exactly one space (1:1); a collaborator is a global identity granted access to one or more spaces via `space_members` (M:N, possibly spanning merchants); `type=agent|collaborator`; `is_admin`. **AuthZ is always resolved against Postgres**, never against the Discord role. This is the invariant that makes the Discord role a *projection*, not a *grant*.
 
@@ -239,7 +239,7 @@ A space whose ACL apply failed is reported as `degraded` and is a reconciler tar
 
 Rationale (justifying the concrete mechanism):
 
-- The primary caller is **one trusted server** (the Zippy backoffice), machine-to-machine. A signed service credential is the right shape — no interactive login, no user identity to federate in v1.
+- The primary caller is **one trusted server** (the backoffice), machine-to-machine. A signed service credential is the right shape — no interactive login, no user identity to federate in v1.
 - **Opaque random keys (not JWT)** because: (a) the hub is the only validator, so self-contained JWT verification buys nothing; (b) opaque keys are **instantly revocable** (delete the row) without a JWT blocklist; (c) no signing-key rotation machinery needed in v1. We store only a **hash** (`api_keys.key_hash`, e.g. SHA-256/argon2id), compare on each request, and never log the raw key.
 - Keys carry a **scope** (`backoffice` full control-plane, or narrower) and a `name`/`merchant_id` binding for audit attribution — every audited action records *which* key acted.
 - **Rotation:** multiple active keys per principal allow zero-downtime rotation (issue new, migrate caller, revoke old).
@@ -276,7 +276,7 @@ Guild entry is **always** OAuth2 `guilds.join` — for agents and collaborators 
 ```mermaid
 sequenceDiagram
   actor Staffer
-  participant BO as Zippy backoffice
+  participant BO as backoffice
   participant API as Hub API (Gin)
   participant PG as Postgres
   participant Q as asynq/Valkey
@@ -310,7 +310,7 @@ Key facts:
 ```mermaid
 sequenceDiagram
   actor Agent
-  participant BO as Zippy backoffice
+  participant BO as backoffice
   participant API as Hub API
   participant PG as Postgres
   participant Q as asynq/Valkey
@@ -405,7 +405,7 @@ Boundaries: `domain` has no infra imports; `store`/`discord`/`queue`/`cache`/`ra
 
 ## 9. M4 / M5 (high level only)
 
-- **M4 — Lifecycle, audit, visibility, marking.** Space lifecycle state machine (active→resolved→archived, reopen) already modeled in the schema (`spaces.lifecycle_state`); archive = lock channel + hide, never delete history (FR-7). Audit log endpoint over the `audit_log` table (FR-14). Static help-desk presence = channel topic + a pinned message applied at provisioning (FR-15 static). Optional `- Zippy` nickname suffix via `GuildMemberNickname` (FR-24, off by default).
+- **M4 — Lifecycle, audit, visibility, marking.** Space lifecycle state machine (active→resolved→archived, reopen) already modeled in the schema (`spaces.lifecycle_state`); archive = lock channel + hide, never delete history (FR-7). Audit log endpoint over the `audit_log` table (FR-14). Static help-desk presence = channel topic + a pinned message applied at provisioning (FR-15 static). Optional configurable nickname suffix via `GuildMemberNickname` (FR-24, off by default).
 - **M5 — OSS hardening.** Integration tests against a throwaway test guild (the isolation suite from M3 becomes the gate), structured logs + minimal metrics (provisioning latency, active spaces, rate-limit hits, errors) + health checks (NFR-7 v1 form), Docker image, README/CHANGELOG/Apache-2.0 license, first tagged `v0.1.0`. Full OTel tracing is v1.1.
 
 ---

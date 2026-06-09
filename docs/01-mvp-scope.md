@@ -18,19 +18,19 @@ The MVP is the **smallest slice that proves the isolation invariant end-to-end t
 
 ---
 
-## 1.5 System context — the Zippy backoffice
+## 1.5 System context — the backoffice
 
-`discord-support-hub` is the **mechanism**; the **Zippy backoffice** is the **policy/business layer** that drives it (*mechanism, not policy* — §1 of the spec).
+`discord-support-hub` is the **mechanism**; the **backoffice** is the **policy/business layer** that drives it (*mechanism, not policy* — §1 of the spec).
 
 - The backoffice is where a staffer performs the human action — "invite this agent", "open a space for this merchant". The hub ships **no human UI** in v1; its control surface is the **API** (FR-11), and the backoffice is its consumer.
 - **Three layers of truth, cleanly separated:**
-  - **Zippy backoffice** — origin of the operational action (who to invite, when).
+  - **backoffice** — origin of the operational action (who to invite, when).
   - **discord-support-hub / Postgres** — authorization source of truth (roster, merchant↔space↔user mappings). The backoffice's action propagates here via the hub API.
   - **Discord** — projection (roles, permission overwrites) the bot reconciles from Postgres.
 - **Guild entry is always OAuth2 `guilds.join`.** The backoffice presents a one-time "Connect with Discord" step; Discord's *Add Guild Member* endpoint requires a per-user `guilds.join` token, so the bot cannot add anyone without it. This holds for **agents and collaborators alike** — no invite links for anyone (NFR-14).
 
 **Agent onboarding-by-API, end to end:**
-1. Staffer invites an agent in the **Zippy backoffice**.
+1. Staffer invites an agent in the **backoffice**.
 2. Backoffice calls the hub API (`POST /agents`) → Postgres records `type=agent` (+ `is_admin` if applicable). This is the authZ source of truth (FR-23).
 3. Agent completes **Connect with Discord** once (OAuth2 `guilds.join`) → hub stores the token at `/oauth/discord/callback`.
 4. Bot adds them to the guild and **assigns the Agent role** → category-level overwrite grants every space at once (FR-6).
@@ -54,7 +54,7 @@ An agent's entire access surface is the single **Agent role** (the "role problem
 | FR-7 | Lifecycle: active → resolved → archived, with reopen | **Full** |
 | FR-9 | Identity mapping as single source of truth (merchant ↔ users ↔ spaces) | **Full** |
 | FR-10 | List all spaces with state, owner, created, last activity | **Full** |
-| FR-11 | Control surface (admin API) to provision/invite/expel/list/close/reopen | **API only** — consumed by the Zippy backoffice (no hub UI); slash-commands → v1.1 |
+| FR-11 | Control surface (admin API) to provision/invite/expel/list/close/reopen | **API only** — consumed by the backoffice (no hub UI); slash-commands → v1.1 |
 | FR-13 | Declarative config (guild ID, agent role, naming, mode, archive policy) with sane defaults | **Full** |
 | FR-14 | Audit log (who/what/when) of provisioning, membership, lifecycle | **Full** |
 | FR-15 | Help-desk visibility | **Static presence only** (topic + pin); sticky/nudge → v1.1 — see §4 |
@@ -66,7 +66,7 @@ An agent's entire access surface is the single **Agent role** (the "role problem
 | FR-21 | "Channels by collaborator" endpoint | **Full** |
 | FR-22 | Provisioning only by API: OAuth2 `guilds.join`, overwrites, no invite links | **Full** (invariant) |
 | FR-23 | Agent roster management (Admin layer); `type`/`is_admin` in store; bot projects + reconciles role | **Full** — driven by the backoffice |
-| FR-24 | Visual agent marking with graceful degradation | **Optional** — nickname suffix `- Zippy` applied by the bot; **off by default**. Emoji/color/hoist/role-icon dropped — see §4 |
+| FR-24 | Visual agent marking with graceful degradation | **Optional** — configurable nickname suffix applied by the bot; **off by default**. Emoji/color/hoist/role-icon dropped — see §4 |
 
 ### Non-functional requirements in v1 (the floor)
 
@@ -109,7 +109,7 @@ These ship in a **lighter but real** form in v1 (full rigor continues through v1
 | **FR-12** — New-message notification / routing / auto-assign | **v2** | Pure convenience; no isolation impact. |
 | **FR-2** thread mode | **Dropped** | Unnecessary at the ~50-merchant target (≈50 channels « the 500 budget). Revisit only on a real scale change. |
 | **FR-15** sticky message + activity nudges | **v1.1** | Static topic+pin already satisfies "always available." Sticky/nudge brings the NFR-15 throttling machinery — defer together. |
-| **FR-24** role-icon / color / hoist | **Dropped** | Marking reduced to an optional nickname suffix (`- Zippy`); the richer visual treatments aren't wanted. |
+| **FR-24** role-icon / color / hoist | **Dropped** | Marking reduced to an optional configurable nickname suffix; the richer visual treatments aren't wanted. |
 | **FR-11** slash commands | **v1.1** | The admin API (consumed by the backoffice) covers the control surface; commands are a second front-end. |
 | Webhooks / event hooks (NFR-8) | **v2** | Userland extensibility, not core. |
 
@@ -123,9 +123,9 @@ These ship in a **lighter but real** form in v1 (full rigor continues through v1
 | **Capacity target (NFR-1)** | **~50 merchants → channel mode.** Thread mode and multi-guild sharding dropped from scope. | 50 « the 500-channel budget |
 | **Cardinality** | **merchant ↔ space = 1:1** (each merchant has exactly one space; `UNIQUE(merchant_id)`). **collaborator ↔ space = M:N** — a collaborator is a global external user who may be invited to several merchants' spaces; tenant grouping derives from space membership, not a user→merchant FK. | Isolation unchanged: a collaborator sees only spaces they were invited to |
 | **FR-8 persistence** | **Deferred to v2.** v1 manages access only. | Keeps the DB schema small |
-| **Agent identity / onboarding origin** | **Zippy backoffice** is the upstream admin surface (manual roster, FR-23). Backoffice → hub API → OAuth2 `guilds.join` entry → bot assigns Agent role. SSO/Workspace binding → v2. | See §1.5; upholds no-invites |
+| **Agent identity / onboarding origin** | **backoffice** is the upstream admin surface (manual roster, FR-23). Backoffice → hub API → OAuth2 `guilds.join` entry → bot assigns Agent role. SSO/Workspace binding → v2. | See §1.5; upholds no-invites |
 | **Expulsion cascade default** | **`remove-from-channel` is the default** (revoke the overwrite, keep the person in the guild). `remove-from-server` is explicit opt-in via `?scope=server`. | Least-destructive default; reversible |
-| **Visual marking** | **Optional nickname suffix `- Zippy`** applied by the bot; **off by default**. No emoji/color/hoist/role-icon. | Minimal, opt-in |
+| **Visual marking** | **Optional configurable nickname suffix** applied by the bot; **off by default**. No emoji/color/hoist/role-icon. | Minimal, opt-in |
 | **Persistence backend** | PostgreSQL = source of truth; Valkey = cache/coordination only, **never** source of truth | Per §10 |
 | **License** | **Apache-2.0** | Patent grant matters for a B2B/payments-adjacent OSS tool; avoids AGPL ambiguity (mirrors the Valkey-over-Redis reasoning in §10) |
 | **Project name** | **`discord-support-hub`** (locked, not a placeholder) | §11 caveats dropped |
@@ -147,7 +147,7 @@ Postgres as source of truth: merchants, users, spaces, `type`/`is_admin`. Two-la
 Collaborator add/remove via per-user overwrite; OAuth2 `guilds.join` "Connect with Discord" + `/oauth/discord/callback`; no-invites lockdown; directory + per-space members + per-collaborator channels. **Multi-tenant isolation test suite** as a gate.
 
 **M4 — Lifecycle, audit, visibility, marking** *(FR-7, FR-10, FR-11, FR-14, FR-15-static, FR-24-optional)*
-Space lifecycle (active/resolved/archived/reopen); audit log; list-all; static help-desk presence (topic+pin); optional `- Zippy` nickname-suffix marking.
+Space lifecycle (active/resolved/archived/reopen); audit log; list-all; static help-desk presence (topic+pin); optional configurable nickname-suffix marking.
 
 **M5 — OSS hardening** *(NFR-7, NFR-10, NFR-16)*
 Integration tests against a test guild, structured logs + metrics + health, Docker image, README/CHANGELOG/license, first tagged release `v0.1.0`.
@@ -158,7 +158,7 @@ Integration tests against a test guild, structured logs + metrics + health, Dock
 
 ## 6. Still needs an operator decision
 
-Resolved above: capacity (~50 → channel mode), cardinality (merchant↔space 1:1, collaborator↔space M:N), agent marking (optional `- Zippy` suffix), agent onboarding origin (Zippy backoffice → hub API → OAuth2 entry), license, and project name. Remaining:
+Resolved above: capacity (~50 → channel mode), cardinality (merchant↔space 1:1, collaborator↔space M:N), agent marking (optional configurable suffix), agent onboarding origin (backoffice → hub API → OAuth2 entry), license, and project name. Remaining:
 
 1. **Test guild + bot application** — a throwaway Discord server plus a bot application/token, needed to run integration tests (NFR-16) and real provisioning. This is an **operational prerequisite, not a design decision**; the M0 setup guide will walk through creating one if you don't already have it. *Needed before M2 runs for real.*
 2. **POC frontend session mechanism** — hub-minted (`/auth/session`) vs delegated to the backoffice's auth. The API reserves the `session` principal seam either way; decide before the POC frontend phase.

@@ -63,7 +63,7 @@ CREATE TYPE expulsion_scope AS ENUM ('channel', 'server');
 -- ===========================================================================
 CREATE TABLE merchants (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    -- Stable external key from the Zippy backoffice; lets the backoffice address a
+    -- Stable external key from the backoffice; lets the backoffice address a
     -- merchant by its own id idempotently. Unique to prevent duplicate provisioning.
     external_ref    TEXT NOT NULL,
     name            TEXT NOT NULL,
@@ -75,7 +75,7 @@ CREATE TABLE merchants (
     CONSTRAINT merchants_external_ref_key UNIQUE (external_ref)
 );
 COMMENT ON TABLE merchants IS 'External customers; merchant grouping is a DB fact, never a Discord role.';
-COMMENT ON COLUMN merchants.external_ref IS 'Stable id from the Zippy backoffice; enables idempotent addressing.';
+COMMENT ON COLUMN merchants.external_ref IS 'Stable id from the backoffice; enables idempotent addressing.';
 
 
 -- ===========================================================================
@@ -233,7 +233,7 @@ COMMENT ON COLUMN oauth_tokens.encryption_key_version IS 'Supports key rotation:
 -- ===========================================================================
 CREATE TABLE api_keys (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name         TEXT NOT NULL,                 -- human label, e.g. 'zippy-backoffice-prod'
+    name         TEXT NOT NULL,                 -- human label, e.g. 'backoffice-prod'
     -- SHA-256 (or argon2id) of the raw key. The raw key is shown once at creation
     -- and never stored or logged.
     key_hash     BYTEA NOT NULL,

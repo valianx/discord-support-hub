@@ -30,7 +30,7 @@ Se evaluaron varias alternativas (helpdesks tipo Freshdesk/Chatwoot, Slack Conne
 
 ## 3. Conceptos y glosario
 
-- **Agente:** miembro del equipo interno (Zippy). Lectura/escritura en *todos* los espacios; puede invitar, expulsar y listar. Es un humano con su propia cuenta de Discord.
+- **Agente:** miembro del equipo interno. Lectura/escritura en *todos* los espacios; puede invitar, expulsar y listar. Es un humano con su propia cuenta de Discord.
 - **Admin:** un Agente con privilegio adicional para gestionar el roster de Agentes (alta/baja). No es un tercer rol de cara al cliente, es una salvaguarda.
 - **Colaborador:** invitado externo de un merchant. Acceso solo a los espacios a los que fue invitado; no puede invitar ni expulsar.
 - **Espacio:** la conversación privada por merchant. Puede materializarse como **canal** o como **thread privado** (ver §4.4).
@@ -68,7 +68,7 @@ Se evaluaron varias alternativas (helpdesks tipo Freshdesk/Chatwoot, Slack Conne
 ### 4.5 Marcado visual del Agente
 
 - **Default gratis:** emoji como prefijo en el apodo del servidor (ej. `🛡️ Mario`), aplicado por el bot, + color distintivo + *hoist* (mostrar el rol aparte en la lista de miembros). Sin costo.
-- **Upgrade opcional:** *role icon* (logo de Zippy) sobre el rol Agente, vía API. Requiere **Boost nivel 2**; si el servidor pierde el nivel 2, el icono deja de mostrarse.
+- **Upgrade opcional:** *role icon* (logo del equipo) sobre el rol Agente, vía API. Requiere **Boost nivel 2**; si el servidor pierde el nivel 2, el icono deja de mostrarse.
 - El sistema soporta ambos con degradación elegante: si hay Boost L2 usa el role icon; si no, cae a emoji + color + hoist.
 - Nota: si un usuario tiene varios roles con icono, Discord muestra el del rol más alto.
 
