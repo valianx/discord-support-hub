@@ -4,7 +4,7 @@ info:
   version: 0.1.0
   summary: API-driven provisioning and governance of isolated private Discord support spaces.
   description: |
-    The control surface (FR-11) for discord-support-hub, consumed by the Zippy backoffice
+    The control surface (FR-11) for discord-support-hub, consumed by the backoffice
     (no human UI in v1). Postgres is the authorization source of truth; Discord is a
     projection the bot reconciles (three-layer truth model).
 
@@ -509,7 +509,7 @@ components:
       type: http
       scheme: bearer
       description: |
-        Opaque service API key issued to the Zippy backoffice (AuthZ Layer A). Sent as
+        Opaque service API key issued to the backoffice (AuthZ Layer A). Sent as
         `Authorization: Bearer <key>`. Stored hashed at rest; instantly revocable. The future POC
         frontend uses a separate session principal (not this long-lived key) behind the same
         authorization layer.
