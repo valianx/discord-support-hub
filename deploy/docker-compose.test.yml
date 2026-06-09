@@ -1,0 +1,152 @@
+# =============================================================================
+# TEST/DEMO ONLY — dummy secrets, never use in production.
+#
+# With these dummy Discord credentials the UI, auth, and listing work.
+# Provisioning jobs will be accepted (202) and then fail at Discord —
+# supply real DISCORD_* values to provision for real.
+#
+# Quick start:
+#   docker compose -f deploy/docker-compose.test.yml up --build
+#   open http://localhost:3000
+#
+# Mint a key (first time or when you need a new one):
+#   docker compose -f deploy/docker-compose.test.yml --profile tools run --rm keygen
+# =============================================================================
+
+# Shared environment block — the api and worker share these values.
+x-app-env: &app-env
+  POSTGRES_DSN: "postgres://hub:hub_test@postgres:5432/discord_support_hub?sslmode=disable"
+  VALKEY_ADDR: "valkey:6379"
+  LOG_LEVEL: "info"
+
+  # TEST ONLY — dummy Discord credentials.
+  # Real provisioning (channel/role creation) will fail at Discord; all API
+  # endpoints and the UI work normally with these values.
+  DISCORD_BOT_TOKEN: "test-bot-token-not-real"
+  DISCORD_GUILD_ID: "100000000000000001"
+  DISCORD_AGENT_ROLE_ID: "100000000000000002"  # must differ from guild id (boot guard)
+  DISCORD_CATEGORY_ID: "100000000000000003"
+
+  # TEST ONLY — fixed AES-256-GCM key (base64-encoded 32 bytes).
+  # Never use this value in production. Generate your own: openssl rand -base64 32
+  ENCRYPTION_KEY: "Gk7yssW60Qb46DN6tZ97l9gxxuvXdlsvMU/n2SI5hgo="  # TEST ONLY
+
+  # TEST ONLY — fixed HMAC secret (hex-encoded 32 bytes / 64 hex chars).
+  # Never use this value in production. Generate your own: openssl rand -hex 32
+  OAUTH_HMAC_SECRET: "d2344cc14d716cd4d1c360257b68876ad15bd6ff20126cefe2135c5acd021212"  # TEST ONLY
+
+  # Disable the reconcile sweep in the test stack (no real Discord to sweep).
+  RECONCILE_SWEEP_CRON: ""
+
+services:
+
+  # PostgreSQL 16 — source of truth.
+  # Internal only: no host port (avoids conflict with an existing local 5432).
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: discord_support_hub
+      POSTGRES_USER: hub
+      POSTGRES_PASSWORD: hub_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hub -d discord_support_hub"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Valkey 8 — cache + coordination.
+  # Internal only: no host port.
+  valkey:
+    image: valkey/valkey:8-alpine
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Migration runner — applies schema migrations once and exits.
+  migrate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: builder
+    command: ["/out/migrate"]
+    environment:
+      POSTGRES_DSN: "postgres://hub:hub_test@postgres:5432/discord_support_hub?sslmode=disable"
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # API server — published on 8080 for direct debugging.
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: api
+    ports:
+      - "8080:8080"
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/livez || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Worker — asynq task processor.
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: worker
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # Frontend — nginx serving the Vite SPA build; proxies /v1, /livez, /readyz, /metrics to api.
+  # Open http://localhost:3000 in your browser.
+  frontend:
+    build:
+      context: ../web/poc
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      api:
+        condition: service_started
+
+  # ── Tools profile ────────────────────────────────────────────────────────────
+  # Services in this profile do NOT start on a normal `docker compose up`.
+  # Run on demand:
+  #   docker compose -f deploy/docker-compose.test.yml --profile tools run --rm keygen
+
+  # keygen — mints a backoffice service API key and prints it once to stdout.
+  keygen:
+    profiles: ["tools"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: builder
+    command: ["/out/keygen", "--name", "demo-backoffice", "--scope", "backoffice"]
+    environment:
+      POSTGRES_DSN: "postgres://hub:hub_test@postgres:5432/discord_support_hub?sslmode=disable"
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"

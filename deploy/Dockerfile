@@ -33,7 +33,12 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
       -trimpath \
       -ldflags="-s -w" \
       -o /out/reconciler \
-      ./cmd/reconciler
+      ./cmd/reconciler && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+      -trimpath \
+      -ldflags="-s -w" \
+      -o /out/keygen \
+      ./cmd/keygen
 
 # ── Stage 2: api image ───────────────────────────────────────────────────────
 FROM gcr.io/distroless/static-debian12 AS api

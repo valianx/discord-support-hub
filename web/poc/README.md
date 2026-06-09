@@ -6,6 +6,40 @@ A single-view backoffice simulator for the Discord Support Hub control-plane API
 
 ---
 
+## Run the whole stack (test/demo)
+
+The fastest way to try the full system — no local Go, Postgres, or Valkey required.
+
+```bash
+# From the repo root:
+docker compose -f deploy/docker-compose.test.yml up --build
+```
+
+This brings up: postgres + valkey + migrate (one-shot) + api + worker + frontend (nginx).
+Open http://localhost:3000 when the stack is healthy.
+
+**Mint an API key (first time, or whenever you need a fresh one):**
+
+```bash
+docker compose -f deploy/docker-compose.test.yml --profile tools run --rm keygen
+```
+
+Copy the raw key printed to stdout. Then in the browser:
+1. Click **Settings** (top-right).
+2. Paste the key into **Service API Key**.
+3. Leave **Hub Base URL** as `/` (nginx proxies to the api — no CORS needed).
+4. Click **Save**.
+
+> **Caveat about real Discord provisioning:** the test stack ships with dummy
+> Discord credentials. The UI, authentication, and all listing/read endpoints
+> work normally. Provisioning jobs (`POST /v1/merchants/{id}/channels`) are
+> accepted (`202`) and then fail at Discord because the bot token is fake.
+> To provision for real, override the `DISCORD_*` env vars in
+> `deploy/docker-compose.test.yml` (or pass them with `--env-file`) with your
+> actual bot token, guild ID, agent role ID, and category ID.
+
+---
+
 ## Prerequisites
 
 - Node.js 18+ / npm 9+

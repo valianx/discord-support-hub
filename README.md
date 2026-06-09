@@ -49,10 +49,23 @@ cp .env.example .env
 
 ### 2. Run with Docker Compose
 
+**Test/demo stack — one command, no `.env` required:**
+
+```bash
+docker compose -f deploy/docker-compose.test.yml up --build
+# Starts: api + worker + postgres + valkey + frontend (nginx SPA)
+# Opens on http://localhost:3000
+```
+
+Mint a key and try the UI: see [web/poc/README.md](web/poc/README.md) § "Run the whole stack (test/demo)".
+
+**Production-ish stack:**
+
 ```bash
 make up
 # Starts: api + worker + postgres + valkey
 # Applies migrations automatically via cmd/migrate
+# Requires a .env file with real credentials
 ```
 
 Verify the stack is healthy:
