@@ -16,6 +16,7 @@ import (
 	"github.com/valianx/discord-support-hub/internal/lock"
 	"github.com/valianx/discord-support-hub/internal/oauth"
 	obsv "github.com/valianx/discord-support-hub/internal/observability"
+	"github.com/valianx/discord-support-hub/internal/queue"
 	"github.com/valianx/discord-support-hub/internal/reconcile"
 	"github.com/valianx/discord-support-hub/internal/secrets"
 	pgstore "github.com/valianx/discord-support-hub/internal/store/postgres"
@@ -111,6 +112,28 @@ func main() {
 		}()
 		defer scheduler.Stop()
 	}
+
+	// fix(outbox-relay): wire the transactional outbox relay so pending outbox rows are
+	// actually enqueued as asynq tasks. Without this, CreateSpaceWithOutbox writes the row
+	// but no task is ever created → the provision worker sits idle → no Discord channel.
+	// The relay polls every 2 s (RelayConfig default), stamps enqueued_at, and stops cleanly
+	// when the context is cancelled (i.e. on SIGINT/SIGTERM).
+	relayCtx, relayCancel := context.WithCancel(ctx)
+	queueClient := queue.NewClient(cfg.ValkeyAddr, cfg.ValkeyPassword, cfg.ValkeyDB)
+	defer func() {
+		relayCancel()
+		_ = queueClient.Close()
+	}()
+	relay := worker.NewRelay(worker.RelayConfig{
+		Store:       pg,
+		QueueClient: queueClient,
+		// PollInterval and BatchSize use the NewRelay defaults (2 s / 100).
+	})
+	go func() {
+		slog.Info("outbox relay: starting")
+		relay.Run(relayCtx)
+		slog.Info("outbox relay: stopped")
+	}()
 
 	// Build and start the asynq server.
 	// fix(NFR-5): AgentRoleID and DefaultCategoryID are now wired so the provision handler
