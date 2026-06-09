@@ -1,0 +1,793 @@
+openapi: 3.1.0
+info:
+  title: discord-support-hub API
+  version: 0.1.0
+  summary: API-driven provisioning and governance of isolated private Discord support spaces.
+  description: |
+    The control surface (FR-11) for discord-support-hub, consumed by the Zippy backoffice
+    (no human UI in v1). Postgres is the authorization source of truth; Discord is a
+    projection the bot reconciles (three-layer truth model).
+
+    Conventions:
+      * **Mutating endpoints are asynchronous.** They validate, persist the *desired*
+        state, enqueue a job, and return `202 Accepted` with a `job` handle. Poll
+        `GET /jobs/{jobId}` for completion. (NFR-2: latency decoupled from Discord rate limits.)
+      * **Read endpoints** are served from cache (TTL + write-invalidation) and return `200`.
+      * **Authorization always resolves against Postgres**, never the Discord role (NFR-13).
+      * **Idempotency:** mutating requests accept an `Idempotency-Key` header; a repeated key
+        replays the original response instead of re-enqueueing (NFR-3).
+      * **No invite links** anywhere: guild entry is OAuth2 `guilds.join` for everyone (NFR-14).
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  contact:
+    name: discord-support-hub
+
+servers:
+  - url: https://hub.example.com/v1
+    description: Hub API (v1 base path)
+
+security:
+  - ServiceApiKey: []
+
+tags:
+  - name: Spaces
+    description: Provision and manage per-merchant private spaces (channels).
+  - name: Collaborators
+    description: Manage external collaborator membership of a space.
+  - name: Agents
+    description: Agent roster management (Admin only).
+  - name: Transversal
+    description: Directory, audit, OAuth2 callback.
+  - name: Jobs
+    description: Poll the status of asynchronous mutating operations.
+
+paths:
+
+  # ----------------------------------------------------------------------- #
+  # SPACES
+  # ----------------------------------------------------------------------- #
+  /merchants/{merchantId}/channels:
+    post:
+      tags: [Spaces]
+      operationId: provisionSpace
+      summary: Provision a private space (channel) for a merchant (async).
+      description: |
+        Records desired state and enqueues a provisioning job. The worker creates a Discord
+        channel already denied to `@everyone` (fail-closed, NFR-4), applies the category-level
+        Agent allow, and persists `discord_channel_id`. Returns `202` with a job handle.
+      parameters:
+        - $ref: '#/components/parameters/MerchantId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProvisionSpaceRequest'
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /channels:
+    get:
+      tags: [Spaces]
+      operationId: listSpaces
+      summary: List all spaces with state, owner, created, last activity (FR-10).
+      parameters:
+        - name: lifecycle_state
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/SpaceLifecycleState' }
+        - name: merchant_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of spaces.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Space' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /channels/{id}:
+    get:
+      tags: [Spaces]
+      operationId: getSpace
+      summary: Space detail (FR-10).
+      parameters:
+        - $ref: '#/components/parameters/SpaceId'
+      responses:
+        '200':
+          description: Space detail.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Space' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /channels/{id}/members:
+    get:
+      tags: [Spaces]
+      operationId: listSpaceMembers
+      summary: Users of a space with their role and merchant (FR-17).
+      parameters:
+        - $ref: '#/components/parameters/SpaceId'
+      responses:
+        '200':
+          description: Members of the space.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/SpaceMember' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /channels/{id}/lifecycle:
+    post:
+      tags: [Spaces]
+      operationId: changeSpaceLifecycle
+      summary: Transition space lifecycle - open/resolve/archive/reopen (FR-7, async).
+      description: |
+        Archiving locks/hides the channel without deleting history. The worker applies the
+        Discord-side change; returns `202`.
+      parameters:
+        - $ref: '#/components/parameters/SpaceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action:
+                  type: string
+                  enum: [open, resolve, archive, reopen]
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /channels/{id}/welcome:sync:
+    post:
+      tags: [Spaces]
+      operationId: syncWelcome
+      summary: Sync static help-desk presence - topic + pin (FR-15 static, async).
+      parameters:
+        - $ref: '#/components/parameters/SpaceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                message:
+                  type: string
+                  description: Override help-desk message; defaults to merchant/config template.
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ----------------------------------------------------------------------- #
+  # COLLABORATORS
+  # ----------------------------------------------------------------------- #
+  /channels/{id}/collaborators:
+    post:
+      tags: [Collaborators]
+      operationId: inviteCollaborator
+      summary: Invite a collaborator to a space (overwrite + OAuth2 join if needed, async).
+      description: |
+        Records the desired `space_member`, enqueues a job that (a) adds the user to the guild
+        via OAuth2 `guilds.join` if not already present, and (b) applies the per-user permission
+        overwrite granting access to this one space. Only Agents/Admins may invite (FR-20).
+      parameters:
+        - $ref: '#/components/parameters/SpaceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InviteCollaboratorRequest'
+      responses:
+        '202':
+          description: |
+            Accepted. If the collaborator has not yet completed "Connect with Discord", the
+            response includes a `connect_url` for the one-time OAuth2 step.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/JobAcceptedBody'
+                  - type: object
+                    properties:
+                      connect_url:
+                        type: [string, 'null']
+                        format: uri
+                        description: One-time OAuth2 guilds.join URL, present when the user must connect first.
+          headers:
+            Location: { $ref: '#/components/headers/JobLocation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /channels/{id}/collaborators/{userId}:
+    delete:
+      tags: [Collaborators]
+      operationId: expelCollaborator
+      summary: Expel a collaborator from a space (FR-19, async).
+      description: |
+        `scope=channel` (default) revokes the per-user overwrite, keeping the person in the guild.
+        `scope=server` also removes them from the guild. Audited either way.
+      parameters:
+        - $ref: '#/components/parameters/SpaceId'
+        - $ref: '#/components/parameters/UserId'
+        - name: scope
+          in: query
+          required: false
+          description: Expulsion scope. Default `channel` (least-destructive).
+          schema:
+            type: string
+            enum: [channel, server]
+            default: channel
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /collaborators/{userId}/channels:
+    get:
+      tags: [Collaborators]
+      operationId: listCollaboratorChannels
+      summary: Spaces a collaborator has access to, with merchant, role, state (FR-21).
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '200':
+          description: Spaces accessible to the collaborator.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/CollaboratorChannel' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ----------------------------------------------------------------------- #
+  # AGENTS (Admin only)
+  # ----------------------------------------------------------------------- #
+  /agents:
+    get:
+      tags: [Agents]
+      operationId: listAgents
+      summary: List agents (Admin only) (FR-23).
+      responses:
+        '200':
+          description: Agent roster.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Agent' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Agents]
+      operationId: addAgent
+      summary: Add an agent to the roster (Admin only) (FR-23).
+      description: |
+        Synchronously records `type=agent` (+ `is_admin`) in Postgres - the authZ source of truth -
+        and returns a one-time Connect-with-Discord link. A reconcile job projects the Agent role
+        once the agent has joined the guild. Returns `201`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddAgentRequest'
+      responses:
+        '201':
+          description: Agent recorded; returns the agent and a one-time connect URL.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Agent'
+                  - type: object
+                    properties:
+                      connect_url:
+                        type: string
+                        format: uri
+                        description: One-time OAuth2 guilds.join URL for the agent.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /agents/{userId}:
+    delete:
+      tags: [Agents]
+      operationId: removeAgent
+      summary: Remove an agent from the roster (Admin only) (FR-23, async).
+      description: |
+        Marks the agent inactive in Postgres and enqueues a job to remove the Agent role
+        (and optionally the guild membership). Returns `202`.
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+        - name: scope
+          in: query
+          required: false
+          description: '`role` removes only the Agent role; `server` also removes from the guild.'
+          schema:
+            type: string
+            enum: [role, server]
+            default: role
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ----------------------------------------------------------------------- #
+  # TRANSVERSAL
+  # ----------------------------------------------------------------------- #
+  /directory:
+    get:
+      tags: [Transversal]
+      operationId: getDirectory
+      summary: Global directory - spaces x users x role, bidirectional search (FR-18).
+      parameters:
+        - name: user_id
+          in: query
+          required: false
+          description: Filter to spaces this user is in ("in what spaces is this user").
+          schema: { type: string, format: uuid }
+        - name: space_id
+          in: query
+          required: false
+          description: Filter to users in this space ("who is in this space").
+          schema: { type: string, format: uuid }
+        - name: merchant_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Directory entries (space x user x role).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/DirectoryEntry' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /audit:
+    get:
+      tags: [Transversal]
+      operationId: getAudit
+      summary: Audit log of provisioning, membership, lifecycle, expulsion (FR-14).
+      parameters:
+        - name: merchant_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+        - name: space_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+        - name: action
+          in: query
+          required: false
+          schema: { type: string }
+        - name: since
+          in: query
+          required: false
+          schema: { type: string, format: date-time }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Audit entries (newest first).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditEntry' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /oauth/discord/callback:
+    get:
+      tags: [Transversal]
+      operationId: oauthDiscordCallback
+      summary: OAuth2 "Connect with Discord" callback (FR-22).
+      description: |
+        Discord redirects here after the user authorizes `identify guilds.join`. The hub exchanges
+        the `code` for an access token (stored encrypted), links it to the user, and enqueues the
+        add-to-guild + access-grant job. **No invite link is ever used.** This endpoint is reached
+        via browser redirect and is exempt from the service-API-key requirement (CSRF-protected via
+        the signed `state` parameter).
+      security: []
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string }
+        - name: state
+          in: query
+          required: true
+          description: Signed, single-use anti-CSRF token binding the callback to the initiating request.
+          schema: { type: string }
+      responses:
+        '302':
+          description: Redirect to a backoffice/POC success or failure page.
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  # ----------------------------------------------------------------------- #
+  # JOBS (async polling)
+  # ----------------------------------------------------------------------- #
+  /jobs/{jobId}:
+    get:
+      tags: [Jobs]
+      operationId: getJob
+      summary: Poll the status of an asynchronous operation.
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Job status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+
+  securitySchemes:
+    ServiceApiKey:
+      type: http
+      scheme: bearer
+      description: |
+        Opaque service API key issued to the Zippy backoffice (AuthZ Layer A). Sent as
+        `Authorization: Bearer <key>`. Stored hashed at rest; instantly revocable. The future POC
+        frontend uses a separate session principal (not this long-lived key) behind the same
+        authorization layer.
+
+  parameters:
+    MerchantId:
+      name: merchantId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    SpaceId:
+      name: id
+      in: path
+      required: true
+      description: Space (channel) id.
+      schema: { type: string, format: uuid }
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Client-supplied key making a mutating request idempotent (NFR-3). A repeated key with the
+        same body replays the original response; a repeated key with a different body returns 409.
+      schema: { type: string, maxLength: 255 }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema: { type: string }
+
+  headers:
+    JobLocation:
+      description: URL to poll for job completion.
+      schema: { type: string, format: uri }
+
+  responses:
+    JobAccepted:
+      description: |
+        Accepted for asynchronous processing. The desired state is persisted; a worker will apply
+        the Discord-side change. Poll the returned job for completion.
+      headers:
+        Location: { $ref: '#/components/headers/JobLocation' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/JobAcceptedBody' }
+    BadRequest:
+      description: Invalid request.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Missing or invalid service API key.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Authenticated but not authorized (resolved against Postgres, NFR-13).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Idempotency-Key reused with a different body, or a conflicting state.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+
+    SpaceLifecycleState:
+      type: string
+      enum: [active, resolved, archived]
+
+    AclState:
+      type: string
+      description: Fail-closed ACL projection state. Only `applied` is treated as accessible (NFR-4).
+      enum: [pending, applied, degraded, failed]
+
+    JobStatus:
+      type: string
+      enum: [pending, active, completed, retrying, archived]
+
+    UserType:
+      type: string
+      enum: [agent, collaborator]
+
+    ProvisionSpaceRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: Space name; channel naming may be templated by config (FR-13).
+        category_id:
+          type: [string, 'null']
+          description: Discord category to place the channel under; defaults to configured category.
+        welcome_message:
+          type: [string, 'null']
+          description: Static help-desk message for topic/pin (FR-15 static).
+
+    InviteCollaboratorRequest:
+      type: object
+      description: Identify the collaborator by hub user id, or by Discord id / email to create the roster row.
+      properties:
+        user_id:
+          type: [string, 'null']
+          format: uuid
+        discord_user_id:
+          type: [string, 'null']
+        email:
+          type: [string, 'null']
+          format: email
+        display_name:
+          type: [string, 'null']
+      anyOf:
+        - required: [user_id]
+        - required: [discord_user_id]
+        - required: [email]
+
+    AddAgentRequest:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email }
+        display_name: { type: [string, 'null'] }
+        discord_user_id:
+          type: [string, 'null']
+          description: Known Discord id if available; otherwise captured at OAuth2 connect.
+        is_admin:
+          type: boolean
+          default: false
+          description: Grant the Admin roster-management privilege.
+
+    Space:
+      type: object
+      required: [id, merchant_id, name, lifecycle_state, acl_state, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        merchant_id: { type: string, format: uuid }
+        name: { type: string }
+        discord_channel_id:
+          type: [string, 'null']
+          description: Null until provisioned by the worker.
+        discord_category_id: { type: [string, 'null'] }
+        lifecycle_state: { $ref: '#/components/schemas/SpaceLifecycleState' }
+        acl_state: { $ref: '#/components/schemas/AclState' }
+        last_activity_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+        archived_at: { type: [string, 'null'], format: date-time }
+
+    SpaceMember:
+      type: object
+      required: [user_id, role]
+      properties:
+        user_id: { type: string, format: uuid }
+        discord_user_id: { type: [string, 'null'] }
+        display_name: { type: [string, 'null'] }
+        merchant_id: { type: [string, 'null'], format: uuid }
+        role:
+          type: string
+          enum: [collaborator]
+        overwrite_applied:
+          type: boolean
+          description: Whether the per-user Discord overwrite has been projected.
+        invited_by: { type: [string, 'null'], format: uuid }
+        created_at: { type: string, format: date-time }
+
+    CollaboratorChannel:
+      type: object
+      required: [space_id, role, lifecycle_state]
+      properties:
+        space_id: { type: string, format: uuid }
+        space_name: { type: string }
+        merchant_id: { type: string, format: uuid }
+        merchant_name: { type: string }
+        role:
+          type: string
+          enum: [collaborator]
+        lifecycle_state: { $ref: '#/components/schemas/SpaceLifecycleState' }
+
+    Agent:
+      type: object
+      required: [id, type, is_admin]
+      properties:
+        id: { type: string, format: uuid }
+        type:
+          type: string
+          enum: [agent]
+        is_admin: { type: boolean }
+        email: { type: [string, 'null'], format: email }
+        display_name: { type: [string, 'null'] }
+        discord_user_id: { type: [string, 'null'] }
+        provisioned_at:
+          type: [string, 'null']
+          format: date-time
+          description: Set once the bot has added them to the guild and projected the Agent role.
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    DirectoryEntry:
+      type: object
+      required: [space_id, user_id, role]
+      properties:
+        space_id: { type: string, format: uuid }
+        space_name: { type: string }
+        merchant_id: { type: string, format: uuid }
+        merchant_name: { type: string }
+        user_id: { type: string, format: uuid }
+        user_display_name: { type: [string, 'null'] }
+        role: { $ref: '#/components/schemas/UserType' }
+
+    AuditEntry:
+      type: object
+      required: [id, action, created_at]
+      properties:
+        id: { type: integer, format: int64 }
+        action:
+          type: string
+          description: e.g. space.provision, collaborator.invite, collaborator.expel, agent.add, space.archive, reconcile.repair.
+        actor_user_id: { type: [string, 'null'], format: uuid }
+        merchant_id: { type: [string, 'null'], format: uuid }
+        space_id: { type: [string, 'null'], format: uuid }
+        target_user_id: { type: [string, 'null'], format: uuid }
+        scope:
+          type: [string, 'null']
+          enum: [channel, server, null]
+        detail:
+          type: [object, 'null']
+          additionalProperties: true
+        created_at: { type: string, format: date-time }
+
+    JobAcceptedBody:
+      type: object
+      required: [job]
+      properties:
+        job: { $ref: '#/components/schemas/Job' }
+
+    Job:
+      type: object
+      required: [id, kind, status, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        kind:
+          type: string
+          description: e.g. provision_space, invite_collaborator, expel, project_agent_role, change_lifecycle.
+        status: { $ref: '#/components/schemas/JobStatus' }
+        space_id: { type: [string, 'null'], format: uuid }
+        merchant_id: { type: [string, 'null'], format: uuid }
+        user_id: { type: [string, 'null'], format: uuid }
+        retry_count: { type: integer }
+        error:
+          type: [string, 'null']
+          description: Last error (redacted) if retrying or archived.
+        created_at: { type: string, format: date-time }
+        completed_at: { type: [string, 'null'], format: date-time }
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Machine-readable error code, e.g. validation_error, forbidden, not_found, idempotency_conflict.
+        message: { type: string }
+        details:
+          type: [object, 'null']
+          additionalProperties: true
