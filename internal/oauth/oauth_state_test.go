@@ -365,6 +365,11 @@ func (f *tokenFakeStore) GetJobBySpaceIDAndKind(_ context.Context, _, _ string) 
 	return nil, store.ErrNotFound
 }
 
+// ListActiveProvisionedSpaces satisfies store.Store (added in M5 for the scheduled sweep).
+func (f *tokenFakeStore) ListActiveProvisionedSpaces(_ context.Context) ([]*domain.Space, error) {
+	panic("ListActiveProvisionedSpaces")
+}
+
 // TestTokenStore_Store_PersistsEncryptedOnly verifies that tokens are stored as
 // ciphertext and that the plaintext does NOT appear in the stored row (AC-3, NFR-6).
 func TestTokenStore_Store_PersistsEncryptedOnly(t *testing.T) {

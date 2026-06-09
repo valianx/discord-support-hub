@@ -20,6 +20,9 @@ type RouterConfig struct {
 	// Never use "*" with credentials (docs/02-architecture.md §5.3).
 	CORSAllowedOrigins []string
 
+	// Metrics is the Prometheus metrics instance. When non-nil, /metrics is exposed.
+	Metrics *observability.Metrics
+
 	// Store is the Postgres-backed store, used by Layer A (auth) and handlers.
 	Store store.Store
 
@@ -58,6 +61,12 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	// Health endpoints — exempt from authentication.
 	r.GET("/livez", observability.LivezHandler)
 	r.GET("/readyz", observability.ReadyzHandler(cfg.PGPinger, cfg.RedisPinger))
+
+	// Prometheus metrics endpoint — exempt from authentication (scraper access).
+	// Omitted when Metrics is nil (e.g. tests that do not need metrics).
+	if cfg.Metrics != nil {
+		r.GET("/metrics", gin.WrapH(cfg.Metrics.Handler()))
+	}
 
 	// Build the handler struct with all M3 deps wired in.
 	h := handlers.NewHandlers(handlers.Config{

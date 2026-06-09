@@ -21,6 +21,7 @@ import (
 	"github.com/valianx/discord-support-hub/internal/queue"
 	"github.com/valianx/discord-support-hub/internal/secrets"
 	"github.com/valianx/discord-support-hub/internal/store/postgres"
+	"github.com/valianx/discord-support-hub/internal/version"
 )
 
 func main() {
@@ -32,6 +33,10 @@ func main() {
 	}
 
 	observability.InitLogger(cfg.LogLevel)
+	slog.Info("api: starting", "version", version.Version)
+
+	// M5: initialise the Prometheus metrics registry (AC-2).
+	metrics := observability.InitMetrics()
 
 	if err = cfg.RequirePostgresDSN(); err != nil {
 		slog.Error("startup: missing required config", "error", err)
@@ -102,6 +107,7 @@ func main() {
 	// Build the Gin router with real auth and handler dependencies.
 	router := api.NewRouter(api.RouterConfig{
 		CORSAllowedOrigins:       cfg.CORSAllowedOrigins,
+		Metrics:                  metrics,
 		Store:                    pg,
 		QueueClient:              queueClient,
 		DiscordOAuthClientID:     cfg.DiscordOAuthClientID,

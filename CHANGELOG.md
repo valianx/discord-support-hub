@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] — 2026-06-09
+
 ### Added
+- **M5 — OSS hardening** (terminal v1 milestone):
+  - **Integration test harness** (`//go:build integration`): live suite in `test/integration/` targeting a throwaway test guild. Skips gracefully with a clear message when test-guild env vars (`DISCORD_BOT_TOKEN`, `TEST_GUILD_ID`, etc.) are absent — `go test ./...` and CI without a guild always pass. Run with `-tags integration` and the env vars from `docs/test-guild-setup.md`. Includes `TestLive_ReconcileGuild_Smoke`, `TestLive_IsolationSuite_MultiTenant`, and `TestLive_EncryptionKey_Valid` (NFR-16, AC-1).
+  - **Minimal Prometheus metrics** (`internal/observability/metrics.go`): four metrics — `hub_provisioning_latency_seconds` (histogram), `hub_active_spaces_total` (gauge), `hub_ratelimit_hits_total` (counter), `hub_errors_total{kind}` (counter). Served via `/metrics` on the API. Isolated registry (no process/Go-runtime leakage). Helper functions are nil-safe. Health checks (`/livez`, `/readyz`) already report dependency status (NFR-7, AC-2).
+  - **Scheduled full-guild reconcile sweep** (`internal/worker/scheduler.go`, `reconcile_guild_test.go`): `asynq.Scheduler` enqueues a `reconcile:guild` task on the low-priority `reconcile` queue at the configured cron interval (default `*/5 * * * *`, overridable via `RECONCILE_SWEEP_CRON`). The `ReconcileGuild` engine method enumerates all `lifecycle=active` provisioned spaces from Postgres and calls `ReconcileSpace` for each. Postgres always wins — unbacked Discord overwrites are revoked (NFR-5, AC-5).
+  - **`internal/version` package**: `version.Version = "v0.1.0"` const, overridable at link time with `-ldflags`. Logged at API startup.
+  - **`.gitattributes`**: `*.go text eol=lf` (and sensible defaults for all text/binary types). Prevents CRLF drift on Windows checkouts from causing spurious `gofmt -l` diffs in CI (AC-3).
+  - **`RECONCILE_SWEEP_CRON`** env var in config (default `*/5 * * * *`); empty string disables the scheduled sweep.
+
+### Added (M0 through M4)
 - **M0 — Skeleton.** Empty-but-running scaffold for the service (step 1 of the v1 work plan):
   - Go module `github.com/valianx/discord-support-hub` (Go 1.26) with the package layout from `docs/02-architecture.md §8`.
   - Entrypoints: `cmd/api` (Gin HTTP server, graceful shutdown), `cmd/worker` (asynq server over Valkey with the `provision`/`membership`/`reconcile`/`marking` queue topology), `cmd/migrate` (idempotent SQL migration runner), `cmd/reconciler` (stub).
@@ -56,4 +67,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Job-status mirror: `GET /jobs/{id}` reflects the real worker outcome (no longer stale `pending`).
   - Hardening: agent `display_name` and channel names reject ASCII-control + Unicode format/private-use chars; agent nickname truncates by rune (UTF-8-safe).
 
-[Unreleased]: https://github.com/valianx/discord-support-hub/commits/main
+[Unreleased]: https://github.com/valianx/discord-support-hub/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/valianx/discord-support-hub/releases/tag/v0.1.0

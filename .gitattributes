@@ -1,0 +1,37 @@
+# Normalize line endings to LF on commit/checkout.
+# This prevents gofmt -l from reporting spurious diffs on Windows checkouts (M5, AC-3).
+
+# Default: text files get LF.
+* text=auto eol=lf
+
+# Go source and related text files: always LF.
+*.go       text eol=lf
+*.mod      text eol=lf
+*.sum      text eol=lf
+*.sql      text eol=lf
+*.yaml     text eol=lf
+*.yml      text eol=lf
+*.json     text eol=lf
+*.md       text eol=lf
+*.env      text eol=lf
+*.env.*    text eol=lf
+Makefile   text eol=lf
+Dockerfile text eol=lf
+
+# Shell scripts: LF only (they will not run with CRLF on Unix).
+*.sh       text eol=lf
+
+# Binary files: no line-ending normalization.
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.ico      binary
+*.woff     binary
+*.woff2    binary
+*.ttf      binary
+*.eot      binary
+*.pdf      binary
+*.zip      binary
+*.tar      binary
+*.gz       binary

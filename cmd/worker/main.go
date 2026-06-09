@@ -10,10 +10,12 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/valianx/discord-support-hub/internal/config"
 	"github.com/valianx/discord-support-hub/internal/discord"
+	"github.com/valianx/discord-support-hub/internal/lock"
 	"github.com/valianx/discord-support-hub/internal/oauth"
-	"github.com/valianx/discord-support-hub/internal/observability"
+	obsv "github.com/valianx/discord-support-hub/internal/observability"
 	"github.com/valianx/discord-support-hub/internal/reconcile"
 	"github.com/valianx/discord-support-hub/internal/secrets"
 	pgstore "github.com/valianx/discord-support-hub/internal/store/postgres"
@@ -27,7 +29,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	observability.InitLogger(cfg.LogLevel)
+	obsv.InitLogger(cfg.LogLevel)
+
+	// M5: initialise the Prometheus metrics registry (AC-2) so /metrics reflects real outcomes.
+	metrics := obsv.InitMetrics()
 
 	if err = cfg.RequireDiscordToken(); err != nil {
 		slog.Error("startup: missing required config", "error", err)
@@ -71,8 +76,41 @@ func main() {
 		slog.Warn("startup: ENCRYPTION_KEY not set — guilds.join will be skipped in invite_collaborator (non-fatal if OAuth2 not used)")
 	}
 
-	// M3: reconcile engine — desired-state vs real Discord diff and repair (§4.2).
-	reconcileEngine := reconcile.NewEngine(pg, discordSession)
+	// Valkey client — used for the distributed reconcile lock (SEC-M5-002).
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     cfg.ValkeyAddr,
+		Password: cfg.ValkeyPassword,
+		DB:       cfg.ValkeyDB,
+	})
+	defer rdb.Close() //nolint:errcheck
+
+	// M3/M5: reconcile engine — desired-state vs real Discord diff and repair (§4.2).
+	// fix(SEC-M5-002): use NewEngineWithLocker so concurrent scheduled sweeps acquire a
+	// per-space lock before reconciling, preventing doubled Discord calls.
+	// fix(AC-2): WithMetrics so the guild sweep updates hub_active_spaces_total each run.
+	reconcileEngine := reconcile.NewEngineWithLocker(pg, discordSession, lock.New(rdb)).
+		WithMetrics(metrics)
+
+	// M5: wire the asynq Scheduler for the scheduled full-guild reconcile sweep (AC-5).
+	// The scheduler enqueues a reconcile:guild task on the low-priority reconcile queue at
+	// the cron interval from config (default every 5 minutes). An empty cron disables it.
+	if cfg.ReconcileSweepCron != "" {
+		scheduler, schedErr := worker.NewScheduler(
+			cfg.ValkeyAddr, cfg.ValkeyPassword, cfg.ValkeyDB,
+			cfg.ReconcileSweepCron, cfg.DiscordGuildID,
+		)
+		if schedErr != nil {
+			slog.Error("startup: reconcile scheduler init failed", "error", schedErr)
+			os.Exit(1)
+		}
+		go func() {
+			slog.Info("scheduler: starting", "cron", cfg.ReconcileSweepCron)
+			if err := scheduler.Start(); err != nil {
+				slog.Error("scheduler: start error", "error", err)
+			}
+		}()
+		defer scheduler.Stop()
+	}
 
 	// Build and start the asynq server.
 	// fix(NFR-5): AgentRoleID and DefaultCategoryID are now wired so the provision handler
@@ -92,6 +130,7 @@ func main() {
 		TokenStore:          tokenStore,
 		ReconcileEngine:     reconcileEngine,
 		AgentNicknameSuffix: cfg.AgentNicknameSuffix,
+		Metrics:             metrics, // fix(AC-2): wire real metrics to provision worker
 	})
 
 	// Start the worker in a goroutine; it blocks until Shutdown is called.

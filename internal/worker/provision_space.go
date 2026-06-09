@@ -27,6 +27,7 @@ import (
 	"github.com/valianx/discord-support-hub/internal/discord"
 	"github.com/valianx/discord-support-hub/internal/domain"
 	"github.com/valianx/discord-support-hub/internal/lock"
+	"github.com/valianx/discord-support-hub/internal/observability"
 	"github.com/valianx/discord-support-hub/internal/queue"
 	"github.com/valianx/discord-support-hub/internal/ratelimit"
 	"github.com/valianx/discord-support-hub/internal/store"
@@ -51,6 +52,7 @@ type provisionSpaceConfig struct {
 	limiter         ratelimit.Limiter
 	locker          lock.Locker
 	cache           cache.Cache
+	metrics         *observability.Metrics // nil → no-op (AC-2 wire-up, nil-safe)
 	guildID         string
 	everyoneRoleID  string // Discord @everyone role id (equals guildID in Discord)
 	agentRoleID     string // Discord Agent role id — MUST NOT equal guildID (NFR-5)
@@ -91,10 +93,14 @@ func newProvisionSpaceHandler(cfg provisionSpaceConfig) asynq.HandlerFunc {
 	return h.handle
 }
 
-func (h *provisionSpaceHandler) handle(ctx context.Context, task *asynq.Task) error {
+// handle is the asynq task handler for KindProvisionSpace.
+// Named return (retErr) is used so the deferred metrics recorder can observe the final
+// outcome without introducing extra control-flow indirection (AC-2).
+func (h *provisionSpaceHandler) handle(ctx context.Context, task *asynq.Task) (retErr error) { //nolint:nonamedreturns
 	var payload queue.ProvisionSpacePayload
 	if err := json.Unmarshal(task.Payload(), &payload); err != nil {
 		// Malformed payload — archive immediately, do not retry.
+		observability.IncError(h.cfg.metrics, "fatal")
 		return fmt.Errorf("%w: decode provision payload: %v", asynq.SkipRetry, err)
 	}
 
@@ -102,8 +108,20 @@ func (h *provisionSpaceHandler) handle(ctx context.Context, task *asynq.Task) er
 	// was written without the space_id (old bug). Retrying 10× would only produce
 	// GetSpaceByID("") → ErrNotFound on every attempt. Fail terminal instead.
 	if payload.SpaceID == "" {
+		observability.IncError(h.cfg.metrics, "fatal")
 		return fmt.Errorf("%w: provision_space: payload missing space_id — task cannot be processed", asynq.SkipRetry)
 	}
+
+	// fix(AC-2): record provisioning latency from job start on both success and fail-closed
+	// paths. Rate-limit retries and lock-held retries are excluded (they are not terminal
+	// provisioning outcomes).
+	jobStart := time.Now()
+	defer func() {
+		if retErr == nil || errors.Is(retErr, asynq.SkipRetry) {
+			success := retErr == nil
+			observability.RecordProvisioningLatency(h.cfg.metrics, time.Since(jobStart).Seconds(), success)
+		}
+	}()
 
 	slog.InfoContext(ctx, "provision_space: starting",
 		"space_id", payload.SpaceID, "merchant_id", payload.MerchantID)
@@ -227,11 +245,17 @@ func (h *provisionSpaceHandler) handle(ctx context.Context, task *asynq.Task) er
 
 // takeTokens acquires one global token and one per-route token before a Discord call.
 // Returns a *RateLimitError when a bucket is empty (asynq RetryDelayFunc handles it).
+// fix(AC-2): increments the rate-limit hit counter whenever a bucket is empty.
 func (h *provisionSpaceHandler) takeTokens(ctx context.Context, routeKey string) error {
 	if err := h.cfg.limiter.TakeGlobal(ctx); err != nil {
+		observability.IncRateLimitHit(h.cfg.metrics)
 		return err
 	}
-	return h.cfg.limiter.TakeRoute(ctx, routeKey)
+	if err := h.cfg.limiter.TakeRoute(ctx, routeKey); err != nil {
+		observability.IncRateLimitHit(h.cfg.metrics)
+		return err
+	}
+	return nil
 }
 
 // handle429 penalizes the rate-limit bucket and returns a retryable *RateLimitError.
@@ -249,11 +273,17 @@ func (h *provisionSpaceHandler) handle429(ctx context.Context, routeKey string, 
 //
 // The channel (if created) is left with the @everyone deny from the initial creation
 // so it remains invisible — we never apply an @everyone allow on failure.
+//
+// fix(AC-2): records provisioning latency (failure label) and increments the fatal-error
+// counter so /metrics reflects real outcomes.
 func (h *provisionSpaceHandler) failClosed(
 	ctx context.Context,
 	spaceID, merchantID, channelID, reason string,
 	cause error,
 ) error {
+	// fix(AC-2): record failure outcome in metrics.
+	observability.IncError(h.cfg.metrics, "fatal")
+
 	slog.ErrorContext(ctx, "provision_space: fail-closed — ACL apply failed",
 		"space_id", spaceID, "reason", reason, "error", cause)
 

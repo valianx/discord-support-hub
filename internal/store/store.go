@@ -199,6 +199,12 @@ type Store interface {
 	// overwrite_applied=true — these are the Postgres-blessed Discord overwrites.
 	ListActiveSpaceMembers(ctx context.Context, spaceID string) ([]*domain.SpaceMember, error)
 
+	// ListActiveProvisionedSpaces returns all spaces in lifecycle_state=active that
+	// have a discord_channel_id set (i.e. successfully provisioned). Used by the
+	// scheduled full-guild reconcile sweep (M5, AC-5) to enumerate all spaces that
+	// require a reconcile pass.
+	ListActiveProvisionedSpaces(ctx context.Context) ([]*domain.Space, error)
+
 	// --- M4: Lifecycle ---
 
 	// UpdateSpaceLifecycle transitions a space's lifecycle_state (and sets archived_at

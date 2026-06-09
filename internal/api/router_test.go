@@ -15,6 +15,7 @@ import (
 	"github.com/valianx/discord-support-hub/internal/api"
 	"github.com/valianx/discord-support-hub/internal/api/middleware"
 	"github.com/valianx/discord-support-hub/internal/authz"
+	"github.com/valianx/discord-support-hub/internal/observability"
 )
 
 // alwaysHealthyPinger is a no-op Pinger that always returns nil (healthy).
@@ -164,6 +165,62 @@ func TestWelcomeSyncRoute_ContractPath(t *testing.T) {
 	if w.Code != http.StatusNotImplemented {
 		t.Errorf("AC-4: POST .../welcome:sync with nil store must return 501 (handler reached), got %d; body: %s",
 			w.Code, w.Body.String())
+	}
+}
+
+// TestMetricsEndpoint_MountedWhenMetricsNonNil verifies that the /metrics endpoint is
+// mounted and returns 200 with the expected metric names when a non-nil Metrics instance
+// is provided to RouterConfig (M5, AC-2).
+//
+// Each metric family requires at least one observation before Prometheus includes it in
+// the text exposition output. We record one sample of each before requesting /metrics.
+func TestMetricsEndpoint_MountedWhenMetricsNonNil(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	m := observability.NewMetrics()
+	// Pre-seed one observation per metric so they all appear in the exposition output.
+	observability.RecordProvisioningLatency(m, 0.1, true)
+	observability.IncRateLimitHit(m)
+	observability.IncError(m, "fatal")
+	observability.SetActiveSpaces(m, 1)
+
+	r := api.NewRouter(api.RouterConfig{
+		Metrics:     m,
+		PGPinger:    &alwaysHealthyPinger{},
+		RedisPinger: &alwaysHealthyPinger{},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("/metrics: want 200, got %d; body: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, name := range []string{
+		"hub_provisioning_latency_seconds",
+		"hub_active_spaces_total",
+		"hub_ratelimit_hits_total",
+		"hub_errors_total",
+	} {
+		if !strings.Contains(body, name) {
+			t.Errorf("/metrics response missing metric %q", name)
+		}
+	}
+}
+
+// TestMetricsEndpoint_AbsentWhenMetricsNil verifies that /metrics returns 404 (route not
+// registered) when the RouterConfig.Metrics field is nil (M5, AC-2 — optional mount).
+func TestMetricsEndpoint_AbsentWhenMetricsNil(t *testing.T) {
+	r := newTestRouter() // Metrics is nil in newTestRouter
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("/metrics with nil Metrics: want 404 (route not registered), got %d", w.Code)
 	}
 }
 

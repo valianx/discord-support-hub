@@ -255,6 +255,12 @@ func (f *workerFakeStore) GetJobBySpaceIDAndKind(_ context.Context, _, _ string)
 	return nil, store.ErrNotFound
 }
 
+// ListActiveProvisionedSpaces satisfies store.Store (added in M5 for the scheduled sweep).
+// Worker tests do not exercise the full-guild reconcile path.
+func (f *workerFakeStore) ListActiveProvisionedSpaces(_ context.Context) ([]*domain.Space, error) {
+	panic("ListActiveProvisionedSpaces")
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 func makeTask(userID string, add bool) *asynq.Task {

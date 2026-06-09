@@ -42,6 +42,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
@@ -50,6 +54,7 @@ import (
 	"github.com/valianx/discord-support-hub/internal/cache"
 	"github.com/valianx/discord-support-hub/internal/domain"
 	"github.com/valianx/discord-support-hub/internal/lock"
+	"github.com/valianx/discord-support-hub/internal/observability"
 	"github.com/valianx/discord-support-hub/internal/queue"
 	"github.com/valianx/discord-support-hub/internal/ratelimit"
 	"github.com/valianx/discord-support-hub/internal/worker"
@@ -812,5 +817,112 @@ func TestProvisionSpace_EmptySpaceID_TerminalError(t *testing.T) {
 	if len(d.createChannelDeniedCalls) != 0 {
 		t.Errorf("CreateChannelDenied must not be called for empty SpaceID, got %d calls",
 			len(d.createChannelDeniedCalls))
+	}
+}
+
+// ─── AC-2: provisioning latency metric increments on success and failure ──────
+
+// runProvisionHandlerWithMetrics is a variant of runProvisionHandler that attaches
+// a real observability.Metrics instance so tests can assert on metric values.
+func runProvisionHandlerWithMetrics(
+	s *provisionFakeStore,
+	d *provisionMockDiscord,
+	task *asynq.Task,
+	m *observability.Metrics,
+) error {
+	mr := miniredis.NewMiniRedis()
+	if err := mr.Start(); err != nil {
+		panic(err)
+	}
+	defer mr.Close()
+
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+
+	mux := worker.NewServeMux(worker.Config{
+		Store:             s,
+		DiscordClient:     d,
+		DiscordGuildID:    "guild-m-001",
+		EveryoneRoleID:    "everyone-m-001",
+		AgentRoleID:       "agent-m-001",
+		DefaultCategoryID: "default-cat-m-001",
+		Limiter:           ratelimit.NoopLimiter{},
+		Locker:            lock.NoopLocker{},
+		Cache:             cache.NoopCache{},
+		Metrics:           m,
+	})
+	return mux.ProcessTask(context.Background(), task)
+}
+
+// metricsBody fetches the /metrics text exposition from the given Metrics instance.
+func metricsBody(t *testing.T, m *observability.Metrics) string {
+	t.Helper()
+	srv := httptest.NewServer(m.Handler())
+	t.Cleanup(srv.Close)
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read metrics body: %v", err)
+	}
+	return string(b)
+}
+
+// TestProvisionWorker_SuccessFlow_RecordsLatencyMetric verifies that a successful
+// provision run increments hub_provisioning_latency_seconds{status="success"} in the
+// Prometheus registry (AC-2: metric helpers are wired to real call-sites).
+func TestProvisionWorker_SuccessFlow_RecordsLatencyMetric(t *testing.T) {
+	m := observability.NewMetrics()
+
+	s := newProvisionFakeStore()
+	s.spaces["space-metric-ok"] = pendingSpace("space-metric-ok", "merchant-m-ok")
+
+	d := &provisionMockDiscord{createChannelDeniedID: "discord-m-ok"}
+	task := makeProvisionTask("space-metric-ok", "merchant-m-ok", "metric-ok-space", "cat-m-ok")
+
+	if err := runProvisionHandlerWithMetrics(s, d, task, m); err != nil {
+		t.Fatalf("provision success: want nil error, got %v", err)
+	}
+
+	body := metricsBody(t, m)
+	// hub_provisioning_latency_seconds_count{status="success"} must be 1 after one success.
+	if !strings.Contains(body, `hub_provisioning_latency_seconds_count{status="success"} 1`) {
+		t.Errorf("AC-2: expected hub_provisioning_latency_seconds_count{status=\"success\"} 1 in /metrics output; got:\n%s", body)
+	}
+}
+
+// TestProvisionWorker_FailureFlow_RecordsLatencyMetric verifies that a fail-closed
+// provision run increments hub_provisioning_latency_seconds{status="failure"} and
+// hub_errors_total{kind="fatal"} (AC-2).
+func TestProvisionWorker_FailureFlow_RecordsLatencyMetric(t *testing.T) {
+	m := observability.NewMetrics()
+
+	s := newProvisionFakeStore()
+	s.spaces["space-metric-fail"] = pendingSpace("space-metric-fail", "merchant-m-fail")
+
+	d := &provisionMockDiscord{
+		createChannelDeniedID: "discord-m-fail",
+		applyCategoryAllowErr: errors.New("discord: 403 forbidden"),
+	}
+	task := makeProvisionTask("space-metric-fail", "merchant-m-fail", "metric-fail-space", "cat-m-fail")
+
+	// failClosed path — must return SkipRetry.
+	if err := runProvisionHandlerWithMetrics(s, d, task, m); err == nil {
+		t.Fatal("expected fail-closed error, got nil")
+	}
+
+	body := metricsBody(t, m)
+
+	// hub_provisioning_latency_seconds_count{status="failure"} must be 1.
+	if !strings.Contains(body, `hub_provisioning_latency_seconds_count{status="failure"} 1`) {
+		t.Errorf("AC-2: expected hub_provisioning_latency_seconds_count{status=\"failure\"} 1 in /metrics output; got:\n%s", body)
+	}
+
+	// hub_errors_total{kind="fatal"} must be at least 1 (failClosed calls IncError).
+	if !strings.Contains(body, `kind="fatal"`) {
+		t.Errorf("AC-2: expected hub_errors_total{kind=\"fatal\"} in /metrics output; got:\n%s", body)
 	}
 }

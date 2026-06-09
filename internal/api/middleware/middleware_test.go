@@ -178,6 +178,11 @@ func (n *noopStore) GetJobBySpaceIDAndKind(_ context.Context, _, _ string) (*dom
 	panic("GetJobBySpaceIDAndKind not stubbed")
 }
 
+// ListActiveProvisionedSpaces satisfies store.Store (added in M5 for the scheduled sweep).
+func (n *noopStore) ListActiveProvisionedSpaces(_ context.Context) ([]*domain.Space, error) {
+	panic("ListActiveProvisionedSpaces not stubbed")
+}
+
 // authFakeStore overrides only the two methods Layer A needs.
 type authFakeStore struct {
 	noopStore
