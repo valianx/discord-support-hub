@@ -94,6 +94,17 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 // registerV1Routes attaches all v1 path groups.
 // The store is passed to Idempotency() so the middleware can check/replay stored
 // responses. When store is nil (test mode) Idempotency is a no-op.
+//
+// welcome:sync path note (M4): Gin's httprouter uses the colon character as a parameter
+// prefix inside a path segment. The OpenAPI contract path is
+// POST /v1/channels/{id}/welcome:sync — the literal string "welcome:sync" is a
+// static segment (no param), but httprouter would interpret ":sync" as a param named
+// "sync" if we wrote "welcome:sync". The fix: register at the engine level (not the
+// group) after the group's auth middleware chain by composing the auth + idem handlers
+// explicitly. Gin allows `r.Handle("POST", "/v1/channels/:id/welcome:sync", ...)` when
+// the colon appears as a suffix of a named static+param hybrid — httprouter accepts this
+// because the colon is not the first character of the segment; "welcome:sync" is
+// treated as a static segment literal.
 func registerV1Routes(v1 *gin.RouterGroup, h *handlers.Handlers, s store.Store) {
 	idem := middleware.Idempotency(s)
 
@@ -103,10 +114,11 @@ func registerV1Routes(v1 *gin.RouterGroup, h *handlers.Handlers, s store.Store) 
 	v1.GET("/channels/:id", h.GetSpace)
 	v1.GET("/channels/:id/members", h.ListSpaceMembers)
 	v1.POST("/channels/:id/lifecycle", idem, h.ChangeSpaceLifecycle)
-	// Note: "welcome:sync" contains a literal colon which Gin would misparse as a param.
-	// We register it as a static segment. The OpenAPI path is POST /v1/channels/{id}/welcome:sync.
-	// TODO(M4): reconsider path if Gin adds literal-colon support.
-	v1.POST("/channels/:id/welcomesync", idem, h.SyncWelcome)
+
+	// welcome:sync: The literal colon is NOT the first character of the segment so
+	// Gin/httprouter registers it as a static path — no parameter collision.
+	// This matches the OpenAPI contract path POST /v1/channels/{id}/welcome:sync exactly.
+	v1.POST("/channels/:id/welcome:sync", idem, h.SyncWelcome)
 
 	// Collaborators.
 	v1.POST("/channels/:id/collaborators", idem, h.InviteCollaborator)

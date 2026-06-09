@@ -198,6 +198,29 @@ type Store interface {
 	// ListSpaceOverwrites returns all active space_member rows for a space that have
 	// overwrite_applied=true — these are the Postgres-blessed Discord overwrites.
 	ListActiveSpaceMembers(ctx context.Context, spaceID string) ([]*domain.SpaceMember, error)
+
+	// --- M4: Lifecycle ---
+
+	// UpdateSpaceLifecycle transitions a space's lifecycle_state (and sets archived_at
+	// when the new state is "archived"). Returns ErrNotFound when the space does not exist.
+	UpdateSpaceLifecycle(ctx context.Context, p UpdateSpaceLifecycleParams) (*domain.Space, error)
+
+	// UpdateSpaceWelcomeMessageID records the pinned welcome message id on the space
+	// after the sync_welcome worker sets the topic + pin. Idempotent on re-sync.
+	UpdateSpaceWelcomeMessageID(ctx context.Context, spaceID, messageID string) (*domain.Space, error)
+
+	// --- M4: Audit ---
+
+	// ListAuditEntries returns audit_log rows newest-first with optional filters
+	// and cursor pagination (FR-14, M4 AC-2).
+	ListAuditEntries(ctx context.Context, p ListAuditEntriesParams) ([]*domain.AuditEntry, error)
+
+	// --- M4: Job mirror ---
+
+	// GetJobBySpaceIDAndKind returns the most recent job row for a space and task kind.
+	// Returns ErrNotFound when no row matches. Used by the lifecycle/provision workers
+	// to advance job status without carrying the job_id in the asynq task payload.
+	GetJobBySpaceIDAndKind(ctx context.Context, spaceID, kind string) (*domain.Job, error)
 }
 
 // --- Parameter types ---
@@ -355,6 +378,28 @@ type CreateOutboxParams struct {
 	Kind           string
 	Payload        map[string]any
 	IdempotencyKey string
+}
+
+// UpdateSpaceLifecycleParams carries the target lifecycle state for a space transition.
+type UpdateSpaceLifecycleParams struct {
+	SpaceID        string
+	LifecycleState domain.SpaceLifecycleState
+}
+
+// ListAuditEntriesParams carries filters and pagination for the audit log endpoint (FR-14).
+type ListAuditEntriesParams struct {
+	// MerchantID filters to actions involving the given merchant when non-nil.
+	MerchantID *string
+	// SpaceID filters to actions involving the given space when non-nil.
+	SpaceID *string
+	// Action filters to a specific action type (e.g. "space.provision") when non-empty.
+	Action *string
+	// Since is an ISO-8601 timestamp; only entries after this timestamp are returned.
+	Since *string
+	// Cursor is the last seen id for page continuation (newest-first order).
+	Cursor *int64
+	// Limit is the maximum number of rows to return. 0 = default (50).
+	Limit int
 }
 
 // --- Sentinel errors ---

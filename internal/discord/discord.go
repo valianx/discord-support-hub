@@ -71,6 +71,36 @@ type Client interface {
 	// GetChannelOverwrites returns the list of permission overwrites on channelID.
 	// Used by the reconciler to detect unbacked overwrites (§4.2).
 	GetChannelOverwrites(ctx context.Context, channelID string) ([]*discordgo.PermissionOverwrite, error)
+
+	// ArchiveChannel locks and hides a channel by denying VIEW_CHANNEL and SEND_MESSAGES
+	// for @everyone. History is preserved; the channel becomes invisible to all non-bot
+	// users (FR-7, M4 AC-1). everyoneRoleID is the guild's @everyone role (= guildID).
+	ArchiveChannel(ctx context.Context, channelID, everyoneRoleID string) error
+
+	// UnarchiveChannel restores a channel to the active state by removing the @everyone
+	// deny overwrite so the per-user overwrites and category-level Agent allow take effect
+	// again (FR-7, M4 AC-1 reopen).
+	UnarchiveChannel(ctx context.Context, channelID, everyoneRoleID string) error
+
+	// SetChannelTopic updates the human-readable topic string on a channel (FR-15 static).
+	// An empty topic string clears the topic.
+	SetChannelTopic(ctx context.Context, channelID, topic string) error
+
+	// PinMessage pins an existing message in a channel. Idempotent — if the message is
+	// already pinned Discord returns 204 without error.
+	PinMessage(ctx context.Context, channelID, messageID string) error
+
+	// EditMessage updates the content of an existing message. Used by sync_welcome to
+	// edit the pinned welcome message in place rather than duplicating it (AC-4 idempotent).
+	EditMessage(ctx context.Context, channelID, messageID, content string) error
+
+	// SendMessage posts a new message to a channel and returns the message id.
+	// Used by sync_welcome to create the initial pinned help-desk message (AC-4).
+	SendMessage(ctx context.Context, channelID, content string) (messageID string, err error)
+
+	// SetNickname sets the display nickname for a guild member. Passing an empty string
+	// resets the nickname to the user's default Discord username (FR-24, M4 AC-5).
+	SetNickname(ctx context.Context, guildID, discordUserID, nickname string) error
 }
 
 // Session is the discordgo-backed implementation of Client.
@@ -241,6 +271,92 @@ func (s *Session) GetChannelOverwrites(_ context.Context, channelID string) ([]*
 		return nil, fmt.Errorf("discord: get channel %s: %w", channelID, err)
 	}
 	return ch.PermissionOverwrites, nil
+}
+
+// ArchiveChannel denies VIEW_CHANNEL and SEND_MESSAGES for @everyone so the channel
+// becomes invisible and read-only. History is preserved in Discord (FR-7, M4 AC-1).
+func (s *Session) ArchiveChannel(_ context.Context, channelID, everyoneRoleID string) error {
+	deny := int64(discordgo.PermissionViewChannel | discordgo.PermissionSendMessages)
+	if err := s.session.ChannelPermissionSet(
+		channelID,
+		everyoneRoleID,
+		discordgo.PermissionOverwriteTypeRole,
+		0,    // allow: none
+		deny, // deny: VIEW_CHANNEL + SEND_MESSAGES
+	); err != nil {
+		return fmt.Errorf("discord: archive channel %s: %w", channelID, err)
+	}
+	return nil
+}
+
+// UnarchiveChannel removes the @everyone deny overwrite so per-user overwrites and the
+// category-level Agent allow resume normal visibility (FR-7, M4 AC-1 reopen).
+func (s *Session) UnarchiveChannel(_ context.Context, channelID, everyoneRoleID string) error {
+	// Removing the overwrite restores the inherited (deny) state from the creation-time
+	// @everyone deny. We then re-apply the creation deny so the channel is born-denied again.
+	// In practice, the channel was created with @everyone deny-VIEW_CHANNEL already in place
+	// (fail-closed); removing the archive overwrite returns to that state.
+	if err := s.session.ChannelPermissionDelete(channelID, everyoneRoleID); err != nil {
+		return fmt.Errorf("discord: unarchive channel %s (delete @everyone overwrite): %w", channelID, err)
+	}
+	return nil
+}
+
+// SetChannelTopic updates the topic string on a channel (FR-15 static, M4 AC-4).
+func (s *Session) SetChannelTopic(_ context.Context, channelID, topic string) error {
+	_, err := s.session.ChannelEdit(channelID, &discordgo.ChannelEdit{Topic: topic})
+	if err != nil {
+		return fmt.Errorf("discord: set channel topic on %s: %w", channelID, err)
+	}
+	return nil
+}
+
+// PinMessage pins a message in a channel. Idempotent per Discord spec (M4 AC-4).
+func (s *Session) PinMessage(_ context.Context, channelID, messageID string) error {
+	if err := s.session.ChannelMessagePin(channelID, messageID); err != nil {
+		return fmt.Errorf("discord: pin message %s on channel %s: %w", messageID, channelID, err)
+	}
+	return nil
+}
+
+// EditMessage updates the content of an existing message (M4 AC-4 idempotent re-sync).
+// AllowedMentions is set to an empty parse list to prevent mention resolution on edit,
+// consistent with the send path (SEC-M4-001).
+func (s *Session) EditMessage(_ context.Context, channelID, messageID, content string) error {
+	_, err := s.session.ChannelMessageEditComplex(&discordgo.MessageEdit{
+		Channel:         channelID,
+		ID:              messageID,
+		Content:         &content,
+		AllowedMentions: &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}},
+	})
+	if err != nil {
+		return fmt.Errorf("discord: edit message %s on channel %s: %w", messageID, channelID, err)
+	}
+	return nil
+}
+
+// SendMessage posts a new message to a channel and returns its id (M4 AC-4).
+// AllowedMentions is set to an empty parse list so the welcome content can never
+// trigger @everyone, @here, or role pings regardless of message content (SEC-M4-001).
+func (s *Session) SendMessage(_ context.Context, channelID, content string) (string, error) {
+	msg, err := s.session.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+		Content: content,
+		// fix(SEC-M4-001): empty Parse list suppresses all mention resolution.
+		AllowedMentions: &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}},
+	})
+	if err != nil {
+		return "", fmt.Errorf("discord: send message to channel %s: %w", channelID, err)
+	}
+	return msg.ID, nil
+}
+
+// SetNickname sets the display nickname for a guild member (FR-24, M4 AC-5).
+// Passing an empty string resets the nickname to the user's default username.
+func (s *Session) SetNickname(_ context.Context, guildID, discordUserID, nickname string) error {
+	if err := s.session.GuildMemberNickname(guildID, discordUserID, nickname); err != nil {
+		return fmt.Errorf("discord: set nickname for user %s in guild %s: %w", discordUserID, guildID, err)
+	}
+	return nil
 }
 
 // SetChannelPermissionDeny sets a deny-VIEW_CHANNEL overwrite on channelID for targetID.

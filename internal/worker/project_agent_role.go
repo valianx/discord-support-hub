@@ -30,6 +30,9 @@ type projectAgentRoleHandler struct {
 	discord     discord.Client
 	guildID     string
 	agentRoleID string
+	// agentNicknameSuffix is the optional suffix applied after role projection (FR-24, M4 AC-5).
+	// Empty = marking disabled.
+	agentNicknameSuffix string
 }
 
 func newProjectAgentRoleHandler(
@@ -46,6 +49,25 @@ func newProjectAgentRoleHandler(
 		discord:     d,
 		guildID:     guildID,
 		agentRoleID: agentRoleID,
+	}
+	return h.handle
+}
+
+// newProjectAgentRoleHandlerWithMarking builds the handler with optional nickname marking.
+func newProjectAgentRoleHandlerWithMarking(
+	s store.Store,
+	d discord.Client,
+	guildID, agentRoleID, nicknameSuffix string,
+) asynq.HandlerFunc {
+	if s == nil || d == nil {
+		return stubHandler(queue.KindProjectAgentRole)
+	}
+	h := &projectAgentRoleHandler{
+		store:               s,
+		discord:             d,
+		guildID:             guildID,
+		agentRoleID:         agentRoleID,
+		agentNicknameSuffix: nicknameSuffix,
 	}
 	return h.handle
 }
@@ -101,6 +123,20 @@ func (h *projectAgentRoleHandler) assignRole(ctx context.Context, user *domain.U
 		// Non-fatal: the role was assigned. Log and continue; the next reconcile will retry the stamp.
 		slog.WarnContext(ctx, "project_agent_role: could not stamp provisioned_at",
 			"user_id", user.ID, "error", err)
+	}
+
+	// M4 AC-5: apply nickname suffix when marking is enabled.
+	if h.agentNicknameSuffix != "" {
+		displayName := ""
+		if user.DisplayName != nil {
+			displayName = *user.DisplayName
+		}
+		nickname := buildNickname(displayName, h.agentNicknameSuffix)
+		if err := h.discord.SetNickname(ctx, h.guildID, *user.DiscordUserID, nickname); err != nil {
+			// Non-fatal: role is already assigned. Log; marking can be retried separately.
+			slog.WarnContext(ctx, "project_agent_role: could not apply nickname suffix",
+				"user_id", user.ID, "error", err)
+		}
 	}
 
 	slog.InfoContext(ctx, "project_agent_role: agent role assigned",

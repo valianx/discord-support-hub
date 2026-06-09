@@ -164,6 +164,20 @@ func (n *noopStore) UpdateDiscordUserID(_ context.Context, _, _ string) error {
 	panic("UpdateDiscordUserID not stubbed")
 }
 
+// M4 store methods — not exercised by auth/middleware tests; all panic.
+func (n *noopStore) UpdateSpaceLifecycle(_ context.Context, _ store.UpdateSpaceLifecycleParams) (*domain.Space, error) {
+	panic("UpdateSpaceLifecycle not stubbed")
+}
+func (n *noopStore) UpdateSpaceWelcomeMessageID(_ context.Context, _, _ string) (*domain.Space, error) {
+	panic("UpdateSpaceWelcomeMessageID not stubbed")
+}
+func (n *noopStore) ListAuditEntries(_ context.Context, _ store.ListAuditEntriesParams) ([]*domain.AuditEntry, error) {
+	panic("ListAuditEntries not stubbed")
+}
+func (n *noopStore) GetJobBySpaceIDAndKind(_ context.Context, _, _ string) (*domain.Job, error) {
+	panic("GetJobBySpaceIDAndKind not stubbed")
+}
+
 // authFakeStore overrides only the two methods Layer A needs.
 type authFakeStore struct {
 	noopStore

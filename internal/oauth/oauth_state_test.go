@@ -351,6 +351,20 @@ func (f *tokenFakeStore) UpdateDiscordUserID(_ context.Context, _, _ string) err
 	panic("UpdateDiscordUserID")
 }
 
+// M4 store methods — not exercised by oauth tests; all panic.
+func (f *tokenFakeStore) UpdateSpaceLifecycle(_ context.Context, _ store.UpdateSpaceLifecycleParams) (*domain.Space, error) {
+	panic("UpdateSpaceLifecycle")
+}
+func (f *tokenFakeStore) UpdateSpaceWelcomeMessageID(_ context.Context, _, _ string) (*domain.Space, error) {
+	panic("UpdateSpaceWelcomeMessageID")
+}
+func (f *tokenFakeStore) ListAuditEntries(_ context.Context, _ store.ListAuditEntriesParams) ([]*domain.AuditEntry, error) {
+	panic("ListAuditEntries")
+}
+func (f *tokenFakeStore) GetJobBySpaceIDAndKind(_ context.Context, _, _ string) (*domain.Job, error) {
+	return nil, store.ErrNotFound
+}
+
 // TestTokenStore_Store_PersistsEncryptedOnly verifies that tokens are stored as
 // ciphertext and that the plaintext does NOT appear in the stored row (AC-3, NFR-6).
 func TestTokenStore_Store_PersistsEncryptedOnly(t *testing.T) {

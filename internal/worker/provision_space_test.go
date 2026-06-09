@@ -131,6 +131,17 @@ func (m *provisionMockDiscord) GetChannelOverwrites(_ context.Context, _ string)
 	return nil, nil
 }
 
+// M4 discord.Client methods — not exercised by provision tests.
+func (m *provisionMockDiscord) ArchiveChannel(_ context.Context, _, _ string) error   { return nil }
+func (m *provisionMockDiscord) UnarchiveChannel(_ context.Context, _, _ string) error { return nil }
+func (m *provisionMockDiscord) SetChannelTopic(_ context.Context, _, _ string) error  { return nil }
+func (m *provisionMockDiscord) PinMessage(_ context.Context, _, _ string) error       { return nil }
+func (m *provisionMockDiscord) EditMessage(_ context.Context, _, _, _ string) error   { return nil }
+func (m *provisionMockDiscord) SendMessage(_ context.Context, _, _ string) (string, error) {
+	return "", nil
+}
+func (m *provisionMockDiscord) SetNickname(_ context.Context, _, _, _ string) error { return nil }
+
 // ─── Fake store for provision tests ──────────────────────────────────────────
 
 type provisionFakeStore struct {

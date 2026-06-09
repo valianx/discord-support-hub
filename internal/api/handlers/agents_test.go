@@ -208,6 +208,20 @@ func (f *agentFakeStore) UpdateDiscordUserID(_ context.Context, _, _ string) err
 	panic("UpdateDiscordUserID")
 }
 
+// M4 store methods — not exercised by agent tests; all panic.
+func (f *agentFakeStore) UpdateSpaceLifecycle(_ context.Context, _ store.UpdateSpaceLifecycleParams) (*domain.Space, error) {
+	panic("UpdateSpaceLifecycle")
+}
+func (f *agentFakeStore) UpdateSpaceWelcomeMessageID(_ context.Context, _, _ string) (*domain.Space, error) {
+	panic("UpdateSpaceWelcomeMessageID")
+}
+func (f *agentFakeStore) ListAuditEntries(_ context.Context, _ store.ListAuditEntriesParams) ([]*domain.AuditEntry, error) {
+	panic("ListAuditEntries")
+}
+func (f *agentFakeStore) GetJobBySpaceIDAndKind(_ context.Context, _, _ string) (*domain.Job, error) {
+	return nil, store.ErrNotFound
+}
+
 // ─── Router helpers ───────────────────────────────────────────────────────────
 
 // buildAgentRouter builds a minimal Gin engine for agent endpoint tests.
@@ -509,5 +523,73 @@ func TestRemoveAgent_NonAgentType_Returns404(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("want 404 for non-agent user, got %d; body: %s", w.Code, w.Body.String())
+	}
+}
+
+// ─── SEC-M4-002: display_name unsafe rune rejection ──────────────────────────
+
+// TestAddAgent_DisplayNameWithBidiOverride_Returns400 verifies that a display_name
+// containing U+202E (RIGHT-TO-LEFT OVERRIDE, a Unicode Cf bidi control character) is
+// rejected with 400 validation_error (SEC-M4-002). U+202E can flip rendered text in
+// Discord's UI, enabling nickname spoofing attacks.
+func TestAddAgent_DisplayNameWithBidiOverride_Returns400(t *testing.T) {
+	r := buildAgentRouter(newAgentFakeStore(), adminPrincipal())
+
+	// U+202E embedded in the display name — must be rejected.
+	displayName := "Support‮tropppuS" // RLO override after "Support"
+	body, _ := json.Marshal(map[string]any{
+		"email":        "agent-sec@example.com",
+		"display_name": displayName,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/agents", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("display_name with U+202E must return 400, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["code"] != "validation_error" {
+		t.Errorf("want code=validation_error, got %q", resp["code"])
+	}
+}
+
+// TestAddAgent_DisplayNameWithControlChar_Returns400 verifies that a display_name
+// containing an ASCII control character (0x01) is rejected with 400 (SEC-M4-002).
+func TestAddAgent_DisplayNameWithControlChar_Returns400(t *testing.T) {
+	r := buildAgentRouter(newAgentFakeStore(), adminPrincipal())
+
+	body, _ := json.Marshal(map[string]any{
+		"email":        "agent-ctrl@example.com",
+		"display_name": "Valid\x01Name",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/agents", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("display_name with control char must return 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestAddAgent_NilDisplayName_Returns201 verifies that omitting display_name (nil)
+// is still accepted — the validation only triggers when the field is provided (SEC-M4-002).
+func TestAddAgent_NilDisplayName_Returns201(t *testing.T) {
+	r := buildAgentRouter(newAgentFakeStore(), adminPrincipal())
+
+	// No display_name field — should pass validation and succeed.
+	body := `{"email":"agent-nodisplay@example.com"}`
+	req := httptest.NewRequest(http.MethodPost, "/agents", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("absent display_name must return 201, got %d: %s", w.Code, w.Body.String())
 	}
 }

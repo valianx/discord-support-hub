@@ -20,6 +20,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/valianx/discord-support-hub/internal/api/middleware"
 	"github.com/valianx/discord-support-hub/internal/authz"
+	"github.com/valianx/discord-support-hub/internal/domain"
 	"github.com/valianx/discord-support-hub/internal/oauth"
 	"github.com/valianx/discord-support-hub/internal/queue"
 	"github.com/valianx/discord-support-hub/internal/store"
@@ -106,10 +107,105 @@ type directoryEntryResponse struct {
 
 // ─── GetAudit ─────────────────────────────────────────────────────────────────
 
-// GetAudit handles GET /audit (FR-14, M4).
-// TODO(M4): query audit_log with filters; return newest-first with cursor pagination.
+// GetAudit handles GET /audit (FR-14, M4 AC-2).
+//
+// Returns audit_log entries newest-first with optional filters:
+//   - merchant_id: filter to a specific merchant
+//   - space_id:    filter to a specific space
+//   - action:      filter to a specific action type (e.g. "space.provision")
+//   - since:       ISO-8601 timestamp; only entries after this time
+//
+// Cursor pagination via the `cursor` query param (last seen id as a string).
+// Control-plane gated. No secrets appear in the audit detail (NFR-6).
 func (h *Handlers) GetAudit(c *gin.Context) {
-	notImplemented(c)
+	if h.store == nil {
+		notImplemented(c)
+		return
+	}
+
+	p := middleware.GetPrincipal(c)
+	if !authz.RequireControlPlane(p) {
+		forbidden(c)
+		return
+	}
+
+	params := store.ListAuditEntriesParams{Limit: 50}
+
+	if v := c.Query("merchant_id"); v != "" {
+		params.MerchantID = &v
+	}
+	if v := c.Query("space_id"); v != "" {
+		params.SpaceID = &v
+	}
+	if v := c.Query("action"); v != "" {
+		params.Action = &v
+	}
+	if v := c.Query("since"); v != "" {
+		params.Since = &v
+	}
+	if v := c.Query("cursor"); v != "" {
+		// Cursor is the last seen id (int64) encoded as a decimal string.
+		var cursorID int64
+		if _, err := fmt.Sscanf(v, "%d", &cursorID); err == nil {
+			params.Cursor = &cursorID
+		}
+	}
+
+	ctx := c.Request.Context()
+
+	entries, err := h.store.ListAuditEntries(ctx, params)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": "failed to list audit entries"})
+		return
+	}
+
+	items := make([]auditEntryResponse, 0, len(entries))
+	for _, e := range entries {
+		items = append(items, toAuditEntryResponse(e))
+	}
+
+	var nextCursor *string
+	if len(entries) == params.Limit && len(entries) > 0 {
+		last := entries[len(entries)-1].ID
+		s := fmt.Sprintf("%d", last)
+		nextCursor = &s
+	}
+
+	c.JSON(http.StatusOK, gin.H{"items": items, "next_cursor": nextCursor})
+}
+
+// auditEntryResponse is the JSON shape for one audit_log entry.
+// No secrets appear in this response (NFR-6, FR-14).
+type auditEntryResponse struct {
+	ID            int64          `json:"id"`
+	ActorAPIKeyID *string        `json:"actor_api_key_id,omitempty"`
+	ActorUserID   *string        `json:"actor_user_id,omitempty"`
+	Action        string         `json:"action"`
+	MerchantID    *string        `json:"merchant_id,omitempty"`
+	SpaceID       *string        `json:"space_id,omitempty"`
+	TargetUserID  *string        `json:"target_user_id,omitempty"`
+	Scope         *string        `json:"scope,omitempty"`
+	Detail        map[string]any `json:"detail,omitempty"`
+	CreatedAt     string         `json:"created_at"`
+}
+
+func toAuditEntryResponse(e *domain.AuditEntry) auditEntryResponse {
+	r := auditEntryResponse{
+		ID:            e.ID,
+		ActorAPIKeyID: e.ActorAPIKeyID,
+		ActorUserID:   e.ActorUserID,
+		Action:        e.Action,
+		MerchantID:    e.MerchantID,
+		SpaceID:       e.SpaceID,
+		TargetUserID:  e.TargetUserID,
+		Detail:        e.Detail,
+		CreatedAt:     e.CreatedAt.UTC().Format(time.RFC3339),
+	}
+	if e.Scope != nil {
+		s := string(*e.Scope)
+		r.Scope = &s
+	}
+	return r
 }
 
 // ─── OAuthDiscordCallback ─────────────────────────────────────────────────────
