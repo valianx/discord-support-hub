@@ -6,9 +6,11 @@
 --   * Postgres is the AuthZ source of truth; Discord is a projection (three-layer truth model).
 --   * Multi-tenant isolation is enforced by the schema where the DB can (NFR-5).
 --   * Fail-closed ACL state is tracked, never assumed open (NFR-4).
---   * One merchant -> N spaces, NO hard cap (typically one active). A one-at-a-time
---     rule, if ever wanted, is a userland concern; the optional partial-unique seam
---     is shown (commented) on the `spaces` table.
+--   * One merchant -> exactly one space (1:1), enforced by UNIQUE(merchant_id) on
+--     `spaces`. Lifecycle (archive/reopen) acts on that single space.
+--   * A collaborator is a global external identity invited to many merchants' spaces
+--     (M:N via space_members); tenant grouping for a collaborator is DERIVED from space
+--     membership, never a user->merchant foreign key.
 --   * Secrets (OAuth2 tokens) stored encrypted at rest; only ciphertext + nonce + key
 --     version persisted (NFR-6).
 --
@@ -54,9 +56,10 @@ CREATE TYPE expulsion_scope AS ENUM ('channel', 'server');
 
 -- ===========================================================================
 -- merchants
--- One external customer. Owns N spaces and N collaborators. The merchant grouping
--- lives HERE (in Postgres), never as a Discord role (Discord caps at 250 roles;
--- a role-per-merchant does not scale -- see scope §4.3).
+-- One external customer. Owns exactly one space (1:1). Collaborators are NOT owned by
+-- a merchant; they are global identities granted access per-space (see space_members).
+-- The merchant grouping lives HERE (in Postgres), never as a Discord role (Discord caps
+-- at 250 roles; a role-per-merchant does not scale -- see scope §4.3).
 -- ===========================================================================
 CREATE TABLE merchants (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -82,16 +85,16 @@ COMMENT ON COLUMN merchants.external_ref IS 'Stable id from the Zippy backoffice
 -- projection the bot maintains. Authorization is ALWAYS resolved against this table,
 -- never against the Discord role.
 --
--- A collaborator belongs to exactly one merchant; an agent belongs to none
--- (merchant_id NULL). A CHECK enforces that invariant at the row level.
+-- A user is just an identity: an internal agent, or an external collaborator. Neither
+-- is tied to a merchant by a column here. A collaborator's merchant associations are
+-- DERIVED from space membership (space_members -> spaces -> merchant), reflecting that
+-- one collaborator may hold access across several merchants' spaces.
 -- ===========================================================================
 CREATE TABLE users (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     type              user_type NOT NULL,
     -- Admin privilege is only meaningful for agents (roster management safeguard).
     is_admin          BOOLEAN NOT NULL DEFAULT FALSE,
-    -- Collaborators are owned by a merchant; agents are not. Enforced by chk below.
-    merchant_id       UUID REFERENCES merchants(id) ON DELETE RESTRICT,
     -- Discord identity. Nullable until the user completes "Connect with Discord"
     -- (OAuth2 identify) -- a roster row can exist before the user has joined.
     discord_user_id   TEXT,
@@ -103,22 +106,14 @@ CREATE TABLE users (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    -- Isolation/consistency invariants the DB CAN enforce:
-    -- agents have no merchant; collaborators must have one.
-    CONSTRAINT users_type_merchant_chk CHECK (
-        (type = 'agent'        AND merchant_id IS NULL) OR
-        (type = 'collaborator' AND merchant_id IS NOT NULL)
-    ),
     -- Admin only meaningful for agents.
     CONSTRAINT users_admin_only_agent_chk CHECK (is_admin = FALSE OR type = 'agent'),
     -- One Discord identity maps to at most one user row (when present).
     CONSTRAINT users_discord_user_id_key UNIQUE (discord_user_id)
 );
-COMMENT ON TABLE users IS 'Roster + AuthZ source of truth; Discord role is a projection of type/is_admin.';
+COMMENT ON TABLE users IS 'Roster + AuthZ source of truth; a user is an identity (agent or collaborator), not merchant-bound. Discord role is a projection of type/is_admin.';
 COMMENT ON COLUMN users.discord_user_id IS 'NULL until the user completes OAuth2 identify; one identity = one row.';
-COMMENT ON CONSTRAINT users_type_merchant_chk ON users IS 'Isolation invariant: collaborators belong to exactly one merchant; agents to none.';
 
-CREATE INDEX users_merchant_id_idx     ON users (merchant_id) WHERE merchant_id IS NOT NULL;
 CREATE INDEX users_type_idx            ON users (type);
 CREATE INDEX users_is_admin_idx        ON users (is_admin) WHERE is_admin = TRUE;
 
@@ -126,8 +121,9 @@ CREATE INDEX users_is_admin_idx        ON users (is_admin) WHERE is_admin = TRUE
 -- ===========================================================================
 -- spaces
 -- The private support conversation per merchant, materialized as a Discord CHANNEL
--- (channel mode only in v1). One merchant -> N spaces, NO hard cap. Tracks the
--- Discord projection (channel id, category) and the fail-closed ACL state.
+-- (channel mode only in v1). One merchant -> exactly one space (1:1), enforced by
+-- UNIQUE(merchant_id). Tracks the Discord projection (channel id, category) and the
+-- fail-closed ACL state.
 -- ===========================================================================
 CREATE TABLE spaces (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -152,22 +148,18 @@ CREATE TABLE spaces (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     archived_at         TIMESTAMPTZ,
 
-    CONSTRAINT spaces_discord_channel_id_key UNIQUE (discord_channel_id)
+    CONSTRAINT spaces_discord_channel_id_key UNIQUE (discord_channel_id),
+    -- 1:1 merchant<->space: a merchant has exactly one space (hard invariant).
+    CONSTRAINT spaces_merchant_id_key UNIQUE (merchant_id)
 );
-COMMENT ON TABLE spaces IS 'Per-merchant private channel; one merchant -> N spaces, no hard cap. Tracks fail-closed ACL state.';
+COMMENT ON TABLE spaces IS 'Per-merchant private channel; one merchant -> exactly one space (1:1, UNIQUE merchant_id). Tracks fail-closed ACL state.';
 COMMENT ON COLUMN spaces.acl_state IS 'Fail-closed: space treated accessible only when applied; else invisible (NFR-4).';
 COMMENT ON COLUMN spaces.discord_channel_id IS 'NULL until worker provisions the channel; UNIQUE prevents double-projection.';
 
-CREATE INDEX spaces_merchant_id_idx        ON spaces (merchant_id);
+-- merchant_id is already indexed by the UNIQUE(merchant_id) constraint above.
 CREATE INDEX spaces_lifecycle_state_idx    ON spaces (lifecycle_state);
 CREATE INDEX spaces_acl_state_idx          ON spaces (acl_state) WHERE acl_state <> 'applied'; -- reconciler targets
 CREATE INDEX spaces_last_activity_idx      ON spaces (last_activity_at);
-
--- OPTIONAL SEAM (operator decision, scope §6.2): enforce exactly-one-active space
--- per merchant at the DB level. Left COMMENTED -- default is "no cap, userland rule".
--- Uncomment to make one-active-at-a-time a hard invariant:
--- CREATE UNIQUE INDEX spaces_one_active_per_merchant_uq
---     ON spaces (merchant_id) WHERE lifecycle_state = 'active';
 
 
 -- ===========================================================================
