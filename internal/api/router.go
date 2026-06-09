@@ -68,33 +68,37 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 		DiscordOAuthRedirectURL: cfg.DiscordOAuthRedirectURL,
 	})
 
-	registerV1Routes(v1, h)
+	registerV1Routes(v1, h, cfg.Store)
 
 	return r
 }
 
 // registerV1Routes attaches all v1 path groups.
-func registerV1Routes(v1 *gin.RouterGroup, h *handlers.Handlers) {
+// The store is passed to Idempotency() so the middleware can check/replay stored
+// responses. When store is nil (test mode) Idempotency is a no-op.
+func registerV1Routes(v1 *gin.RouterGroup, h *handlers.Handlers, s store.Store) {
+	idem := middleware.Idempotency(s)
+
 	// Spaces — provision + reads + lifecycle + welcome sync.
-	v1.POST("/merchants/:merchantId/channels", middleware.Idempotency(), h.ProvisionSpace)
+	v1.POST("/merchants/:merchantId/channels", idem, h.ProvisionSpace)
 	v1.GET("/channels", h.ListSpaces)
 	v1.GET("/channels/:id", h.GetSpace)
 	v1.GET("/channels/:id/members", h.ListSpaceMembers)
-	v1.POST("/channels/:id/lifecycle", middleware.Idempotency(), h.ChangeSpaceLifecycle)
+	v1.POST("/channels/:id/lifecycle", idem, h.ChangeSpaceLifecycle)
 	// Note: "welcome:sync" contains a literal colon which Gin would misparse as a param.
 	// We register it as a static segment. The OpenAPI path is POST /v1/channels/{id}/welcome:sync.
 	// TODO(M4): reconsider path if Gin adds literal-colon support.
-	v1.POST("/channels/:id/welcomesync", middleware.Idempotency(), h.SyncWelcome)
+	v1.POST("/channels/:id/welcomesync", idem, h.SyncWelcome)
 
 	// Collaborators.
-	v1.POST("/channels/:id/collaborators", middleware.Idempotency(), h.InviteCollaborator)
-	v1.DELETE("/channels/:id/collaborators/:userId", middleware.Idempotency(), h.ExpelCollaborator)
+	v1.POST("/channels/:id/collaborators", idem, h.InviteCollaborator)
+	v1.DELETE("/channels/:id/collaborators/:userId", idem, h.ExpelCollaborator)
 	v1.GET("/collaborators/:userId/channels", h.ListCollaboratorChannels)
 
 	// Agents (Admin only — Layer B enforced inside handlers).
 	v1.GET("/agents", h.ListAgents)
-	v1.POST("/agents", middleware.Idempotency(), h.AddAgent)
-	v1.DELETE("/agents/:userId", middleware.Idempotency(), h.RemoveAgent)
+	v1.POST("/agents", idem, h.AddAgent)
+	v1.DELETE("/agents/:userId", idem, h.RemoveAgent)
 
 	// Transversal.
 	v1.GET("/directory", h.GetDirectory)

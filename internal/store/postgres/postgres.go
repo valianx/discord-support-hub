@@ -3,6 +3,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -352,29 +353,373 @@ func scanOAuthToken(row interface {
 	return &t, nil
 }
 
-// ─── Spaces (TODO M2) ─────────────────────────────────────────────────────────
+// ─── Spaces ───────────────────────────────────────────────────────────────────
 
-// GetSpaceByID implements store.Store.
-// TODO(M2): implement the real query.
-func (s *Store) GetSpaceByID(_ context.Context, _ string) (*domain.Space, error) {
-	return nil, fmt.Errorf("GetSpaceByID: not implemented") // TODO(M2)
+// CreateSpace inserts a new desired-state space row.
+func (s *Store) CreateSpace(ctx context.Context, p store.CreateSpaceParams) (*domain.Space, error) {
+	row := s.pool.QueryRow(ctx, `
+		INSERT INTO spaces (merchant_id, name, discord_category_id)
+		VALUES ($1, $2, $3)
+		RETURNING id, merchant_id, discord_channel_id, discord_category_id, name,
+		          lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		          reconciled_at, drift_count, created_at, updated_at, archived_at`,
+		p.MerchantID, p.Name, p.DiscordCategoryID,
+	)
+	sp, err := scanSpace(row)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
+			return nil, store.ErrConflict
+		}
+		return nil, err
+	}
+	return sp, nil
 }
 
-// ─── Jobs (TODO M2) ───────────────────────────────────────────────────────────
-
-// CreateJob implements store.Store.
-// TODO(M2): implement the real insert.
-func (s *Store) CreateJob(_ context.Context, _ store.CreateJobParams) (*domain.Job, error) {
-	return nil, fmt.Errorf("CreateJob: not implemented") // TODO(M2)
+// GetSpaceByID returns the space for the given id.
+func (s *Store) GetSpaceByID(ctx context.Context, id string) (*domain.Space, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, merchant_id, discord_channel_id, discord_category_id, name,
+		       lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		       reconciled_at, drift_count, created_at, updated_at, archived_at
+		FROM spaces WHERE id = $1`, id)
+	return scanSpace(row)
 }
 
-// GetJobByID implements store.Store.
-// TODO(M2): implement the real query.
-func (s *Store) GetJobByID(_ context.Context, _ string) (*domain.Job, error) {
-	return nil, fmt.Errorf("GetJobByID: not implemented") // TODO(M2)
+// GetSpaceByMerchantID returns the single space owned by the merchant.
+func (s *Store) GetSpaceByMerchantID(ctx context.Context, merchantID string) (*domain.Space, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, merchant_id, discord_channel_id, discord_category_id, name,
+		       lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		       reconciled_at, drift_count, created_at, updated_at, archived_at
+		FROM spaces WHERE merchant_id = $1`, merchantID)
+	return scanSpace(row)
+}
+
+// UpdateSpaceDiscordChannel stamps the discord_channel_id and acl_state after provisioning.
+func (s *Store) UpdateSpaceDiscordChannel(ctx context.Context, p store.UpdateSpaceDiscordChannelParams) (*domain.Space, error) {
+	row := s.pool.QueryRow(ctx, `
+		UPDATE spaces
+		SET discord_channel_id = $1, discord_category_id = COALESCE($2, discord_category_id),
+		    acl_state = $3, updated_at = now()
+		WHERE id = $4
+		RETURNING id, merchant_id, discord_channel_id, discord_category_id, name,
+		          lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		          reconciled_at, drift_count, created_at, updated_at, archived_at`,
+		p.DiscordChannelID, p.DiscordCategoryID, p.ACLState, p.SpaceID,
+	)
+	return scanSpace(row)
+}
+
+// UpdateSpaceACLState transitions the acl_state of a space.
+func (s *Store) UpdateSpaceACLState(ctx context.Context, spaceID string, state domain.ACLState) (*domain.Space, error) {
+	row := s.pool.QueryRow(ctx, `
+		UPDATE spaces SET acl_state = $1, updated_at = now()
+		WHERE id = $2
+		RETURNING id, merchant_id, discord_channel_id, discord_category_id, name,
+		          lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		          reconciled_at, drift_count, created_at, updated_at, archived_at`,
+		state, spaceID,
+	)
+	return scanSpace(row)
+}
+
+func scanSpace(row interface{ Scan(dest ...any) error }) (*domain.Space, error) {
+	var sp domain.Space
+	err := row.Scan(
+		&sp.ID, &sp.MerchantID, &sp.DiscordChannelID, &sp.DiscordCategoryID, &sp.Name,
+		&sp.LifecycleState, &sp.ACLState, &sp.WelcomeMessageID, &sp.LastActivityAt,
+		&sp.ReconciledAt, &sp.DriftCount, &sp.CreatedAt, &sp.UpdatedAt, &sp.ArchivedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: scan space: %w", err)
+	}
+	return &sp, nil
+}
+
+// ─── Jobs ─────────────────────────────────────────────────────────────────────
+
+// CreateJob inserts a Postgres jobs mirror row.
+func (s *Store) CreateJob(ctx context.Context, p store.CreateJobParams) (*domain.Job, error) {
+	payloadJSON, err := marshalPayload(p.Payload)
+	if err != nil {
+		return nil, err
+	}
+	row := s.pool.QueryRow(ctx, `
+		INSERT INTO jobs (task_id, kind, queue, merchant_id, space_id, user_id, payload)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, task_id, kind, queue, status, merchant_id, space_id, user_id,
+		          payload, error, retry_count, created_at, updated_at, completed_at`,
+		p.TaskID, p.Kind, p.Queue, p.MerchantID, p.SpaceID, p.UserID, payloadJSON,
+	)
+	return scanJob(row)
+}
+
+// GetJobByID returns the job for the given id (Postgres mirror of asynq state).
+func (s *Store) GetJobByID(ctx context.Context, id string) (*domain.Job, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, task_id, kind, queue, status, merchant_id, space_id, user_id,
+		       payload, error, retry_count, created_at, updated_at, completed_at
+		FROM jobs WHERE id = $1`, id)
+	return scanJob(row)
+}
+
+// UpdateJobStatus transitions the job row to a new status.
+func (s *Store) UpdateJobStatus(ctx context.Context, p store.UpdateJobStatusParams) (*domain.Job, error) {
+	var completedAt *string // let Postgres handle the timestamp via CASE
+	query := `
+		UPDATE jobs SET
+			status      = $1,
+			error       = COALESCE($2, error),
+			retry_count = COALESCE($3, retry_count),
+			completed_at = CASE WHEN $4 THEN now() ELSE completed_at END,
+			updated_at  = now()
+		WHERE id = $5
+		RETURNING id, task_id, kind, queue, status, merchant_id, space_id, user_id,
+		          payload, error, retry_count, created_at, updated_at, completed_at`
+	_ = completedAt
+	row := s.pool.QueryRow(ctx, query,
+		p.Status, p.Error, p.RetryCount, p.Completed, p.JobID,
+	)
+	return scanJob(row)
+}
+
+func scanJob(row interface{ Scan(dest ...any) error }) (*domain.Job, error) {
+	var j domain.Job
+	var payloadRaw []byte
+	err := row.Scan(
+		&j.ID, &j.TaskID, &j.Kind, &j.Queue, &j.Status,
+		&j.MerchantID, &j.SpaceID, &j.UserID,
+		&payloadRaw, &j.Error, &j.RetryCount,
+		&j.CreatedAt, &j.UpdatedAt, &j.CompletedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: scan job: %w", err)
+	}
+	if len(payloadRaw) > 0 {
+		if err = unmarshalPayload(payloadRaw, &j.Payload); err != nil {
+			return nil, err
+		}
+	}
+	return &j, nil
+}
+
+// ─── Idempotency ──────────────────────────────────────────────────────────────
+
+// InsertIdempotencyKey performs an atomic INSERT into idempotency_keys.
+// Returns ErrConflict when the key already exists (caller must replay the stored response).
+func (s *Store) InsertIdempotencyKey(ctx context.Context, p store.InsertIdempotencyKeyParams) (*domain.IdempotencyKey, error) {
+	row := s.pool.QueryRow(ctx, `
+		INSERT INTO idempotency_keys (key, request_hash, job_id, expires_at)
+		VALUES ($1, $2, $3, $4)
+		RETURNING key, request_hash, status, response_code, response_body, job_id, created_at, expires_at`,
+		p.Key, p.RequestHash, p.JobID, p.ExpiresAt,
+	)
+	ik, err := scanIdempotencyKey(row)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
+			return nil, store.ErrConflict
+		}
+		return nil, err
+	}
+	return ik, nil
+}
+
+// GetIdempotencyKey returns the stored record for the given key.
+// Returns ErrNotFound when the key is absent or expired.
+func (s *Store) GetIdempotencyKey(ctx context.Context, key string) (*domain.IdempotencyKey, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT key, request_hash, status, response_code, response_body, job_id, created_at, expires_at
+		FROM idempotency_keys
+		WHERE key = $1 AND expires_at > now()`, key)
+	return scanIdempotencyKey(row)
+}
+
+// UpdateIdempotencyKeyResponse stores the final response on a pending record.
+func (s *Store) UpdateIdempotencyKeyResponse(ctx context.Context, p store.UpdateIdempotencyKeyResponseParams) error {
+	bodyJSON, err := marshalPayload(p.ResponseBody)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx, `
+		UPDATE idempotency_keys
+		SET status = $1, response_code = $2, response_body = $3, job_id = COALESCE($4, job_id)
+		WHERE key = $5`,
+		p.Status, p.ResponseCode, bodyJSON, p.JobID, p.Key,
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: update idempotency key response: %w", err)
+	}
+	return nil
+}
+
+func scanIdempotencyKey(row interface{ Scan(dest ...any) error }) (*domain.IdempotencyKey, error) {
+	var ik domain.IdempotencyKey
+	var bodyRaw []byte
+	err := row.Scan(
+		&ik.Key, &ik.RequestHash, &ik.Status, &ik.ResponseCode, &bodyRaw,
+		&ik.JobID, &ik.CreatedAt, &ik.ExpiresAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: scan idempotency_key: %w", err)
+	}
+	if len(bodyRaw) > 0 {
+		if err = unmarshalPayload(bodyRaw, &ik.ResponseBody); err != nil {
+			return nil, err
+		}
+	}
+	return &ik, nil
+}
+
+// ─── Outbox ───────────────────────────────────────────────────────────────────
+
+// CreateSpaceWithOutbox writes the desired-state Space row AND an outbox row in
+// one Postgres transaction. This is the transactional outbox pattern (NFR-3, §4):
+// the relay picks up the outbox row and enqueues the asynq task, so a committed
+// desired-state change is never lost before enqueue.
+func (s *Store) CreateSpaceWithOutbox(
+	ctx context.Context,
+	sp store.CreateSpaceParams,
+	ob store.CreateOutboxParams,
+) (*domain.Space, *domain.OutboxRow, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("postgres: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Insert space row.
+	spRow := tx.QueryRow(ctx, `
+		INSERT INTO spaces (merchant_id, name, discord_category_id)
+		VALUES ($1, $2, $3)
+		RETURNING id, merchant_id, discord_channel_id, discord_category_id, name,
+		          lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		          reconciled_at, drift_count, created_at, updated_at, archived_at`,
+		sp.MerchantID, sp.Name, sp.DiscordCategoryID,
+	)
+	space, err := scanSpace(spRow)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
+			return nil, nil, store.ErrConflict
+		}
+		return nil, nil, err
+	}
+
+	// Insert outbox row.
+	payloadJSON, err := marshalPayload(ob.Payload)
+	if err != nil {
+		return nil, nil, err
+	}
+	obRow := tx.QueryRow(ctx, `
+		INSERT INTO outbox (aggregate, aggregate_id, kind, payload, idempotency_key)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, aggregate, aggregate_id, kind, payload, idempotency_key, enqueued_at, created_at`,
+		ob.Aggregate, ob.AggregateID, ob.Kind, payloadJSON, ob.IdempotencyKey,
+	)
+	outbox, err := scanOutboxRow(obRow)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return nil, nil, fmt.Errorf("postgres: commit outbox tx: %w", err)
+	}
+	return space, outbox, nil
+}
+
+// ListPendingOutbox returns up to limit outbox rows that have not been enqueued yet.
+func (s *Store) ListPendingOutbox(ctx context.Context, limit int) ([]*domain.OutboxRow, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, aggregate, aggregate_id, kind, payload, idempotency_key, enqueued_at, created_at
+		FROM outbox
+		WHERE enqueued_at IS NULL
+		ORDER BY created_at ASC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list pending outbox: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*domain.OutboxRow
+	for rows.Next() {
+		ob, err := scanOutboxRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ob)
+	}
+	return out, rows.Err()
+}
+
+// StampOutboxEnqueued sets enqueued_at = now() on the named rows.
+func (s *Store) StampOutboxEnqueued(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx,
+		"UPDATE outbox SET enqueued_at = now() WHERE id = ANY($1::uuid[])",
+		ids,
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: stamp outbox enqueued: %w", err)
+	}
+	return nil
+}
+
+func scanOutboxRow(row interface{ Scan(dest ...any) error }) (*domain.OutboxRow, error) {
+	var ob domain.OutboxRow
+	var payloadRaw []byte
+	err := row.Scan(
+		&ob.ID, &ob.Aggregate, &ob.AggregateID, &ob.Kind,
+		&payloadRaw, &ob.IdempotencyKey, &ob.EnqueuedAt, &ob.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: scan outbox: %w", err)
+	}
+	if len(payloadRaw) > 0 {
+		if err = unmarshalPayload(payloadRaw, &ob.Payload); err != nil {
+			return nil, err
+		}
+	}
+	return &ob, nil
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
+
+// marshalPayload converts a map to a JSON byte slice suitable for JSONB columns.
+// Returns nil when the map is nil.
+func marshalPayload(m map[string]any) ([]byte, error) {
+	if m == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: marshal payload: %w", err)
+	}
+	return b, nil
+}
+
+// unmarshalPayload parses raw JSONB bytes into a map.
+func unmarshalPayload(b []byte, dst *map[string]any) error {
+	if err := json.Unmarshal(b, dst); err != nil {
+		return fmt.Errorf("postgres: unmarshal payload: %w", err)
+	}
+	return nil
+}
 
 // safeDSNPrefix returns a credential-free representation of the DSN for log output.
 // It extracts only the host and database name from either URL-style

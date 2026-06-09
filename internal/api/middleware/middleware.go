@@ -137,15 +137,6 @@ func GetPrincipal(c *gin.Context) *authz.Principal {
 	return p
 }
 
-// Idempotency is a pass-through stub for edge-level idempotency (NFR-3, §4.1).
-// TODO(M2): read Idempotency-Key header, check idempotency_keys table, replay stored
-// response on a hit, insert a pending record on a miss.
-func Idempotency() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		c.Next()
-	}
-}
-
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 // extractBearer parses "Bearer <token>" from an Authorization header value.

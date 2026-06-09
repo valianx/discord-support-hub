@@ -80,14 +80,47 @@ func (n *noopStore) UpsertOAuthToken(_ context.Context, _ store.UpsertOAuthToken
 func (n *noopStore) GetOAuthTokenByUserID(_ context.Context, _ string) (*domain.OAuthToken, error) {
 	panic("GetOAuthTokenByUserID not stubbed")
 }
+func (n *noopStore) CreateSpace(_ context.Context, _ store.CreateSpaceParams) (*domain.Space, error) {
+	panic("CreateSpace not stubbed")
+}
 func (n *noopStore) GetSpaceByID(_ context.Context, _ string) (*domain.Space, error) {
 	panic("GetSpaceByID not stubbed")
+}
+func (n *noopStore) GetSpaceByMerchantID(_ context.Context, _ string) (*domain.Space, error) {
+	panic("GetSpaceByMerchantID not stubbed")
+}
+func (n *noopStore) UpdateSpaceDiscordChannel(_ context.Context, _ store.UpdateSpaceDiscordChannelParams) (*domain.Space, error) {
+	panic("UpdateSpaceDiscordChannel not stubbed")
+}
+func (n *noopStore) UpdateSpaceACLState(_ context.Context, _ string, _ domain.ACLState) (*domain.Space, error) {
+	panic("UpdateSpaceACLState not stubbed")
 }
 func (n *noopStore) CreateJob(_ context.Context, _ store.CreateJobParams) (*domain.Job, error) {
 	panic("CreateJob not stubbed")
 }
 func (n *noopStore) GetJobByID(_ context.Context, _ string) (*domain.Job, error) {
 	panic("GetJobByID not stubbed")
+}
+func (n *noopStore) UpdateJobStatus(_ context.Context, _ store.UpdateJobStatusParams) (*domain.Job, error) {
+	panic("UpdateJobStatus not stubbed")
+}
+func (n *noopStore) InsertIdempotencyKey(_ context.Context, _ store.InsertIdempotencyKeyParams) (*domain.IdempotencyKey, error) {
+	panic("InsertIdempotencyKey not stubbed")
+}
+func (n *noopStore) GetIdempotencyKey(_ context.Context, _ string) (*domain.IdempotencyKey, error) {
+	panic("GetIdempotencyKey not stubbed")
+}
+func (n *noopStore) UpdateIdempotencyKeyResponse(_ context.Context, _ store.UpdateIdempotencyKeyResponseParams) error {
+	panic("UpdateIdempotencyKeyResponse not stubbed")
+}
+func (n *noopStore) CreateSpaceWithOutbox(_ context.Context, _ store.CreateSpaceParams, _ store.CreateOutboxParams) (*domain.Space, *domain.OutboxRow, error) {
+	panic("CreateSpaceWithOutbox not stubbed")
+}
+func (n *noopStore) ListPendingOutbox(_ context.Context, _ int) ([]*domain.OutboxRow, error) {
+	panic("ListPendingOutbox not stubbed")
+}
+func (n *noopStore) StampOutboxEnqueued(_ context.Context, _ []string) error {
+	panic("StampOutboxEnqueued not stubbed")
 }
 
 // authFakeStore overrides only the two methods Layer A needs.
