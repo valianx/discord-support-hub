@@ -626,7 +626,10 @@ components:
 
     InviteCollaboratorRequest:
       type: object
-      description: Identify the collaborator by hub user id, or by Discord id / email to create the roster row.
+      description: |
+        Identify the collaborator by hub user id, or by Discord id / email to create the roster row.
+        A collaborator is a global identity, not bound to a merchant; the merchant scope comes from the
+        target space (the path `id`). The same collaborator may be invited to spaces of several merchants.
       properties:
         user_id:
           type: [string, 'null']
@@ -681,7 +684,10 @@ components:
         user_id: { type: string, format: uuid }
         discord_user_id: { type: [string, 'null'] }
         display_name: { type: [string, 'null'] }
-        merchant_id: { type: [string, 'null'], format: uuid }
+        merchant_id:
+          type: [string, 'null']
+          format: uuid
+          description: The space's merchant (derived from the space, not a property of the collaborator). A collaborator is a global identity and may be a member of spaces across several merchants.
         role:
           type: string
           enum: [collaborator]
@@ -693,11 +699,15 @@ components:
 
     CollaboratorChannel:
       type: object
+      description: One space a collaborator can access. A collaborator may have several of these spanning different merchants; the merchant on each entry is the space's merchant, not the collaborator's.
       required: [space_id, role, lifecycle_state]
       properties:
         space_id: { type: string, format: uuid }
         space_name: { type: string }
-        merchant_id: { type: string, format: uuid }
+        merchant_id:
+          type: string
+          format: uuid
+          description: The space's merchant (derived from the space).
         merchant_name: { type: string }
         role:
           type: string
@@ -725,11 +735,15 @@ components:
 
     DirectoryEntry:
       type: object
+      description: One space x user x role row. The merchant is the space's merchant (derived from the space); for a collaborator it does not imply the user belongs to that merchant, since a collaborator may appear in spaces of several merchants.
       required: [space_id, user_id, role]
       properties:
         space_id: { type: string, format: uuid }
         space_name: { type: string }
-        merchant_id: { type: string, format: uuid }
+        merchant_id:
+          type: string
+          format: uuid
+          description: The space's merchant (derived from the space).
         merchant_name: { type: string }
         user_id: { type: string, format: uuid }
         user_display_name: { type: [string, 'null'] }

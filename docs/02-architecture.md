@@ -52,7 +52,7 @@ flowchart LR
 
 **Layer 1 — Zippy backoffice (origin of action).** A human staffer performs the operational decision ("invite this agent", "open a space for merchant X"). The hub ships **no human UI** in v1; the backoffice is the API consumer.
 
-**Layer 2 — hub Postgres (authorization source of truth).** Every roster fact (`merchant ↔ user ↔ space`, `type=agent|collaborator`, `is_admin`) lives here. **AuthZ is always resolved against Postgres**, never against the Discord role. This is the invariant that makes the Discord role a *projection*, not a *grant*.
+**Layer 2 — hub Postgres (authorization source of truth).** Every roster fact lives here: a merchant owns exactly one space (1:1); a collaborator is a global identity granted access to one or more spaces via `space_members` (M:N, possibly spanning merchants); `type=agent|collaborator`; `is_admin`. **AuthZ is always resolved against Postgres**, never against the Discord role. This is the invariant that makes the Discord role a *projection*, not a *grant*.
 
 **Layer 3 — Discord (projection).** Roles and permission overwrites are the rendered consequence of Postgres state. The bot writes them and the reconciler repairs drift. If Discord and Postgres disagree, **Postgres wins** and the reconciler corrects Discord.
 
@@ -250,10 +250,11 @@ The auth middleware (Gin) extracts the bearer token, hashes it, looks up the act
 
 After authentication, **authorization resolves against Postgres**, never against Discord:
 
-- The middleware/handler loads the relevant roster facts (`users.type`, `users.is_admin`, `space_members`, `merchant` ownership) and decides:
+- The middleware/handler loads the relevant roster facts (`users.type`, `users.is_admin`, `space_members`) and decides:
   - `POST /agents`, `DELETE /agents/{id}` → require **Admin** (`is_admin = true`) — the roster-management safeguard.
   - Invite / expel / lifecycle → require **Agent** (or the backoffice service principal acting on an agent's behalf).
   - Read endpoints scoped so a request can only see what the principal is entitled to.
+- **Collaborator entitlement is per-space, not per-merchant.** "Is this principal entitled to space S?" resolves to "does a `space_members` row link this user to S?" — there is no `user → merchant` binding to scope against. A collaborator may hold rows for spaces across several merchants and is entitled only to those. Merchant ownership applies to the **space** (each space has one merchant), not to collaborator scoping.
 - The decision is a pure function of Postgres state. Even if Discord shows someone with the Agent role, if Postgres says `type=collaborator` they are **not** authorized. This is `MANAGE_ROLES` reserved-to-the-bot (NFR-13) made concrete: the Discord role is not a grant, it is a projection.
 
 ### 5.3 The future POC frontend (downstream consumer)
@@ -268,7 +269,7 @@ A browser POC frontend will be built **after** the API is complete. It is a down
 
 ## 6. Onboarding sequences (end-to-end)
 
-Guild entry is **always** OAuth2 `guilds.join` — for agents and collaborators alike (no invite links, NFR-14). The difference between the two is the **access grant**: an agent gets the **Agent role** (category-level VIEW_CHANNEL = all spaces); a collaborator gets a **per-user overwrite** on their one space.
+Guild entry is **always** OAuth2 `guilds.join` — for agents and collaborators alike (no invite links, NFR-14). The difference between the two is the **access grant**: an agent gets the **Agent role** (category-level VIEW_CHANNEL = all spaces); a collaborator gets a **per-user overwrite** on each target space they are invited to (one collaborator may hold overwrites on several spaces across merchants).
 
 ### 6.1 Agent onboarding
 
@@ -337,7 +338,7 @@ sequenceDiagram
 ```
 
 Key facts:
-- A collaborator's **entire** access surface is one `ChannelPermissionSet(channelID, userID, PermissionOverwriteTypeMember, allow, deny)` on their one space. They have **no role**, **no category access**, and cannot see any other merchant's channel — isolation by construction (NFR-5).
+- A collaborator's access surface is a per-user `ChannelPermissionSet(channelID, userID, PermissionOverwriteTypeMember, allow, deny)` on the target space — one such overwrite per space they were invited to. They have **no role** and **no category access**, and can see only the spaces they hold an overwrite on (possibly across several merchants), never one they were not invited to — isolation by construction (NFR-5).
 - No invite link is ever created; entry is `guilds.join`, access is the overwrite (FR-22).
 - Collaborators cannot invite (FR-20) — enforced at Layer B: only Agent/Admin principals reach the invite handler.
 
@@ -433,12 +434,11 @@ Boundaries: `domain` has no infra imports; `store`/`discord`/`queue`/`cache`/`ra
 
 1. **One trusted backoffice caller** for the service-key auth in v1 (multiple keys allowed for rotation, but a single logical principal). If multiple distinct backoffice systems appear, scopes already accommodate them.
 2. **One guild** (no multi-guild sharding — explicitly out of scope). `guild_id` is configuration, not a per-row dimension that needs sharding logic.
-3. **Spaces-per-merchant is N (no hard cap), typically one active.** Per the open operator decision (`01-mvp-scope.md` §6.2), the schema models one-merchant→N-spaces and does **not** enforce one-at-a-time. A `UNIQUE` partial-index seam is noted in the DDL should the operator later want to enforce exactly-one-active.
+3. **Cardinality is fixed: merchant↔space is 1:1, collaborator↔space is M:N.** Each merchant owns exactly one space, enforced by `UNIQUE (merchant_id)` on `spaces`; lifecycle (archive/reopen) acts on that single space. A collaborator is a global external identity that may be granted access to several spaces across different merchants via `space_members`; a collaborator's tenant associations are derived from space membership, never from a `user → merchant` column.
 4. **Valkey is cache + coordination only.** No authorization or roster fact is ever read from Valkey for a decision. A total Valkey loss degrades throughput (cold cache, locks unavailable → workers back off) but cannot cause an isolation breach.
 5. **The POC frontend is downstream and out of build scope.** Only the CORS config and the session-principal seam are reserved here; the session issuer is not built in M0–M3.
 
 ### Open items needing an operator decision
 
-1. **One-active-space-per-merchant rule** — enforce a DB-level `UNIQUE (merchant_id) WHERE lifecycle_state='active'` partial index, or leave it in userland? Default in this design: **leave in userland** (no cap), per scope §6.2. *Confirm.*
-2. **Frontend session mechanism** — when the POC is built, will the human session be minted by the hub (a `/auth/session` endpoint) or delegated to the backoffice's existing auth? The seam supports either; the choice is deferred until the POC starts.
-3. **Test guild + bot application** — operational prerequisite (not a design decision) needed before M2 runs for real; the M0 setup guide covers creation.
+1. **Frontend session mechanism** — when the POC is built, will the human session be minted by the hub (a `/auth/session` endpoint) or delegated to the backoffice's existing auth? The seam supports either; the choice is deferred until the POC starts.
+2. **Test guild + bot application** — operational prerequisite (not a design decision) needed before M2 runs for real; the M0 setup guide covers creation.

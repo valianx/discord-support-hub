@@ -121,6 +121,7 @@ These ship in a **lighter but real** form in v1 (full rigor continues through v1
 | :-- | :-- | :-- |
 | **MVP FR set** | FR-1,3,4,5,6,7,9,10,11,13,14,16,17,18,19,20,21,22,23 + reduced FR-15; FR-24 reduced to optional suffix | This document |
 | **Capacity target (NFR-1)** | **~50 merchants → channel mode.** Thread mode and multi-guild sharding dropped from scope. | 50 « the 500-channel budget |
+| **Cardinality** | **merchant ↔ space = 1:1** (each merchant has exactly one space; `UNIQUE(merchant_id)`). **collaborator ↔ space = M:N** — a collaborator is a global external user who may be invited to several merchants' spaces; tenant grouping derives from space membership, not a user→merchant FK. | Isolation unchanged: a collaborator sees only spaces they were invited to |
 | **FR-8 persistence** | **Deferred to v2.** v1 manages access only. | Keeps the DB schema small |
 | **Agent identity / onboarding origin** | **Zippy backoffice** is the upstream admin surface (manual roster, FR-23). Backoffice → hub API → OAuth2 `guilds.join` entry → bot assigns Agent role. SSO/Workspace binding → v2. | See §1.5; upholds no-invites |
 | **Expulsion cascade default** | **`remove-from-channel` is the default** (revoke the overwrite, keep the person in the guild). `remove-from-server` is explicit opt-in via `?scope=server`. | Least-destructive default; reversible |
@@ -157,10 +158,10 @@ Integration tests against a test guild, structured logs + metrics + health, Dock
 
 ## 6. Still needs an operator decision
 
-Resolved above: capacity (~50 → channel mode), agent marking (optional `- Zippy` suffix), agent onboarding origin (Zippy backoffice → hub API → OAuth2 entry), license, and project name. Remaining:
+Resolved above: capacity (~50 → channel mode), cardinality (merchant↔space 1:1, collaborator↔space M:N), agent marking (optional `- Zippy` suffix), agent onboarding origin (Zippy backoffice → hub API → OAuth2 entry), license, and project name. Remaining:
 
 1. **Test guild + bot application** — a throwaway Discord server plus a bot application/token, needed to run integration tests (NFR-16) and real provisioning. This is an **operational prerequisite, not a design decision**; the M0 setup guide will walk through creating one if you don't already have it. *Needed before M2 runs for real.*
-2. **Spaces per merchant** — one active space per merchant, or several open at once? The data model already allows **one merchant → N spaces** (typically one active); confirm whether a hard one-at-a-time rule should be enforced. *Affects the M1 schema.*
+2. **POC frontend session mechanism** — hub-minted (`/auth/session`) vs delegated to the backoffice's auth. The API reserves the `session` principal seam either way; decide before the POC frontend phase.
 
 ---
 
