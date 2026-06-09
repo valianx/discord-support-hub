@@ -77,6 +77,36 @@ func TestRequireDiscordToken(t *testing.T) {
 	}
 }
 
+// TestRequireAgentRoleID verifies the boot-time guard that DISCORD_AGENT_ROLE_ID
+// must be present and distinct from DISCORD_GUILD_ID (fix NFR-5).
+func TestRequireAgentRoleID(t *testing.T) {
+	t.Run("missing agent role id returns error", func(t *testing.T) {
+		clearEnv(t, "DISCORD_AGENT_ROLE_ID", "DISCORD_GUILD_ID")
+		cfg, _ := config.Load()
+		if err := cfg.RequireAgentRoleID(); err == nil {
+			t.Error("RequireAgentRoleID() should return error when DISCORD_AGENT_ROLE_ID is empty")
+		}
+	})
+
+	t.Run("agent role id equals guild id returns error (would be @everyone)", func(t *testing.T) {
+		t.Setenv("DISCORD_GUILD_ID", "guild-123")
+		t.Setenv("DISCORD_AGENT_ROLE_ID", "guild-123") // same as guild id = @everyone
+		cfg, _ := config.Load()
+		if err := cfg.RequireAgentRoleID(); err == nil {
+			t.Error("RequireAgentRoleID() should return error when AgentRoleID equals GuildID (@everyone)")
+		}
+	})
+
+	t.Run("distinct agent role id is valid", func(t *testing.T) {
+		t.Setenv("DISCORD_GUILD_ID", "guild-123")
+		t.Setenv("DISCORD_AGENT_ROLE_ID", "agent-role-456") // distinct
+		cfg, _ := config.Load()
+		if err := cfg.RequireAgentRoleID(); err != nil {
+			t.Errorf("RequireAgentRoleID() unexpected error for valid config: %v", err)
+		}
+	})
+}
+
 func clearEnv(t *testing.T, keys ...string) {
 	t.Helper()
 	for _, k := range keys {

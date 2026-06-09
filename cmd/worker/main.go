@@ -49,15 +49,18 @@ func main() {
 	defer pg.Close()
 
 	// Build and start the asynq server.
+	// fix(NFR-5): AgentRoleID and DefaultCategoryID are now wired so the provision handler
+	// uses the real Agent role (not @everyone) and can apply the category allow consistently.
 	srv := worker.New(worker.Config{
-		RedisAddr:      cfg.ValkeyAddr,
-		RedisPassword:  cfg.ValkeyPassword,
-		RedisDB:        cfg.ValkeyDB,
-		Concurrency:    cfg.WorkerConcurrency,
-		Store:          pg,
-		DiscordClient:  discordSession,
-		DiscordGuildID: cfg.DiscordGuildID,
-		AgentRoleID:    cfg.DiscordAgentRoleID,
+		RedisAddr:         cfg.ValkeyAddr,
+		RedisPassword:     cfg.ValkeyPassword,
+		RedisDB:           cfg.ValkeyDB,
+		Concurrency:       cfg.WorkerConcurrency,
+		Store:             pg,
+		DiscordClient:     discordSession,
+		DiscordGuildID:    cfg.DiscordGuildID,
+		AgentRoleID:       cfg.DiscordAgentRoleID,
+		DefaultCategoryID: cfg.DiscordCategoryID,
 	})
 
 	// Start the worker in a goroutine; it blocks until Shutdown is called.

@@ -122,6 +122,15 @@ func (n *noopStore) ListPendingOutbox(_ context.Context, _ int) ([]*domain.Outbo
 func (n *noopStore) StampOutboxEnqueued(_ context.Context, _ []string) error {
 	panic("StampOutboxEnqueued not stubbed")
 }
+func (n *noopStore) UpdateOutboxPayload(_ context.Context, _ string, _ map[string]any) error {
+	panic("UpdateOutboxPayload not stubbed")
+}
+func (n *noopStore) InsertAuditEntry(_ context.Context, _ store.InsertAuditEntryParams) error {
+	panic("InsertAuditEntry not stubbed")
+}
+func (n *noopStore) ListSpaces(_ context.Context, _ store.ListSpacesParams) ([]*domain.Space, error) {
+	panic("ListSpaces not stubbed")
+}
 
 // authFakeStore overrides only the two methods Layer A needs.
 type authFakeStore struct {

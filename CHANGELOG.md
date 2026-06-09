@@ -34,5 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - asynq retry/backoff: `RetryDelayFunc` honors `Retry-After`; rate-limit retries are excluded from the failure counter; `SkipRetry` for terminal/fail-closed errors.
   - Jobs mirror: `GET /jobs/{id}` reads authoritative status from Postgres (never Valkey), gated on control-plane authority.
   - Read-through Valkey cache helper (TTL + invalidation).
+- **M2b — Provisioning vertical** (completes step 3 / M2): a merchant channel is provisioned end-to-end, fail-closed, through the M2a machinery.
+  - `POST /merchants/{id}/channels` — validates (name length/charset, category snowflake), writes the desired `spaces` row + `outbox` row in one transaction, returns `202` + `Location` + job, stores the `202` for idempotent replay. Control-plane gated (FR-1).
+  - **Fail-closed provisioning worker** — acquires the per-merchant lock + a rate-limit token, creates the channel **already denied to `@everyone`** (the deny-`VIEW_CHANNEL` overwrite is in the *initial* create — no visible window, NFR-4), applies the category-level allow to the **configured Agent role** (never `@everyone`), persists `discord_channel_id` + `acl_state='applied'`. Any ACL failure → `SkipRetry` + `degraded`/`failed` + audit, never world-readable (FR-3, FR-5).
+  - **Isolation guard** — the handler refuses to grant category visibility when the Agent role is unset or equals the guild id (`@everyone`), protecting the multi-tenant isolation invariant (NFR-5).
+  - `GET /channels` and `GET /channels/{id}` served from cache (generation-token invalidation), control-plane gated (FR-10).
 
 [Unreleased]: https://github.com/valianx/discord-support-hub/commits/main

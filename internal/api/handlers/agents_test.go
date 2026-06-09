@@ -166,6 +166,15 @@ func (f *agentFakeStore) ListPendingOutbox(_ context.Context, _ int) ([]*domain.
 func (f *agentFakeStore) StampOutboxEnqueued(_ context.Context, _ []string) error {
 	panic("StampOutboxEnqueued")
 }
+func (f *agentFakeStore) UpdateOutboxPayload(_ context.Context, _ string, _ map[string]any) error {
+	panic("UpdateOutboxPayload")
+}
+func (f *agentFakeStore) InsertAuditEntry(_ context.Context, _ store.InsertAuditEntryParams) error {
+	panic("InsertAuditEntry")
+}
+func (f *agentFakeStore) ListSpaces(_ context.Context, _ store.ListSpacesParams) ([]*domain.Space, error) {
+	panic("ListSpaces")
+}
 
 // ─── Router helpers ───────────────────────────────────────────────────────────
 

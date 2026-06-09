@@ -115,6 +115,21 @@ func (c *Config) RequirePostgresDSN() error {
 	return nil
 }
 
+// RequireAgentRoleID returns an error when DISCORD_AGENT_ROLE_ID is absent or equals
+// DISCORD_GUILD_ID. The Agent role must be a real, distinct role — using the guild id
+// would grant @everyone VIEW_CHANNEL on every space category, breaking multi-tenant
+// isolation (NFR-5).
+func (c *Config) RequireAgentRoleID() error {
+	if c.DiscordAgentRoleID == "" {
+		return fmt.Errorf("config: DISCORD_AGENT_ROLE_ID is required but not set")
+	}
+	if c.DiscordGuildID != "" && c.DiscordAgentRoleID == c.DiscordGuildID {
+		return fmt.Errorf("config: DISCORD_AGENT_ROLE_ID must not equal DISCORD_GUILD_ID — " +
+			"the guild id is the @everyone role; using it would make every channel world-readable (NFR-5)")
+	}
+	return nil
+}
+
 // RequireEncryptionKey returns an error when the AES-256-GCM key is absent.
 func (c *Config) RequireEncryptionKey() error {
 	if c.EncryptionKey == "" {

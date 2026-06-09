@@ -133,6 +133,25 @@ type Store interface {
 
 	// StampOutboxEnqueued marks outbox rows as enqueued by setting enqueued_at.
 	StampOutboxEnqueued(ctx context.Context, ids []string) error
+
+	// UpdateOutboxPayload replaces the payload on an outbox row identified by its
+	// idempotency_key. Called immediately after CreateSpaceWithOutbox to inject the
+	// space_id (which is only known after the transaction commits) into the relay payload
+	// so the worker's GetSpaceByID call resolves to the correct space (fix DEFECT-2).
+	// Only updates rows that have not yet been enqueued (enqueued_at IS NULL).
+	UpdateOutboxPayload(ctx context.Context, idempotencyKey string, payload map[string]any) error
+
+	// --- Audit log ---
+
+	// InsertAuditEntry appends an audit_log row.
+	// No secrets may appear in entry.Detail (NFR-6, FR-14).
+	InsertAuditEntry(ctx context.Context, entry InsertAuditEntryParams) error
+
+	// --- Spaces list ---
+
+	// ListSpaces returns spaces ordered by created_at asc with optional filters and
+	// cursor-based pagination. Limit of 0 uses the default page size (50).
+	ListSpaces(ctx context.Context, p ListSpacesParams) ([]*domain.Space, error)
 }
 
 // --- Parameter types ---
@@ -223,6 +242,30 @@ type UpdateIdempotencyKeyResponseParams struct {
 	ResponseCode int
 	ResponseBody map[string]any
 	JobID        *string
+}
+
+// InsertAuditEntryParams carries the fields for an audit_log row.
+// Never include raw tokens or secret values in Detail (NFR-6).
+type InsertAuditEntryParams struct {
+	ActorAPIKeyID *string
+	ActorUserID   *string
+	Action        string
+	MerchantID    *string
+	SpaceID       *string
+	TargetUserID  *string
+	Detail        map[string]any
+}
+
+// ListSpacesParams carries filter and pagination parameters for ListSpaces.
+type ListSpacesParams struct {
+	// LifecycleState filters to a specific lifecycle state when non-empty.
+	LifecycleState *domain.SpaceLifecycleState
+	// MerchantID filters to a specific merchant when non-empty.
+	MerchantID *string
+	// Cursor is the last seen created_at value (ISO-8601) for page continuation.
+	Cursor *string
+	// Limit is the maximum number of rows to return. 0 = default (50).
+	Limit int
 }
 
 // CreateOutboxParams carries the fields for inserting an outbox row.

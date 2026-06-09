@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bwmarrin/discordgo"
 	"github.com/hibiken/asynq"
 	"github.com/valianx/discord-support-hub/internal/domain"
 	"github.com/valianx/discord-support-hub/internal/queue"
@@ -46,6 +47,17 @@ func (f *fakeDiscordClient) AssignAgentRole(_ context.Context, _, discordUserID,
 func (f *fakeDiscordClient) RemoveAgentRole(_ context.Context, _, discordUserID, _ string) error {
 	f.removeCalls = append(f.removeCalls, discordUserID)
 	return f.removeErr
+}
+
+// M2b discord.Client methods — not exercised by project_agent_role tests, stub only.
+func (f *fakeDiscordClient) CreateChannelDenied(_ context.Context, _, _, _, _ string) (string, error) {
+	return "", nil
+}
+func (f *fakeDiscordClient) ApplyCategoryAgentAllow(_ context.Context, _, _ string) error {
+	return nil
+}
+func (f *fakeDiscordClient) SetChannelPermissionDeny(_ context.Context, _, _ string, _ discordgo.PermissionOverwriteType) error {
+	return nil
 }
 
 // workerFakeStore implements store.Store for worker tests.
@@ -158,6 +170,15 @@ func (f *workerFakeStore) ListPendingOutbox(_ context.Context, _ int) ([]*domain
 }
 func (f *workerFakeStore) StampOutboxEnqueued(_ context.Context, _ []string) error {
 	panic("StampOutboxEnqueued")
+}
+func (f *workerFakeStore) UpdateOutboxPayload(_ context.Context, _ string, _ map[string]any) error {
+	panic("UpdateOutboxPayload")
+}
+func (f *workerFakeStore) InsertAuditEntry(_ context.Context, _ store.InsertAuditEntryParams) error {
+	panic("InsertAuditEntry")
+}
+func (f *workerFakeStore) ListSpaces(_ context.Context, _ store.ListSpacesParams) ([]*domain.Space, error) {
+	panic("ListSpaces")
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
