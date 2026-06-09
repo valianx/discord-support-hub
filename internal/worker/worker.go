@@ -52,6 +52,9 @@ type Config struct {
 
 	// M3: reconcile engine for post-mutation targeted sweeps.
 	ReconcileEngine *reconcile.Engine
+
+	// M4: optional nickname suffix for agent marking (FR-24). Empty = disabled.
+	AgentNicknameSuffix string
 }
 
 // provisionMaxRetry is the MaxRetry for the provision queue. Rate-limit retries are
@@ -115,8 +118,10 @@ func (s *Server) Shutdown() {
 
 // registerHandlers binds every task kind to its handler.
 func registerHandlers(mux *asynq.ServeMux, cfg Config) {
-	// M1: real project_agent_role handler.
-	roleHandler := newProjectAgentRoleHandler(cfg.Store, cfg.DiscordClient, cfg.DiscordGuildID, cfg.AgentRoleID)
+	// M1: real project_agent_role handler; M4: wired with optional nickname suffix (FR-24).
+	roleHandler := newProjectAgentRoleHandlerWithMarking(
+		cfg.Store, cfg.DiscordClient, cfg.DiscordGuildID, cfg.AgentRoleID, cfg.AgentNicknameSuffix,
+	)
 	mux.HandleFunc(queue.KindProjectAgentRole, roleHandler)
 
 	// M2b: real provision_space handler.
@@ -156,11 +161,33 @@ func registerHandlers(mux *asynq.ServeMux, cfg Config) {
 	// M3: real reconcile_space handler.
 	mux.HandleFunc(queue.KindReconcileSpace, newReconcileSpaceHandler(cfg.ReconcileEngine))
 
-	// Remaining kinds are stubs pending M4.
-	mux.HandleFunc(queue.KindChangeLifecycle, stubHandler(queue.KindChangeLifecycle))
+	// M4: real lifecycle handler.
+	lifecycleHandler := newChangeLifecycleHandler(lifecycleConfig{
+		store:          cfg.Store,
+		discord:        cfg.DiscordClient,
+		guildID:        cfg.DiscordGuildID,
+		everyoneRoleID: cfg.EveryoneRoleID,
+	})
+	mux.HandleFunc(queue.KindChangeLifecycle, lifecycleHandler)
+
+	// M4: real sync_welcome handler.
+	welcomeHandler := newSyncWelcomeHandler(syncWelcomeConfig{
+		store:   cfg.Store,
+		discord: cfg.DiscordClient,
+	})
+	mux.HandleFunc(queue.KindSyncWelcome, welcomeHandler)
+
+	// M4: real nickname-suffix marking handler (no-op when suffix is empty).
+	nickHandler := newApplyNicknameSuffixHandler(nickmarkingConfig{
+		store:   cfg.Store,
+		discord: cfg.DiscordClient,
+		guildID: cfg.DiscordGuildID,
+		suffix:  cfg.AgentNicknameSuffix,
+	})
+	mux.HandleFunc(queue.KindApplyNicknameSuffix, nickHandler)
+
+	// KindReconcileGuild remains a stub until M5's scheduled full-guild sweep.
 	mux.HandleFunc(queue.KindReconcileGuild, stubHandler(queue.KindReconcileGuild))
-	mux.HandleFunc(queue.KindSyncWelcome, stubHandler(queue.KindSyncWelcome))
-	mux.HandleFunc(queue.KindApplyNicknameSuffix, stubHandler(queue.KindApplyNicknameSuffix))
 }
 
 // stubHandler returns an asynq.HandlerFunc that logs receipt and returns nil.

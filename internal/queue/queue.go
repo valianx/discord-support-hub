@@ -72,6 +72,12 @@ type ReconcileSpacePayload struct {
 	SpaceID string `json:"space_id"`
 }
 
+// SyncWelcomePayload is the task payload for KindSyncWelcome.
+type SyncWelcomePayload struct {
+	SpaceID string `json:"space_id"`
+	Message string `json:"message,omitempty"` // override message; empty = use default template
+}
+
 // ApplyNicknameSuffixPayload is the task payload for KindApplyNicknameSuffix.
 type ApplyNicknameSuffixPayload struct {
 	UserID  string `json:"user_id"`

@@ -997,6 +997,144 @@ func (s *Store) UpdateSpaceReconciledAt(ctx context.Context, spaceID string) err
 	return nil
 }
 
+// ─── M4: Lifecycle ────────────────────────────────────────────────────────────
+
+// UpdateSpaceLifecycle transitions a space's lifecycle_state.
+// When the new state is "archived", archived_at is set to now().
+// When the new state is anything else (active, resolved), archived_at is cleared.
+// Returns ErrNotFound when the space does not exist.
+func (s *Store) UpdateSpaceLifecycle(ctx context.Context, p store.UpdateSpaceLifecycleParams) (*domain.Space, error) {
+	row := s.pool.QueryRow(ctx, `
+		UPDATE spaces
+		SET lifecycle_state = $1,
+		    archived_at = CASE WHEN $1::text = 'archived' THEN now() ELSE NULL END,
+		    updated_at = now()
+		WHERE id = $2
+		RETURNING id, merchant_id, discord_channel_id, discord_category_id, name,
+		          lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		          reconciled_at, drift_count, created_at, updated_at, archived_at`,
+		p.LifecycleState, p.SpaceID,
+	)
+	sp, err := scanSpace(row)
+	if err != nil {
+		return nil, err
+	}
+	return sp, nil
+}
+
+// UpdateSpaceWelcomeMessageID records the pinned message id from sync_welcome.
+func (s *Store) UpdateSpaceWelcomeMessageID(ctx context.Context, spaceID, messageID string) (*domain.Space, error) {
+	row := s.pool.QueryRow(ctx, `
+		UPDATE spaces SET welcome_message_id = $1, updated_at = now()
+		WHERE id = $2
+		RETURNING id, merchant_id, discord_channel_id, discord_category_id, name,
+		          lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		          reconciled_at, drift_count, created_at, updated_at, archived_at`,
+		messageID, spaceID,
+	)
+	return scanSpace(row)
+}
+
+// ─── M4: Audit entries ────────────────────────────────────────────────────────
+
+// ListAuditEntries returns audit_log rows newest-first with optional filters (FR-14).
+func (s *Store) ListAuditEntries(ctx context.Context, p store.ListAuditEntriesParams) ([]*domain.AuditEntry, error) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+
+	args := make([]any, 0, 6)
+	where := " WHERE 1=1"
+
+	if p.MerchantID != nil {
+		args = append(args, *p.MerchantID)
+		where += fmt.Sprintf(" AND merchant_id = $%d", len(args))
+	}
+	if p.SpaceID != nil {
+		args = append(args, *p.SpaceID)
+		where += fmt.Sprintf(" AND space_id = $%d", len(args))
+	}
+	if p.Action != nil {
+		args = append(args, *p.Action)
+		where += fmt.Sprintf(" AND action = $%d", len(args))
+	}
+	if p.Since != nil {
+		args = append(args, *p.Since)
+		where += fmt.Sprintf(" AND created_at > $%d::timestamptz", len(args))
+	}
+	// Cursor is the last seen id (newest-first: cursor means "id < cursor").
+	if p.Cursor != nil {
+		args = append(args, *p.Cursor)
+		where += fmt.Sprintf(" AND id < $%d", len(args))
+	}
+
+	args = append(args, limit)
+	query := `SELECT id, actor_api_key, actor_user_id, action, merchant_id, space_id,
+		             target_user_id, scope, detail, created_at
+		      FROM audit_log` + where +
+		fmt.Sprintf(` ORDER BY id DESC LIMIT $%d`, len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list audit entries: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*domain.AuditEntry
+	for rows.Next() {
+		e, err := scanAuditEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func scanAuditEntry(row interface{ Scan(dest ...any) error }) (*domain.AuditEntry, error) {
+	var e domain.AuditEntry
+	var detailRaw []byte
+	var scopeStr *string
+	err := row.Scan(
+		&e.ID, &e.ActorAPIKeyID, &e.ActorUserID, &e.Action,
+		&e.MerchantID, &e.SpaceID, &e.TargetUserID,
+		&scopeStr, &detailRaw, &e.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: scan audit_entry: %w", err)
+	}
+	if scopeStr != nil {
+		s := domain.ExpulsionScope(*scopeStr)
+		e.Scope = &s
+	}
+	if len(detailRaw) > 0 {
+		if err = unmarshalPayload(detailRaw, &e.Detail); err != nil {
+			return nil, err
+		}
+	}
+	return &e, nil
+}
+
+// ─── M4: Job lookup by space ──────────────────────────────────────────────────
+
+// GetJobBySpaceIDAndKind returns the most-recent jobs row for a given space and task kind.
+// Returns ErrNotFound when no row exists. Used by workers to advance job status without
+// needing the job_id in the asynq task payload (fix for lookupJobBySpaceID stub).
+func (s *Store) GetJobBySpaceIDAndKind(ctx context.Context, spaceID, kind string) (*domain.Job, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, task_id, kind, queue, status, merchant_id, space_id, user_id,
+		       payload, error, retry_count, created_at, updated_at, completed_at
+		FROM jobs
+		WHERE space_id = $1 AND kind = $2
+		ORDER BY created_at DESC
+		LIMIT 1`, spaceID, kind)
+	return scanJob(row)
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 // marshalPayload converts a map to a JSON byte slice suitable for JSONB columns.

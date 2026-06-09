@@ -209,6 +209,20 @@ func (f *oauthFakeStore) UpdateDiscordUserIDConflict(_ context.Context, _, _ str
 	return store.ErrConflict
 }
 
+// M4 store methods — not exercised by OAuth callback tests.
+func (f *oauthFakeStore) UpdateSpaceLifecycle(_ context.Context, _ store.UpdateSpaceLifecycleParams) (*domain.Space, error) {
+	panic("UpdateSpaceLifecycle")
+}
+func (f *oauthFakeStore) UpdateSpaceWelcomeMessageID(_ context.Context, _, _ string) (*domain.Space, error) {
+	panic("UpdateSpaceWelcomeMessageID")
+}
+func (f *oauthFakeStore) ListAuditEntries(_ context.Context, _ store.ListAuditEntriesParams) ([]*domain.AuditEntry, error) {
+	panic("ListAuditEntries")
+}
+func (f *oauthFakeStore) GetJobBySpaceIDAndKind(_ context.Context, _, _ string) (*domain.Job, error) {
+	return nil, store.ErrNotFound
+}
+
 // ─── fakeDiscordTransport ─────────────────────────────────────────────────────
 
 // fakeDiscordTransport records requests and returns canned responses.

@@ -70,6 +70,18 @@ func (h *Handlers) AddAgent(c *gin.Context) {
 		return
 	}
 
+	// fix(SEC-M4-002): display_name becomes a Discord nickname; reject unsafe runes
+	// (ASCII control chars + Unicode Cf/Co) to prevent nickname spoofing via bidi overrides.
+	if req.DisplayName != nil {
+		if msg := rejectUnsafeRunes(*req.DisplayName); msg != "" {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code":    "validation_error",
+				"message": "display_name " + msg,
+			})
+			return
+		}
+	}
+
 	email := req.Email
 	user, err := h.store.CreateUser(c.Request.Context(), store.CreateUserParams{
 		Type:          domain.UserTypeAgent,

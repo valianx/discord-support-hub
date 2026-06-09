@@ -77,18 +77,21 @@ func main() {
 	// Build and start the asynq server.
 	// fix(NFR-5): AgentRoleID and DefaultCategoryID are now wired so the provision handler
 	// uses the real Agent role (not @everyone) and can apply the category allow consistently.
+	// fix(AC-5): AgentNicknameSuffix wired so AGENT_NICKNAME_SUFFIX env var can enable
+	// nickname marking at runtime (was always disabled regardless of env var).
 	srv := worker.New(worker.Config{
-		RedisAddr:         cfg.ValkeyAddr,
-		RedisPassword:     cfg.ValkeyPassword,
-		RedisDB:           cfg.ValkeyDB,
-		Concurrency:       cfg.WorkerConcurrency,
-		Store:             pg,
-		DiscordClient:     discordSession,
-		DiscordGuildID:    cfg.DiscordGuildID,
-		AgentRoleID:       cfg.DiscordAgentRoleID,
-		DefaultCategoryID: cfg.DiscordCategoryID,
-		TokenStore:        tokenStore,
-		ReconcileEngine:   reconcileEngine,
+		RedisAddr:           cfg.ValkeyAddr,
+		RedisPassword:       cfg.ValkeyPassword,
+		RedisDB:             cfg.ValkeyDB,
+		Concurrency:         cfg.WorkerConcurrency,
+		Store:               pg,
+		DiscordClient:       discordSession,
+		DiscordGuildID:      cfg.DiscordGuildID,
+		AgentRoleID:         cfg.DiscordAgentRoleID,
+		DefaultCategoryID:   cfg.DiscordCategoryID,
+		TokenStore:          tokenStore,
+		ReconcileEngine:     reconcileEngine,
+		AgentNicknameSuffix: cfg.AgentNicknameSuffix,
 	})
 
 	// Start the worker in a goroutine; it blocks until Shutdown is called.

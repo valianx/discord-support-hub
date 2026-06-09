@@ -283,6 +283,20 @@ func (f *collaboratorFakeStore) UpdateDiscordUserID(_ context.Context, _, _ stri
 	panic("UpdateDiscordUserID")
 }
 
+// M4 store methods — not exercised by collaborator tests.
+func (f *collaboratorFakeStore) UpdateSpaceLifecycle(_ context.Context, _ store.UpdateSpaceLifecycleParams) (*domain.Space, error) {
+	panic("UpdateSpaceLifecycle")
+}
+func (f *collaboratorFakeStore) UpdateSpaceWelcomeMessageID(_ context.Context, _, _ string) (*domain.Space, error) {
+	panic("UpdateSpaceWelcomeMessageID")
+}
+func (f *collaboratorFakeStore) ListAuditEntries(_ context.Context, _ store.ListAuditEntriesParams) ([]*domain.AuditEntry, error) {
+	panic("ListAuditEntries")
+}
+func (f *collaboratorFakeStore) GetJobBySpaceIDAndKind(_ context.Context, _, _ string) (*domain.Job, error) {
+	return nil, store.ErrNotFound
+}
+
 // ─── Router builders ─────────────────────────────────────────────────────────
 
 // buildCollaboratorRouter builds a minimal Gin engine for collaborator handler tests.

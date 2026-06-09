@@ -142,6 +142,31 @@ func TestStubHandlers_JobEndpoints(t *testing.T) {
 	assertNotImplemented(t, r, http.MethodGet, "/v1/jobs/job-001")
 }
 
+// TestWelcomeSyncRoute_ContractPath verifies that the router serves the OpenAPI contract
+// path POST /v1/channels/{id}/welcome:sync (with a literal colon) and returns the
+// handler response — NOT 404 (AC-4 route-path fix: the colon must be part of the literal
+// segment, not a Gin route-param prefix).
+//
+// The nil-store router returns 501 from SyncWelcome (store == nil guard). A 404 would
+// indicate the route was never registered at the contract path.
+func TestWelcomeSyncRoute_ContractPath(t *testing.T) {
+	r := newTestRouter()
+	// Contract path per OpenAPI: POST /v1/channels/{id}/welcome:sync
+	req := httptest.NewRequest(http.MethodPost, "/v1/channels/space-001/welcome:sync", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	// The handler must be reachable (not 404). With nil store it returns 501.
+	if w.Code == http.StatusNotFound {
+		t.Errorf("AC-4: POST /v1/channels/{id}/welcome:sync must be registered at the colon path, got 404 — " +
+			"route is not wired correctly. Check router.go welcome:sync registration.")
+	}
+	if w.Code != http.StatusNotImplemented {
+		t.Errorf("AC-4: POST .../welcome:sync with nil store must return 501 (handler reached), got %d; body: %s",
+			w.Code, w.Body.String())
+	}
+}
+
 // TestHealthEndpoints_NotStubbed verifies that health endpoints return 200, not 501.
 func TestHealthEndpoints_NotStubbed(t *testing.T) {
 	r := newTestRouter()

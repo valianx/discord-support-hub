@@ -33,6 +33,10 @@ const cacheSpaceTTL = 5 * time.Minute
 // https://discord.com/developers/docs/resources/channel#channel-object
 const discordChannelNameMaxLen = 100
 
+// discordMessageMaxLen is Discord's enforced maximum for message content (2000 chars).
+// https://discord.com/developers/docs/resources/message#create-message
+const discordMessageMaxLen = 2000
+
 // ─── ProvisionSpace ───────────────────────────────────────────────────────────
 
 // provisionSpaceRequest is the validated JSON body for POST /merchants/{merchantId}/channels.
@@ -40,6 +44,23 @@ type provisionSpaceRequest struct {
 	Name           string  `json:"name" binding:"required"`
 	CategoryID     *string `json:"category_id"`
 	WelcomeMessage *string `json:"welcome_message"`
+}
+
+// rejectUnsafeRunes returns a non-empty error message when s contains ASCII control
+// characters (0x00–0x1F, 0x7F) or Unicode format/private-use code points (Cf, Co).
+// These characters have no legitimate place in user-visible strings displayed in Discord
+// and may enable UI spoofing via direction overrides or invisible injections (SEC-M3-001,
+// SEC-M4-002).
+func rejectUnsafeRunes(s string) string {
+	for _, ch := range s {
+		if ch < 0x20 || ch == 0x7F {
+			return "contains disallowed control characters"
+		}
+		if unicode.Is(unicode.Cf, ch) || unicode.Is(unicode.Co, ch) {
+			return fmt.Sprintf("contains disallowed Unicode control character U+%04X", ch)
+		}
+	}
+	return ""
 }
 
 // validateProvisionRequest validates the channel name and optional category_id fields
@@ -61,16 +82,9 @@ func validateProvisionRequest(req *provisionSpaceRequest) (trimmedName string, v
 	if len(name) > discordChannelNameMaxLen {
 		return "", fmt.Sprintf("name exceeds Discord's %d-character limit", discordChannelNameMaxLen)
 	}
-	for _, ch := range name {
-		if ch < 0x20 || ch == 0x7F {
-			return "", "name contains disallowed control characters"
-		}
-		// SEC-M3-001: reject Unicode bidi/format control characters (U+202E RIGHT-TO-LEFT
-		// OVERRIDE and its family). unicode.Cf covers all format controls; unicode.Co covers
-		// private-use codepoints that have no place in a channel name.
-		if unicode.Is(unicode.Cf, ch) || unicode.Is(unicode.Co, ch) {
-			return "", fmt.Sprintf("name contains disallowed Unicode control character U+%04X", ch)
-		}
+	// SEC-M3-001: reject ASCII control chars and Unicode bidi/format/private-use code points.
+	if msg := rejectUnsafeRunes(name); msg != "" {
+		return "", "name " + msg
 	}
 	if req.CategoryID != nil {
 		catID := *req.CategoryID
@@ -419,16 +433,245 @@ func (h *Handlers) ListSpaceMembers(c *gin.Context) {
 	h.listSpaceMembers(c)
 }
 
-// ChangeSpaceLifecycle handles POST /channels/{id}/lifecycle (FR-7, M4).
-// TODO(M4): validate transition, enqueue change_lifecycle job, return 202.
-func (h *Handlers) ChangeSpaceLifecycle(c *gin.Context) {
-	notImplemented(c)
+// ─── ChangeSpaceLifecycle ─────────────────────────────────────────────────────
+
+// lifecycleTransitions defines the valid (from → to) state machine edges (AC-6, FR-7).
+// Only edges listed here are permitted; any other transition is rejected with 409.
+var lifecycleTransitions = map[domain.SpaceLifecycleState]map[domain.SpaceLifecycleState]bool{
+	domain.SpaceLifecycleActive:   {domain.SpaceLifecycleResolved: true, domain.SpaceLifecycleArchived: true},
+	domain.SpaceLifecycleResolved: {domain.SpaceLifecycleActive: true, domain.SpaceLifecycleArchived: true},
+	domain.SpaceLifecycleArchived: {domain.SpaceLifecycleActive: true}, // reopen
 }
 
-// SyncWelcome handles POST /channels/{id}/welcome:sync (FR-15 static, M4).
-// TODO(M4): enqueue sync_welcome job (set topic + pin), return 202.
+// changeLifecycleRequest is the JSON body for POST /channels/{id}/lifecycle.
+type changeLifecycleRequest struct {
+	Action string `json:"action" binding:"required"`
+}
+
+// actionToLifecycleState maps the API action string to the target SpaceLifecycleState.
+var actionToLifecycleState = map[string]domain.SpaceLifecycleState{
+	"open":    domain.SpaceLifecycleActive,
+	"resolve": domain.SpaceLifecycleResolved,
+	"archive": domain.SpaceLifecycleArchived,
+	"reopen":  domain.SpaceLifecycleActive,
+}
+
+// ChangeSpaceLifecycle handles POST /channels/{id}/lifecycle (FR-7, M4 AC-1, AC-6).
+//
+// Control-plane gated. Validates the transition, writes an outbox row for the async
+// worker, creates a jobs mirror row, and returns 202. The worker applies the Discord-side
+// change (archive = lock/hide; reopen = restore to active). History is never deleted.
+func (h *Handlers) ChangeSpaceLifecycle(c *gin.Context) {
+	if h.store == nil {
+		notImplemented(c)
+		return
+	}
+
+	p := middleware.GetPrincipal(c)
+	if !authz.RequireControlPlane(p) {
+		forbidden(c)
+		return
+	}
+
+	spaceID := c.Param("id")
+	if spaceID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "validation_error", "message": "id is required"})
+		return
+	}
+
+	var req changeLifecycleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "validation_error", "message": err.Error()})
+		return
+	}
+
+	targetState, ok := actionToLifecycleState[req.Action]
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    "validation_error",
+			"message": fmt.Sprintf("action must be one of: open, resolve, archive, reopen (got %q)", req.Action),
+		})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	sp, err := h.store.GetSpaceByID(ctx, spaceID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"code": "not_found", "message": "space not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": "failed to load space"})
+		return
+	}
+
+	// Validate state machine transition (AC-6).
+	validTargets, fromExists := lifecycleTransitions[sp.LifecycleState]
+	if !fromExists || !validTargets[targetState] {
+		c.JSON(http.StatusConflict, gin.H{
+			"code": "invalid_transition",
+			"message": fmt.Sprintf("cannot transition from %q to %q via action %q",
+				sp.LifecycleState, targetState, req.Action),
+		})
+		return
+	}
+
+	// No-op when already in the target state (idempotent).
+	if sp.LifecycleState == targetState {
+		c.JSON(http.StatusConflict, gin.H{
+			"code":    "already_in_state",
+			"message": fmt.Sprintf("space is already in state %q", targetState),
+		})
+		return
+	}
+
+	idemKey := middleware.GetIdempotencyKey(c)
+	if idemKey == "" {
+		idemKey = fmt.Sprintf("lifecycle:%s:%s", spaceID, req.Action)
+	}
+
+	// Create the jobs mirror row.
+	jobID := uuid.New().String()
+	job, jobErr := h.store.CreateJob(ctx, store.CreateJobParams{
+		TaskID:  idemKey,
+		Kind:    queue.KindChangeLifecycle,
+		Queue:   queue.QueueProvision,
+		SpaceID: &spaceID,
+		Payload: map[string]any{"space_id": spaceID, "action": req.Action},
+	})
+	if jobErr == nil {
+		jobID = job.ID
+	}
+
+	// Enqueue the lifecycle job via the queue client.
+	if h.queueClient != nil {
+		_, _ = h.queueClient.Enqueue(
+			queue.KindChangeLifecycle,
+			queue.QueueProvision,
+			queue.ChangeLifecyclePayload{SpaceID: spaceID, Action: req.Action},
+			queue.TaskIDOpt(idemKey),
+		)
+	}
+
+	// Write an audit entry for the requested transition.
+	_ = h.store.InsertAuditEntry(ctx, store.InsertAuditEntryParams{
+		Action:  "space.lifecycle." + req.Action,
+		SpaceID: &spaceID,
+		Detail:  map[string]any{"from": string(sp.LifecycleState), "to": string(targetState), "action": req.Action},
+	})
+
+	respBody := map[string]any{
+		"job": map[string]any{
+			"id":       jobID,
+			"kind":     queue.KindChangeLifecycle,
+			"status":   string(domain.JobStatusPending),
+			"space_id": spaceID,
+		},
+	}
+	locationURL := fmt.Sprintf("/v1/jobs/%s", jobID)
+	c.Header("Location", locationURL)
+	middleware.StoreIdempotencyResponse(ctx, h.store, idemKey, http.StatusAccepted, respBody, &jobID)
+	c.JSON(http.StatusAccepted, respBody)
+}
+
+// ─── SyncWelcome ──────────────────────────────────────────────────────────────
+
+// syncWelcomeRequest is the optional JSON body for POST /channels/{id}/welcome:sync.
+type syncWelcomeRequest struct {
+	Message *string `json:"message"`
+}
+
+// SyncWelcome handles POST /channels/{id}/welcome:sync (FR-15 static, M4 AC-4).
+//
+// Control-plane gated. Enqueues a sync_welcome job that sets the channel topic and
+// idempotently pins a help-desk message (edits the existing pin rather than duplicating).
+// Returns 202.
 func (h *Handlers) SyncWelcome(c *gin.Context) {
-	notImplemented(c)
+	if h.store == nil {
+		notImplemented(c)
+		return
+	}
+
+	p := middleware.GetPrincipal(c)
+	if !authz.RequireControlPlane(p) {
+		forbidden(c)
+		return
+	}
+
+	spaceID := c.Param("id")
+	if spaceID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "validation_error", "message": "id is required"})
+		return
+	}
+
+	var req syncWelcomeRequest
+	// Body is optional; ignore bind errors for empty bodies.
+	_ = c.ShouldBindJSON(&req)
+
+	// fix(SEC-M4-001): validate message length against Discord's 2000-char limit.
+	if req.Message != nil && len(*req.Message) > discordMessageMaxLen {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    "validation_error",
+			"message": fmt.Sprintf("message exceeds Discord's %d-character limit", discordMessageMaxLen),
+		})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	if _, err := h.store.GetSpaceByID(ctx, spaceID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"code": "not_found", "message": "space not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": "failed to load space"})
+		return
+	}
+
+	idemKey := middleware.GetIdempotencyKey(c)
+	if idemKey == "" {
+		idemKey = fmt.Sprintf("welcome:sync:%s", spaceID)
+	}
+
+	welcomeMsg := ""
+	if req.Message != nil {
+		welcomeMsg = *req.Message
+	}
+
+	jobID := uuid.New().String()
+	job, jobErr := h.store.CreateJob(ctx, store.CreateJobParams{
+		TaskID:  idemKey,
+		Kind:    queue.KindSyncWelcome,
+		Queue:   queue.QueueProvision,
+		SpaceID: &spaceID,
+		Payload: map[string]any{"space_id": spaceID, "message": welcomeMsg},
+	})
+	if jobErr == nil {
+		jobID = job.ID
+	}
+
+	if h.queueClient != nil {
+		_, _ = h.queueClient.Enqueue(
+			queue.KindSyncWelcome,
+			queue.QueueProvision,
+			queue.SyncWelcomePayload{SpaceID: spaceID, Message: welcomeMsg},
+			queue.TaskIDOpt(idemKey),
+		)
+	}
+
+	respBody := map[string]any{
+		"job": map[string]any{
+			"id":       jobID,
+			"kind":     queue.KindSyncWelcome,
+			"status":   string(domain.JobStatusPending),
+			"space_id": spaceID,
+		},
+	}
+	locationURL := fmt.Sprintf("/v1/jobs/%s", jobID)
+	c.Header("Location", locationURL)
+	middleware.StoreIdempotencyResponse(ctx, h.store, idemKey, http.StatusAccepted, respBody, &jobID)
+	c.JSON(http.StatusAccepted, respBody)
 }
 
 // ─── Response types ──────────────────────────────────────────────────────────

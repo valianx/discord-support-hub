@@ -77,6 +77,17 @@ func (f *fakeDiscordClient) GetChannelOverwrites(_ context.Context, _ string) ([
 	return nil, nil
 }
 
+// M4 discord.Client methods — not exercised by project_agent_role tests.
+func (f *fakeDiscordClient) ArchiveChannel(_ context.Context, _, _ string) error   { return nil }
+func (f *fakeDiscordClient) UnarchiveChannel(_ context.Context, _, _ string) error { return nil }
+func (f *fakeDiscordClient) SetChannelTopic(_ context.Context, _, _ string) error  { return nil }
+func (f *fakeDiscordClient) PinMessage(_ context.Context, _, _ string) error       { return nil }
+func (f *fakeDiscordClient) EditMessage(_ context.Context, _, _, _ string) error   { return nil }
+func (f *fakeDiscordClient) SendMessage(_ context.Context, _, _ string) (string, error) {
+	return "", nil
+}
+func (f *fakeDiscordClient) SetNickname(_ context.Context, _, _, _ string) error { return nil }
+
 // workerFakeStore implements store.Store for worker tests.
 type workerFakeStore struct {
 	users            map[string]*domain.User
@@ -228,6 +239,20 @@ func (f *workerFakeStore) ListActiveSpaceMembers(_ context.Context, _ string) ([
 }
 func (f *workerFakeStore) UpdateDiscordUserID(_ context.Context, _, _ string) error {
 	panic("UpdateDiscordUserID")
+}
+
+// M4 store methods — not exercised by project_agent_role tests; all panic.
+func (f *workerFakeStore) UpdateSpaceLifecycle(_ context.Context, _ store.UpdateSpaceLifecycleParams) (*domain.Space, error) {
+	panic("UpdateSpaceLifecycle")
+}
+func (f *workerFakeStore) UpdateSpaceWelcomeMessageID(_ context.Context, _, _ string) (*domain.Space, error) {
+	panic("UpdateSpaceWelcomeMessageID")
+}
+func (f *workerFakeStore) ListAuditEntries(_ context.Context, _ store.ListAuditEntriesParams) ([]*domain.AuditEntry, error) {
+	panic("ListAuditEntries")
+}
+func (f *workerFakeStore) GetJobBySpaceIDAndKind(_ context.Context, _, _ string) (*domain.Job, error) {
+	return nil, store.ErrNotFound
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

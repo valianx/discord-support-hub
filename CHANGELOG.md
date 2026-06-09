@@ -47,5 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Reconcile teeth** — any Discord overwrite not backed by a `space_members` row is revoked (Postgres wins, NFR-5).
   - **Multi-tenant isolation test suite** (`test/integration/`) wired as a merge gate (NFR-5).
   - Hardening closed: `secrets.Decrypt` nonce-length guard, `RequireAgentRoleID()` at boot, Unicode control-char rejection in channel names.
+- **M4 — Lifecycle, audit, static help-desk visibility, optional marking** (step 5 of the v1 build):
+  - **Space lifecycle** — `POST /channels/{id}/lifecycle` (open/resolve/archive/reopen); validated transitions (illegal → 409); archive locks/hides the channel **without deleting history**; reopen restores; async `202` + job (FR-7).
+  - **Audit endpoint** — `GET /audit` with filters (merchant/space/action/since), newest-first, cursor pagination, no secrets in output (FR-14).
+  - `GET /channels` list-all reports state, owner, created, last-activity (FR-10).
+  - **Static help-desk presence** — `POST /channels/{id}/welcome:sync` sets the channel topic + an idempotent pinned message (re-sync edits the existing pin); welcome content is mention-neutralized (`AllowedMentions` none) and length-capped (FR-15 static).
+  - **Optional configurable nickname-suffix marking** — off by default, now runtime-enableable; vendor-agnostic (FR-24).
+  - Job-status mirror: `GET /jobs/{id}` reflects the real worker outcome (no longer stale `pending`).
+  - Hardening: agent `display_name` and channel names reject ASCII-control + Unicode format/private-use chars; agent nickname truncates by rune (UTF-8-safe).
 
 [Unreleased]: https://github.com/valianx/discord-support-hub/commits/main

@@ -74,11 +74,3 @@ func IsFailure(err error) bool {
 func SkipRetryError(cause error) error {
 	return fmt.Errorf("%w: %w", asynq.SkipRetry, cause)
 }
-
-// min returns the smaller of a and b (generic uint helper; Go 1.21+ has built-in min).
-func min(a, b uint) uint {
-	if a < b {
-		return a
-	}
-	return b
-}
