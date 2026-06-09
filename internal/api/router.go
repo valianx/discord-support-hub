@@ -7,6 +7,7 @@ import (
 	"github.com/valianx/discord-support-hub/internal/api/handlers"
 	"github.com/valianx/discord-support-hub/internal/api/middleware"
 	"github.com/valianx/discord-support-hub/internal/cache"
+	"github.com/valianx/discord-support-hub/internal/oauth"
 	"github.com/valianx/discord-support-hub/internal/observability"
 	"github.com/valianx/discord-support-hub/internal/queue"
 	"github.com/valianx/discord-support-hub/internal/store"
@@ -28,9 +29,16 @@ type RouterConfig struct {
 	// Cache is the Valkey read cache. Handlers use it for space reads.
 	Cache cache.Cache
 
-	// Discord config needed by handlers.
-	DiscordOAuthClientID    string
-	DiscordOAuthRedirectURL string
+	// Discord OAuth2 config needed by handlers.
+	DiscordOAuthClientID     string
+	DiscordOAuthClientSecret string // NFR-6: never hardcoded, from env only
+	DiscordOAuthRedirectURL  string
+
+	// M3: HMAC-signed single-use CSRF state manager for OAuth2 (AC-3).
+	StateManager *oauth.StateManager
+
+	// M3: encrypted OAuth2 token store for guilds.join (AC-2, AC-3).
+	TokenStore *oauth.TokenStore
 
 	// Health check pingable dependencies.
 	PGPinger    observability.Pinger
@@ -51,8 +59,21 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	r.GET("/livez", observability.LivezHandler)
 	r.GET("/readyz", observability.ReadyzHandler(cfg.PGPinger, cfg.RedisPinger))
 
+	// Build the handler struct with all M3 deps wired in.
+	h := handlers.NewHandlers(handlers.Config{
+		Store:                    cfg.Store,
+		QueueClient:              cfg.QueueClient,
+		Cache:                    cfg.Cache,
+		DiscordOAuthClientID:     cfg.DiscordOAuthClientID,
+		DiscordOAuthClientSecret: cfg.DiscordOAuthClientSecret,
+		DiscordOAuthRedirectURL:  cfg.DiscordOAuthRedirectURL,
+		StateManager:             cfg.StateManager,
+		TokenStore:               cfg.TokenStore,
+	})
+
 	// OAuth2 callback — exempt from service API key auth (security: [] in OpenAPI).
-	r.GET("/v1/oauth/discord/callback", handlers.OAuthDiscordCallback)
+	// Registered on h (not as a standalone function) so it has access to stateManager and tokenStore.
+	r.GET("/v1/oauth/discord/callback", h.OAuthDiscordCallback)
 
 	// All other v1 routes require Layer A authentication.
 	// When Store is nil (test mode without real auth), fall back to the no-op stub.
@@ -64,14 +85,6 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	}
 
 	v1 := r.Group("/v1", authMiddleware)
-
-	h := handlers.NewHandlers(handlers.Config{
-		Store:                   cfg.Store,
-		QueueClient:             cfg.QueueClient,
-		Cache:                   cfg.Cache,
-		DiscordOAuthClientID:    cfg.DiscordOAuthClientID,
-		DiscordOAuthRedirectURL: cfg.DiscordOAuthRedirectURL,
-	})
 
 	registerV1Routes(v1, h, cfg.Store)
 

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -42,11 +43,13 @@ type provisionSpaceRequest struct {
 }
 
 // validateProvisionRequest validates the channel name and optional category_id fields
-// beyond what the struct binding tag can express (SEC-M2b-002).
+// beyond what the struct binding tag can express (SEC-M2b-002, SEC-M3-001).
 //
 // Channel name rules (Discord's documented limits):
 //   - 1–100 characters after trimming whitespace.
 //   - No ASCII control characters (0x00–0x1F, 0x7F).
+//   - No Unicode bidi or format control characters (Cf category, e.g. U+202E RLO) — SEC-M3-001.
+//     These could allow name spoofing via direction overrides in UI surfaces.
 //
 // Category ID rules: when provided, must be a non-empty string of digits only
 // (Discord snowflake format).
@@ -61,6 +64,12 @@ func validateProvisionRequest(req *provisionSpaceRequest) (trimmedName string, v
 	for _, ch := range name {
 		if ch < 0x20 || ch == 0x7F {
 			return "", "name contains disallowed control characters"
+		}
+		// SEC-M3-001: reject Unicode bidi/format control characters (U+202E RIGHT-TO-LEFT
+		// OVERRIDE and its family). unicode.Cf covers all format controls; unicode.Co covers
+		// private-use codepoints that have no place in a channel name.
+		if unicode.Is(unicode.Cf, ch) || unicode.Is(unicode.Co, ch) {
+			return "", fmt.Sprintf("name contains disallowed Unicode control character U+%04X", ch)
 		}
 	}
 	if req.CategoryID != nil {
@@ -403,10 +412,11 @@ func (h *Handlers) GetSpace(c *gin.Context) {
 
 // ─── Stub handlers (M3/M4) ───────────────────────────────────────────────────
 
-// ListSpaceMembers handles GET /channels/{id}/members (FR-17, M3).
-// TODO(M3): list space_members rows for the given space.
+// ListSpaceMembers handles GET /channels/{id}/members (FR-17, AC-7).
+// Lists all active space_member rows for the given space.
+// Control-plane gated. Implementation lives in transversal.go (listSpaceMembers).
 func (h *Handlers) ListSpaceMembers(c *gin.Context) {
-	notImplemented(c)
+	h.listSpaceMembers(c)
 }
 
 // ChangeSpaceLifecycle handles POST /channels/{id}/lifecycle (FR-7, M4).

@@ -114,6 +114,23 @@ func (m *provisionMockDiscord) SetChannelPermissionDeny(
 	return nil
 }
 
+// M3 discord.Client methods — not exercised by provision tests.
+func (m *provisionMockDiscord) SetCollaboratorOverwrite(_ context.Context, _, _ string) error {
+	return nil
+}
+func (m *provisionMockDiscord) DeleteCollaboratorOverwrite(_ context.Context, _, _ string) error {
+	return nil
+}
+func (m *provisionMockDiscord) AddGuildMember(_ context.Context, _, _, _ string) error {
+	return nil
+}
+func (m *provisionMockDiscord) RemoveGuildMember(_ context.Context, _, _ string) error {
+	return nil
+}
+func (m *provisionMockDiscord) GetChannelOverwrites(_ context.Context, _ string) ([]*discordgo.PermissionOverwrite, error) {
+	return nil, nil
+}
+
 // ─── Fake store for provision tests ──────────────────────────────────────────
 
 type provisionFakeStore struct {

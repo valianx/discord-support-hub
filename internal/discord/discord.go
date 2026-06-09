@@ -44,6 +44,33 @@ type Client interface {
 	// by calling ChannelPermissionSet with allow=0 deny=VIEW_CHANNEL.
 	// Used by the fail-closed path to re-assert the @everyone deny after a partial failure.
 	SetChannelPermissionDeny(ctx context.Context, channelID, targetID string, targetType discordgo.PermissionOverwriteType) error
+
+	// SetCollaboratorOverwrite applies a per-user permission overwrite on channelID for
+	// discordUserID, granting VIEW_CHANNEL + SEND_MESSAGES (PermissionOverwriteTypeMember).
+	// This is the ONLY access grant for a collaborator — no role, no category access.
+	// Isolation invariant: each collaborator's access is bounded to exactly the spaces
+	// they hold an overwrite on (NFR-5, §6.2).
+	SetCollaboratorOverwrite(ctx context.Context, channelID, discordUserID string) error
+
+	// DeleteCollaboratorOverwrite removes the per-user permission overwrite for discordUserID
+	// on channelID (PermissionOverwriteTypeMember). Used by both the channel-scope expulsion
+	// path and the reconciler when revoking an unbacked overwrite (§6.3, §4.2).
+	DeleteCollaboratorOverwrite(ctx context.Context, channelID, discordUserID string) error
+
+	// AddGuildMember adds a user to the guild using their guilds.join OAuth2 access token
+	// (GuildMemberAdd). The accessToken is the per-user guilds.join token stored encrypted
+	// in oauth_tokens (§6.2, §7). No roles are applied at join; collaborator access is
+	// granted via SetCollaboratorOverwrite separately.
+	// Returns nil (no error) when the user is already a guild member.
+	AddGuildMember(ctx context.Context, guildID, discordUserID, accessToken string) error
+
+	// RemoveGuildMember removes a user from the guild entirely (GuildMemberRemove).
+	// Used for server-scope expulsion (§6.3).
+	RemoveGuildMember(ctx context.Context, guildID, discordUserID string) error
+
+	// GetChannelOverwrites returns the list of permission overwrites on channelID.
+	// Used by the reconciler to detect unbacked overwrites (§4.2).
+	GetChannelOverwrites(ctx context.Context, channelID string) ([]*discordgo.PermissionOverwrite, error)
 }
 
 // Session is the discordgo-backed implementation of Client.
@@ -153,6 +180,67 @@ func (s *Session) ApplyCategoryAgentAllow(_ context.Context, categoryID, agentRo
 		return fmt.Errorf("discord: apply category agent allow on %s: %w", categoryID, err)
 	}
 	return nil
+}
+
+// SetCollaboratorOverwrite applies a per-user permission overwrite granting
+// VIEW_CHANNEL + SEND_MESSAGES to discordUserID on channelID (PermissionOverwriteTypeMember).
+// This is the only access grant for a collaborator — no role is assigned (NFR-5, §6.2).
+func (s *Session) SetCollaboratorOverwrite(_ context.Context, channelID, discordUserID string) error {
+	allow := int64(discordgo.PermissionViewChannel | discordgo.PermissionSendMessages)
+	if err := s.session.ChannelPermissionSet(
+		channelID,
+		discordUserID,
+		discordgo.PermissionOverwriteTypeMember,
+		allow,
+		0, // deny: none
+	); err != nil {
+		return fmt.Errorf("discord: set collaborator overwrite on channel %s for user %s: %w",
+			channelID, discordUserID, err)
+	}
+	return nil
+}
+
+// DeleteCollaboratorOverwrite removes the per-user overwrite for discordUserID on channelID.
+// Used for channel-scope expulsion and reconciler revocation of unbacked overwrites (§6.3, §4.2).
+func (s *Session) DeleteCollaboratorOverwrite(_ context.Context, channelID, discordUserID string) error {
+	if err := s.session.ChannelPermissionDelete(channelID, discordUserID); err != nil {
+		return fmt.Errorf("discord: delete collaborator overwrite on channel %s for user %s: %w",
+			channelID, discordUserID, err)
+	}
+	return nil
+}
+
+// AddGuildMember adds a user to the guild via OAuth2 guilds.join.
+// accessToken is the per-user OAuth2 access token stored encrypted in oauth_tokens.
+// Returns nil when the user is already a guild member (idempotent).
+func (s *Session) AddGuildMember(_ context.Context, guildID, discordUserID, accessToken string) error {
+	params := &discordgo.GuildMemberAddParams{
+		AccessToken: accessToken,
+	}
+	if err := s.session.GuildMemberAdd(guildID, discordUserID, params); err != nil {
+		// Discord returns 204 No Content when the member is already in the guild;
+		// discordgo does not surface this as an error — so any error here is real.
+		return fmt.Errorf("discord: add guild member %s: %w", discordUserID, err)
+	}
+	return nil
+}
+
+// RemoveGuildMember removes a user from the guild (server-scope expulsion, §6.3).
+func (s *Session) RemoveGuildMember(_ context.Context, guildID, discordUserID string) error {
+	if err := s.session.GuildMemberDelete(guildID, discordUserID); err != nil {
+		return fmt.Errorf("discord: remove guild member %s: %w", discordUserID, err)
+	}
+	return nil
+}
+
+// GetChannelOverwrites returns the permission overwrites on a channel.
+// Used by the reconciler to detect any overwrites not backed by Postgres (§4.2).
+func (s *Session) GetChannelOverwrites(_ context.Context, channelID string) ([]*discordgo.PermissionOverwrite, error) {
+	ch, err := s.session.Channel(channelID)
+	if err != nil {
+		return nil, fmt.Errorf("discord: get channel %s: %w", channelID, err)
+	}
+	return ch.PermissionOverwrites, nil
 }
 
 // SetChannelPermissionDeny sets a deny-VIEW_CHANNEL overwrite on channelID for targetID.

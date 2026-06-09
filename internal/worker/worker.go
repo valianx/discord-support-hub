@@ -14,8 +14,10 @@ import (
 	"github.com/valianx/discord-support-hub/internal/cache"
 	"github.com/valianx/discord-support-hub/internal/discord"
 	"github.com/valianx/discord-support-hub/internal/lock"
+	"github.com/valianx/discord-support-hub/internal/oauth"
 	"github.com/valianx/discord-support-hub/internal/queue"
 	"github.com/valianx/discord-support-hub/internal/ratelimit"
+	"github.com/valianx/discord-support-hub/internal/reconcile"
 	"github.com/valianx/discord-support-hub/internal/store"
 )
 
@@ -44,6 +46,12 @@ type Config struct {
 	Cache             cache.Cache
 	EveryoneRoleID    string // Discord @everyone role id (equals guildID in Discord)
 	DefaultCategoryID string // optional default Discord category for spaces without category_id
+
+	// M3: OAuth2 token store for the invite_collaborator handler (guilds.join).
+	TokenStore *oauth.TokenStore
+
+	// M3: reconcile engine for post-mutation targeted sweeps.
+	ReconcileEngine *reconcile.Engine
 }
 
 // provisionMaxRetry is the MaxRetry for the provision queue. Rate-limit retries are
@@ -127,12 +135,30 @@ func registerHandlers(mux *asynq.ServeMux, cfg Config) {
 	})
 	mux.HandleFunc(queue.KindProvisionSpace, provisionHandler)
 
-	// Remaining kinds are stubs pending M3/M4.
-	mux.HandleFunc(queue.KindInviteCollaborator, stubHandler(queue.KindInviteCollaborator))
-	mux.HandleFunc(queue.KindExpelCollaborator, stubHandler(queue.KindExpelCollaborator))
+	// M3: real invite and expel handlers.
+	inviteHandler := newInviteCollaboratorHandler(inviteCollaboratorConfig{
+		store:      cfg.Store,
+		discord:    cfg.DiscordClient,
+		locker:     cfg.Locker,
+		tokenStore: cfg.TokenStore,
+		guildID:    cfg.DiscordGuildID,
+	})
+	mux.HandleFunc(queue.KindInviteCollaborator, inviteHandler)
+
+	expelHandler := newExpelCollaboratorHandler(expelCollaboratorConfig{
+		store:   cfg.Store,
+		discord: cfg.DiscordClient,
+		locker:  cfg.Locker,
+		guildID: cfg.DiscordGuildID,
+	})
+	mux.HandleFunc(queue.KindExpelCollaborator, expelHandler)
+
+	// M3: real reconcile_space handler.
+	mux.HandleFunc(queue.KindReconcileSpace, newReconcileSpaceHandler(cfg.ReconcileEngine))
+
+	// Remaining kinds are stubs pending M4.
 	mux.HandleFunc(queue.KindChangeLifecycle, stubHandler(queue.KindChangeLifecycle))
 	mux.HandleFunc(queue.KindReconcileGuild, stubHandler(queue.KindReconcileGuild))
-	mux.HandleFunc(queue.KindReconcileSpace, stubHandler(queue.KindReconcileSpace))
 	mux.HandleFunc(queue.KindSyncWelcome, stubHandler(queue.KindSyncWelcome))
 	mux.HandleFunc(queue.KindApplyNicknameSuffix, stubHandler(queue.KindApplyNicknameSuffix))
 }

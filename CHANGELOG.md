@@ -39,5 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Fail-closed provisioning worker** — acquires the per-merchant lock + a rate-limit token, creates the channel **already denied to `@everyone`** (the deny-`VIEW_CHANNEL` overwrite is in the *initial* create — no visible window, NFR-4), applies the category-level allow to the **configured Agent role** (never `@everyone`), persists `discord_channel_id` + `acl_state='applied'`. Any ACL failure → `SkipRetry` + `degraded`/`failed` + audit, never world-readable (FR-3, FR-5).
   - **Isolation guard** — the handler refuses to grant category visibility when the Agent role is unset or equals the guild id (`@everyone`), protecting the multi-tenant isolation invariant (NFR-5).
   - `GET /channels` and `GET /channels/{id}` served from cache (generation-token invalidation), control-plane gated (FR-10).
+- **M3 — Membership, OAuth2 entry & isolation** (step 4 of the v1 build): external collaborators join via OAuth2 and are isolated per space.
+  - Collaborator invite (`POST /channels/{id}/collaborators`) → OAuth2 `guilds.join` add-if-needed + a per-user permission overwrite as the **only** access grant; expel (`DELETE …?scope=channel|server`); both audited. Control-plane gated; collaborators cannot invite (FR-4, FR-19, FR-20).
+  - **OAuth2 "Connect with Discord"** callback (`GET /oauth/discord/callback`): HMAC-signed single-use `state` (CSRF), server-side code exchange, AES-GCM-encrypted token at rest, identity bound to the verified Discord user (one Discord id ↔ one hub user; 409 on conflict), pending invites applied on connect (FR-22, NFR-6).
+  - **No-invites lockdown** — `CREATE_INSTANT_INVITE` reserved to the bot (NFR-14).
+  - Directory (`GET /directory`, bidirectional), space members (`GET /channels/{id}/members`), channels-by-collaborator (`GET /collaborators/{userId}/channels`) (FR-17, FR-18, FR-21).
+  - **Reconcile teeth** — any Discord overwrite not backed by a `space_members` row is revoked (Postgres wins, NFR-5).
+  - **Multi-tenant isolation test suite** (`test/integration/`) wired as a merge gate (NFR-5).
+  - Hardening closed: `secrets.Decrypt` nonce-length guard, `RequireAgentRoleID()` at boot, Unicode control-char rejection in channel names.
 
 [Unreleased]: https://github.com/valianx/discord-support-hub/commits/main
