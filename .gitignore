@@ -38,3 +38,12 @@ Thumbs.db
 
 # Agent workspaces
 /workspaces/
+
+# Pipeline/agent report artifacts belong in the Obsidian workspace, never the repo
+/00-state.md
+/00-execution-events.md
+/0?-implementation*.md
+/0?-testing*.md
+/0?-validation*.md
+/0?-security*.md
+/failure-brief.md

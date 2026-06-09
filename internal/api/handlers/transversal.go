@@ -5,13 +5,13 @@ import "github.com/gin-gonic/gin"
 // GetDirectory handles GET /directory (FR-18, M3).
 // Bidirectional search: filter by user_id or space_id or merchant_id.
 // TODO(M3): query space_members joined to spaces and users with cursor pagination.
-func GetDirectory(c *gin.Context) {
+func (h *Handlers) GetDirectory(c *gin.Context) {
 	notImplemented(c)
 }
 
 // GetAudit handles GET /audit (FR-14, M4).
 // TODO(M4): query audit_log with filters; return newest-first with cursor pagination.
-func GetAudit(c *gin.Context) {
+func (h *Handlers) GetAudit(c *gin.Context) {
 	notImplemented(c)
 }
 

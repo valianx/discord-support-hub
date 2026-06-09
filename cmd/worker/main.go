@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -12,6 +13,7 @@ import (
 	"github.com/valianx/discord-support-hub/internal/config"
 	"github.com/valianx/discord-support-hub/internal/discord"
 	"github.com/valianx/discord-support-hub/internal/observability"
+	pgstore "github.com/valianx/discord-support-hub/internal/store/postgres"
 	"github.com/valianx/discord-support-hub/internal/worker"
 )
 
@@ -37,12 +39,25 @@ func main() {
 	}
 	defer discordSession.Close() //nolint:errcheck
 
+	// Postgres pool — required for M1 worker handlers.
+	ctx := context.Background()
+	pg, err := pgstore.New(ctx, cfg.PostgresDSN)
+	if err != nil {
+		slog.Error("startup: postgres connect failed", "error", err)
+		os.Exit(1)
+	}
+	defer pg.Close()
+
 	// Build and start the asynq server.
 	srv := worker.New(worker.Config{
-		RedisAddr:     cfg.ValkeyAddr,
-		RedisPassword: cfg.ValkeyPassword,
-		RedisDB:       cfg.ValkeyDB,
-		Concurrency:   cfg.WorkerConcurrency,
+		RedisAddr:      cfg.ValkeyAddr,
+		RedisPassword:  cfg.ValkeyPassword,
+		RedisDB:        cfg.ValkeyDB,
+		Concurrency:    cfg.WorkerConcurrency,
+		Store:          pg,
+		DiscordClient:  discordSession,
+		DiscordGuildID: cfg.DiscordGuildID,
+		AgentRoleID:    cfg.DiscordAgentRoleID,
 	})
 
 	// Start the worker in a goroutine; it blocks until Shutdown is called.

@@ -1,6 +1,7 @@
 // Package worker registers asynq task handlers for all job kinds.
-// In M0 all handlers are stubs that log receipt and return nil.
-// Real implementations land in M2 (provisioning), M3 (membership), M4 (lifecycle/marking).
+// M0: stub handlers only.
+// M1: project_agent_role handler is real (assigns/removes Agent role via Discord).
+// M2+: provision, membership, reconcile handlers.
 package worker
 
 import (
@@ -9,7 +10,9 @@ import (
 	"log/slog"
 
 	"github.com/hibiken/asynq"
+	"github.com/valianx/discord-support-hub/internal/discord"
 	"github.com/valianx/discord-support-hub/internal/queue"
+	"github.com/valianx/discord-support-hub/internal/store"
 )
 
 // Server wraps the asynq.Server and its ServeMux.
@@ -24,9 +27,15 @@ type Config struct {
 	RedisPassword string
 	RedisDB       int
 	Concurrency   int
+
+	// Runtime dependencies for real handlers (M1+).
+	Store          store.Store
+	DiscordClient  discord.Client
+	DiscordGuildID string
+	AgentRoleID    string
 }
 
-// New creates an asynq.Server with the four-queue topology and stub handlers registered.
+// New creates an asynq.Server with the four-queue topology and handlers registered.
 // Queue priorities match docs/02-architecture.md §3.4.
 func New(cfg Config) *Server {
 	srv := asynq.NewServer(
@@ -48,36 +57,44 @@ func New(cfg Config) *Server {
 		},
 	)
 
-	mux := NewServeMux()
+	mux := newServeMux(cfg)
 
 	return &Server{server: srv, mux: mux}
 }
 
-// NewServeMux builds a ServeMux with all stub handlers registered.
+// NewServeMux builds a ServeMux with handlers registered.
+// Accepts Config so real handlers receive their dependencies.
 // Exposed so tests can reuse the exact same handler wiring without duplication.
-func NewServeMux() *asynq.ServeMux {
+func NewServeMux(cfg Config) *asynq.ServeMux {
+	return newServeMux(cfg)
+}
+
+func newServeMux(cfg Config) *asynq.ServeMux {
 	mux := asynq.NewServeMux()
-	registerHandlers(mux)
+	registerHandlers(mux, cfg)
 	return mux
 }
 
 // Start begins processing tasks. It blocks until the context is cancelled.
-// The asynq.Server handles graceful shutdown internally on Shutdown().
 func (s *Server) Start() error {
 	return s.server.Run(s.mux)
 }
 
-// Shutdown initiates a graceful shutdown, waiting for in-flight tasks to complete.
+// Shutdown initiates a graceful shutdown.
 func (s *Server) Shutdown() {
 	s.server.Shutdown()
 }
 
-// registerHandlers binds every task kind to its stub handler.
-func registerHandlers(mux *asynq.ServeMux) {
+// registerHandlers binds every task kind to its handler.
+func registerHandlers(mux *asynq.ServeMux, cfg Config) {
+	// M1: real project_agent_role handler.
+	roleHandler := newProjectAgentRoleHandler(cfg.Store, cfg.DiscordClient, cfg.DiscordGuildID, cfg.AgentRoleID)
+	mux.HandleFunc(queue.KindProjectAgentRole, roleHandler)
+
+	// Remaining kinds are stubs pending M2/M3/M4.
 	mux.HandleFunc(queue.KindProvisionSpace, stubHandler(queue.KindProvisionSpace))
 	mux.HandleFunc(queue.KindInviteCollaborator, stubHandler(queue.KindInviteCollaborator))
 	mux.HandleFunc(queue.KindExpelCollaborator, stubHandler(queue.KindExpelCollaborator))
-	mux.HandleFunc(queue.KindProjectAgentRole, stubHandler(queue.KindProjectAgentRole))
 	mux.HandleFunc(queue.KindChangeLifecycle, stubHandler(queue.KindChangeLifecycle))
 	mux.HandleFunc(queue.KindReconcileGuild, stubHandler(queue.KindReconcileGuild))
 	mux.HandleFunc(queue.KindReconcileSpace, stubHandler(queue.KindReconcileSpace))
@@ -86,7 +103,6 @@ func registerHandlers(mux *asynq.ServeMux) {
 }
 
 // stubHandler returns an asynq.HandlerFunc that logs receipt and returns nil.
-// Every stub is replaced by a real implementation in later milestones.
 func stubHandler(kind string) asynq.HandlerFunc {
 	return func(ctx context.Context, task *asynq.Task) error {
 		var payload map[string]json.RawMessage
