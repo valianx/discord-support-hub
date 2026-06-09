@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **POC backoffice frontend** (`web/poc/`) — a single-view backoffice simulator (Vite + React + TypeScript + Tailwind + shadcn/ui) that drives the control-plane API directly: provision a space, list spaces, invite/expel collaborators, change lifecycle, and watch async job status. It is a **local operator tool** — the operator supplies their own service API key at runtime (held in `sessionStorage`, never committed/deployed), with a Vite dev-proxy to the hub (no CORS in dev), a `connect-src` CSP, and a validated-key connection indicator. Not part of the `v0.1.0` API release.
+
 ## [0.1.0] — 2026-06-09
 
 ### Added

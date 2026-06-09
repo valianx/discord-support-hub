@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Content-Security-Policy — bounds where this page can connect.
+      connect-src 'self': restricts XHR/fetch/WebSocket to same origin, so a
+      hypothetical XSS cannot exfiltrate the sessionStorage API key to an
+      arbitrary third-party server.
+
+      ws: and wss: are included so the Vite HMR WebSocket keeps working in dev.
+      If the hub runs cross-origin in production, add its origin to connect-src,
+      e.g.:  connect-src 'self' https://hub.example.com
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="
+        default-src 'self';
+        script-src  'self' 'unsafe-inline';
+        style-src   'self' 'unsafe-inline';
+        img-src     'self' data:;
+        font-src    'self';
+        connect-src 'self' ws: wss:;
+        frame-src   'none';
+        object-src  'none';
+      "
+    />
+    <title>poc</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
