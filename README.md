@@ -1,6 +1,4 @@
-# discord-support-hub
-
-> Working name — final name pending (see [docs/00-requirements.md §11](docs/00-requirements.md#11-nombre-del-proyecto-candidatos)).
+# Discord Support Hub
 
 **Open-source, API-driven service that provisions and governs isolated private support spaces on Discord — one per merchant — with real per-channel access control.**
 
