@@ -35,6 +35,10 @@ type Config struct {
 	DiscordOAuthClientSecret string // NFR-6: secret from env only
 	DiscordOAuthRedirectURL  string
 
+	// M3: HMAC secret for single-use CSRF state tokens (AC-3).
+	// Must be at least 32 bytes of entropy encoded as hexadecimal (64 hex chars = 32 bytes).
+	OAuthHMACSecret string // from OAUTH_HMAC_SECRET; optional but required for OAuth2 callback
+
 	// CORS: comma-separated list of allowed origins (never "*" with credentials).
 	CORSAllowedOrigins []string
 
@@ -69,6 +73,7 @@ func Load() (*Config, error) {
 		DiscordOAuthClientID:     getEnv("DISCORD_OAUTH_CLIENT_ID", ""),
 		DiscordOAuthClientSecret: getEnv("DISCORD_OAUTH_CLIENT_SECRET", ""),
 		DiscordOAuthRedirectURL:  getEnv("DISCORD_OAUTH_REDIRECT_URL", ""),
+		OAuthHMACSecret:          getEnv("OAUTH_HMAC_SECRET", ""),
 		EncryptionKey:            getEnv("ENCRYPTION_KEY", ""),
 		AgentNicknameSuffix:      getEnv("AGENT_NICKNAME_SUFFIX", ""),
 		LogLevel:                 getEnv("LOG_LEVEL", "info"),

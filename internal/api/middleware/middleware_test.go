@@ -132,6 +132,38 @@ func (n *noopStore) ListSpaces(_ context.Context, _ store.ListSpacesParams) ([]*
 	panic("ListSpaces not stubbed")
 }
 
+// M3 store methods — not exercised by auth/middleware tests; all panic.
+func (n *noopStore) CreateSpaceMember(_ context.Context, _ store.CreateSpaceMemberParams) (*domain.SpaceMember, error) {
+	panic("CreateSpaceMember not stubbed")
+}
+func (n *noopStore) GetSpaceMemberBySpaceAndUser(_ context.Context, _, _ string) (*domain.SpaceMember, error) {
+	panic("GetSpaceMemberBySpaceAndUser not stubbed")
+}
+func (n *noopStore) SetSpaceMemberOverwriteApplied(_ context.Context, _ string) (*domain.SpaceMember, error) {
+	panic("SetSpaceMemberOverwriteApplied not stubbed")
+}
+func (n *noopStore) RevokeSpaceMember(_ context.Context, _ string) (*domain.SpaceMember, error) {
+	panic("RevokeSpaceMember not stubbed")
+}
+func (n *noopStore) ListSpaceMembers(_ context.Context, _ string) ([]*domain.SpaceMember, error) {
+	panic("ListSpaceMembers not stubbed")
+}
+func (n *noopStore) ListCollaboratorChannels(_ context.Context, _ string) ([]*domain.SpaceMember, error) {
+	panic("ListCollaboratorChannels not stubbed")
+}
+func (n *noopStore) ListDirectory(_ context.Context, _ store.ListDirectoryParams) ([]*store.DirectoryEntry, error) {
+	panic("ListDirectory not stubbed")
+}
+func (n *noopStore) UpdateSpaceReconciledAt(_ context.Context, _ string) error {
+	panic("UpdateSpaceReconciledAt not stubbed")
+}
+func (n *noopStore) ListActiveSpaceMembers(_ context.Context, _ string) ([]*domain.SpaceMember, error) {
+	panic("ListActiveSpaceMembers not stubbed")
+}
+func (n *noopStore) UpdateDiscordUserID(_ context.Context, _, _ string) error {
+	panic("UpdateDiscordUserID not stubbed")
+}
+
 // authFakeStore overrides only the two methods Layer A needs.
 type authFakeStore struct {
 	noopStore

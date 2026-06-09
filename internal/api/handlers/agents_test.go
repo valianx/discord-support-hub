@@ -176,6 +176,38 @@ func (f *agentFakeStore) ListSpaces(_ context.Context, _ store.ListSpacesParams)
 	panic("ListSpaces")
 }
 
+// M3 store methods — not exercised by agent handler tests; all panic.
+func (f *agentFakeStore) CreateSpaceMember(_ context.Context, _ store.CreateSpaceMemberParams) (*domain.SpaceMember, error) {
+	panic("CreateSpaceMember")
+}
+func (f *agentFakeStore) GetSpaceMemberBySpaceAndUser(_ context.Context, _, _ string) (*domain.SpaceMember, error) {
+	panic("GetSpaceMemberBySpaceAndUser")
+}
+func (f *agentFakeStore) SetSpaceMemberOverwriteApplied(_ context.Context, _ string) (*domain.SpaceMember, error) {
+	panic("SetSpaceMemberOverwriteApplied")
+}
+func (f *agentFakeStore) RevokeSpaceMember(_ context.Context, _ string) (*domain.SpaceMember, error) {
+	panic("RevokeSpaceMember")
+}
+func (f *agentFakeStore) ListSpaceMembers(_ context.Context, _ string) ([]*domain.SpaceMember, error) {
+	panic("ListSpaceMembers")
+}
+func (f *agentFakeStore) ListCollaboratorChannels(_ context.Context, _ string) ([]*domain.SpaceMember, error) {
+	panic("ListCollaboratorChannels")
+}
+func (f *agentFakeStore) ListDirectory(_ context.Context, _ store.ListDirectoryParams) ([]*store.DirectoryEntry, error) {
+	panic("ListDirectory")
+}
+func (f *agentFakeStore) UpdateSpaceReconciledAt(_ context.Context, _ string) error {
+	panic("UpdateSpaceReconciledAt")
+}
+func (f *agentFakeStore) ListActiveSpaceMembers(_ context.Context, _ string) ([]*domain.SpaceMember, error) {
+	panic("ListActiveSpaceMembers")
+}
+func (f *agentFakeStore) UpdateDiscordUserID(_ context.Context, _, _ string) error {
+	panic("UpdateDiscordUserID")
+}
+
 // ─── Router helpers ───────────────────────────────────────────────────────────
 
 // buildAgentRouter builds a minimal Gin engine for agent endpoint tests.

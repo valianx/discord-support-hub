@@ -48,6 +48,13 @@ type Store interface {
 	// and the Agent role was projected (or overwrite applied for a collaborator).
 	SetUserProvisionedAt(ctx context.Context, id string) (*domain.User, error)
 
+	// UpdateDiscordUserID links a Discord user id to a hub user.
+	// Returns ErrConflict when another user already holds that discord_user_id
+	// (UNIQUE constraint on users.discord_user_id). Never silently overwrites an
+	// existing link — callers must surface ErrConflict as a user-visible error
+	// (one Discord identity may bind to at most one hub user).
+	UpdateDiscordUserID(ctx context.Context, userID, discordUserID string) error
+
 	// --- API Keys ---
 
 	// CreateAPIKey inserts an api_keys row (stores only the hash, never the raw key).
@@ -152,6 +159,45 @@ type Store interface {
 	// ListSpaces returns spaces ordered by created_at asc with optional filters and
 	// cursor-based pagination. Limit of 0 uses the default page size (50).
 	ListSpaces(ctx context.Context, p ListSpacesParams) ([]*domain.Space, error)
+
+	// --- Space members (collaborators) ---
+
+	// CreateSpaceMember inserts a desired space_member row (collaborator → space mapping).
+	// Returns ErrConflict when the (space_id, user_id) pair already exists and is active.
+	CreateSpaceMember(ctx context.Context, p CreateSpaceMemberParams) (*domain.SpaceMember, error)
+
+	// GetSpaceMemberBySpaceAndUser returns the space_member for the given (space_id, user_id).
+	// Returns ErrNotFound when no row exists.
+	GetSpaceMemberBySpaceAndUser(ctx context.Context, spaceID, userID string) (*domain.SpaceMember, error)
+
+	// SetSpaceMemberOverwriteApplied marks overwrite_applied=true once the Discord
+	// per-user permission overwrite has been projected successfully.
+	SetSpaceMemberOverwriteApplied(ctx context.Context, id string) (*domain.SpaceMember, error)
+
+	// RevokeSpaceMember sets revoked_at on the space_member row (channel-scope expulsion).
+	// The row is kept for audit purposes; the Discord overwrite is revoked by the worker.
+	RevokeSpaceMember(ctx context.Context, id string) (*domain.SpaceMember, error)
+
+	// ListSpaceMembers returns all active (revoked_at IS NULL) space_member rows for a space.
+	ListSpaceMembers(ctx context.Context, spaceID string) ([]*domain.SpaceMember, error)
+
+	// ListCollaboratorChannels returns all active space_member rows for a collaborator
+	// (i.e. all spaces the collaborator has been invited to and not expelled from).
+	ListCollaboratorChannels(ctx context.Context, userID string) ([]*domain.SpaceMember, error)
+
+	// ListDirectory returns space_member rows with optional bidirectional filters
+	// (by user_id, space_id, or merchant_id via the joined spaces table).
+	ListDirectory(ctx context.Context, p ListDirectoryParams) ([]*DirectoryEntry, error)
+
+	// UpdateSpaceReconciledAt stamps the reconciled_at field on a space after
+	// a targeted reconcile pass completes.
+	UpdateSpaceReconciledAt(ctx context.Context, spaceID string) error
+
+	// --- Reconciliation ---
+
+	// ListSpaceOverwrites returns all active space_member rows for a space that have
+	// overwrite_applied=true — these are the Postgres-blessed Discord overwrites.
+	ListActiveSpaceMembers(ctx context.Context, spaceID string) ([]*domain.SpaceMember, error)
 }
 
 // --- Parameter types ---
@@ -244,6 +290,39 @@ type UpdateIdempotencyKeyResponseParams struct {
 	JobID        *string
 }
 
+// CreateSpaceMemberParams carries the fields for inserting a desired space_member row.
+type CreateSpaceMemberParams struct {
+	SpaceID   string
+	UserID    string
+	Role      domain.SpaceMemberRole
+	InvitedBy *string
+}
+
+// ListDirectoryParams carries filters for the bidirectional directory query (FR-18).
+type ListDirectoryParams struct {
+	// UserID filters to spaces the given user is in ("in what spaces is this user").
+	UserID *string
+	// SpaceID filters to users in the given space ("who is in this space").
+	SpaceID *string
+	// MerchantID filters to spaces owned by the given merchant.
+	MerchantID *string
+	// Cursor is the last seen created_at value for page continuation.
+	Cursor *string
+	// Limit is the maximum number of rows to return. 0 = default (50).
+	Limit int
+}
+
+// DirectoryEntry is one row in the bidirectional directory result (FR-18).
+type DirectoryEntry struct {
+	SpaceID         string
+	SpaceName       string
+	MerchantID      string
+	MerchantName    string
+	UserID          string
+	UserDisplayName *string
+	Role            domain.UserType
+}
+
 // InsertAuditEntryParams carries the fields for an audit_log row.
 // Never include raw tokens or secret values in Detail (NFR-6).
 type InsertAuditEntryParams struct {
@@ -253,6 +332,7 @@ type InsertAuditEntryParams struct {
 	MerchantID    *string
 	SpaceID       *string
 	TargetUserID  *string
+	Scope         *domain.ExpulsionScope
 	Detail        map[string]any
 }
 

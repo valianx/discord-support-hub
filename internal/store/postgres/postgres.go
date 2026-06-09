@@ -180,6 +180,27 @@ func (s *Store) SetUserProvisionedAt(ctx context.Context, id string) (*domain.Us
 	return scanUser(row)
 }
 
+// UpdateDiscordUserID links a Discord user id to a hub user (OAuth2 connect flow).
+// Returns store.ErrConflict when another hub user already holds that discord_user_id
+// (users.discord_user_id is UNIQUE — one Discord identity per hub user).
+// Returns store.ErrNotFound when the hub user row does not exist.
+func (s *Store) UpdateDiscordUserID(ctx context.Context, userID, discordUserID string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE users SET discord_user_id = $1, updated_at = now()
+		WHERE id = $2`, discordUserID, userID)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
+			return store.ErrConflict
+		}
+		return fmt.Errorf("postgres: update discord_user_id: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
 // scanUser scans a single users row from any pgx scanner (pgx.Row or pgx.Rows).
 func scanUser(row interface {
 	Scan(dest ...any) error
@@ -591,9 +612,9 @@ func (s *Store) InsertAuditEntry(ctx context.Context, p store.InsertAuditEntryPa
 		return err
 	}
 	_, err = s.pool.Exec(ctx, `
-		INSERT INTO audit_log (actor_api_key, actor_user_id, action, merchant_id, space_id, target_user_id, detail)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		p.ActorAPIKeyID, p.ActorUserID, p.Action, p.MerchantID, p.SpaceID, p.TargetUserID, detailJSON,
+		INSERT INTO audit_log (actor_api_key, actor_user_id, action, merchant_id, space_id, target_user_id, scope, detail)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		p.ActorAPIKeyID, p.ActorUserID, p.Action, p.MerchantID, p.SpaceID, p.TargetUserID, p.Scope, detailJSON,
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: insert audit entry: %w", err)
@@ -787,6 +808,193 @@ func scanOutboxRow(row interface{ Scan(dest ...any) error }) (*domain.OutboxRow,
 		}
 	}
 	return &ob, nil
+}
+
+// ─── Space members ────────────────────────────────────────────────────────────
+
+// CreateSpaceMember inserts a desired space_member row.
+// Returns store.ErrConflict on (space_id, user_id) unique violation.
+func (s *Store) CreateSpaceMember(ctx context.Context, p store.CreateSpaceMemberParams) (*domain.SpaceMember, error) {
+	row := s.pool.QueryRow(ctx, `
+		INSERT INTO space_members (space_id, user_id, role, invited_by)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, space_id, user_id, role, overwrite_applied, invited_by, created_at, revoked_at`,
+		p.SpaceID, p.UserID, p.Role, p.InvitedBy,
+	)
+	sm, err := scanSpaceMember(row)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
+			return nil, store.ErrConflict
+		}
+		return nil, err
+	}
+	return sm, nil
+}
+
+// GetSpaceMemberBySpaceAndUser returns the space_member for (space_id, user_id).
+func (s *Store) GetSpaceMemberBySpaceAndUser(ctx context.Context, spaceID, userID string) (*domain.SpaceMember, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, space_id, user_id, role, overwrite_applied, invited_by, created_at, revoked_at
+		FROM space_members WHERE space_id = $1 AND user_id = $2`, spaceID, userID)
+	return scanSpaceMember(row)
+}
+
+// SetSpaceMemberOverwriteApplied marks the Discord overwrite as projected.
+func (s *Store) SetSpaceMemberOverwriteApplied(ctx context.Context, id string) (*domain.SpaceMember, error) {
+	row := s.pool.QueryRow(ctx, `
+		UPDATE space_members SET overwrite_applied = TRUE
+		WHERE id = $1
+		RETURNING id, space_id, user_id, role, overwrite_applied, invited_by, created_at, revoked_at`, id)
+	return scanSpaceMember(row)
+}
+
+// RevokeSpaceMember sets revoked_at on the row (channel-scope expulsion, row kept for audit).
+func (s *Store) RevokeSpaceMember(ctx context.Context, id string) (*domain.SpaceMember, error) {
+	row := s.pool.QueryRow(ctx, `
+		UPDATE space_members SET revoked_at = now()
+		WHERE id = $1
+		RETURNING id, space_id, user_id, role, overwrite_applied, invited_by, created_at, revoked_at`, id)
+	return scanSpaceMember(row)
+}
+
+// ListSpaceMembers returns active (revoked_at IS NULL) space_member rows for a space.
+func (s *Store) ListSpaceMembers(ctx context.Context, spaceID string) ([]*domain.SpaceMember, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, space_id, user_id, role, overwrite_applied, invited_by, created_at, revoked_at
+		FROM space_members
+		WHERE space_id = $1 AND revoked_at IS NULL
+		ORDER BY created_at ASC`, spaceID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list space_members: %w", err)
+	}
+	defer rows.Close()
+	return collectSpaceMembers(rows)
+}
+
+// ListCollaboratorChannels returns active space_member rows for a user.
+func (s *Store) ListCollaboratorChannels(ctx context.Context, userID string) ([]*domain.SpaceMember, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, space_id, user_id, role, overwrite_applied, invited_by, created_at, revoked_at
+		FROM space_members
+		WHERE user_id = $1 AND revoked_at IS NULL
+		ORDER BY created_at ASC`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list collaborator channels: %w", err)
+	}
+	defer rows.Close()
+	return collectSpaceMembers(rows)
+}
+
+// ListActiveSpaceMembers returns space_member rows for a space with overwrite_applied=true.
+// Used by the reconciler to compare the Postgres-blessed set against Discord's overwrites.
+func (s *Store) ListActiveSpaceMembers(ctx context.Context, spaceID string) ([]*domain.SpaceMember, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, space_id, user_id, role, overwrite_applied, invited_by, created_at, revoked_at
+		FROM space_members
+		WHERE space_id = $1 AND revoked_at IS NULL`, spaceID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list active space_members: %w", err)
+	}
+	defer rows.Close()
+	return collectSpaceMembers(rows)
+}
+
+func collectSpaceMembers(rows pgx.Rows) ([]*domain.SpaceMember, error) {
+	var out []*domain.SpaceMember
+	for rows.Next() {
+		sm, err := scanSpaceMember(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sm)
+	}
+	return out, rows.Err()
+}
+
+func scanSpaceMember(row interface{ Scan(dest ...any) error }) (*domain.SpaceMember, error) {
+	var sm domain.SpaceMember
+	err := row.Scan(
+		&sm.ID, &sm.SpaceID, &sm.UserID, &sm.Role,
+		&sm.OverwriteApplied, &sm.InvitedBy, &sm.CreatedAt, &sm.RevokedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: scan space_member: %w", err)
+	}
+	return &sm, nil
+}
+
+// ─── Directory ────────────────────────────────────────────────────────────────
+
+// ListDirectory returns directory entries (space x user x role) with optional filters (FR-18).
+func (s *Store) ListDirectory(ctx context.Context, p store.ListDirectoryParams) ([]*store.DirectoryEntry, error) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+
+	args := make([]any, 0, 5)
+	where := " WHERE sm.revoked_at IS NULL"
+
+	if p.UserID != nil {
+		args = append(args, *p.UserID)
+		where += fmt.Sprintf(" AND sm.user_id = $%d", len(args))
+	}
+	if p.SpaceID != nil {
+		args = append(args, *p.SpaceID)
+		where += fmt.Sprintf(" AND sm.space_id = $%d", len(args))
+	}
+	if p.MerchantID != nil {
+		args = append(args, *p.MerchantID)
+		where += fmt.Sprintf(" AND sp.merchant_id = $%d", len(args))
+	}
+	if p.Cursor != nil {
+		args = append(args, *p.Cursor)
+		where += fmt.Sprintf(" AND sm.created_at > $%d", len(args))
+	}
+
+	args = append(args, limit)
+	query := `
+		SELECT sm.space_id, sp.name, sp.merchant_id, m.name,
+		       sm.user_id, u.display_name, u.type
+		FROM space_members sm
+		JOIN spaces sp ON sp.id = sm.space_id
+		JOIN merchants m ON m.id = sp.merchant_id
+		JOIN users u ON u.id = sm.user_id` +
+		where +
+		fmt.Sprintf(` ORDER BY sm.created_at ASC LIMIT $%d`, len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list directory: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*store.DirectoryEntry
+	for rows.Next() {
+		var e store.DirectoryEntry
+		if err := rows.Scan(
+			&e.SpaceID, &e.SpaceName, &e.MerchantID, &e.MerchantName,
+			&e.UserID, &e.UserDisplayName, &e.Role,
+		); err != nil {
+			return nil, fmt.Errorf("postgres: scan directory entry: %w", err)
+		}
+		out = append(out, &e)
+	}
+	return out, rows.Err()
+}
+
+// UpdateSpaceReconciledAt stamps reconciled_at = now() on a space.
+func (s *Store) UpdateSpaceReconciledAt(ctx context.Context, spaceID string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE spaces SET reconciled_at = now(), updated_at = now() WHERE id = $1`, spaceID)
+	if err != nil {
+		return fmt.Errorf("postgres: update space reconciled_at: %w", err)
+	}
+	return nil
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────

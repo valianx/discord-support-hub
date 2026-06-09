@@ -60,6 +60,23 @@ func (f *fakeDiscordClient) SetChannelPermissionDeny(_ context.Context, _, _ str
 	return nil
 }
 
+// M3 discord.Client methods — not exercised by project_agent_role tests.
+func (f *fakeDiscordClient) SetCollaboratorOverwrite(_ context.Context, _, _ string) error {
+	return nil
+}
+func (f *fakeDiscordClient) DeleteCollaboratorOverwrite(_ context.Context, _, _ string) error {
+	return nil
+}
+func (f *fakeDiscordClient) AddGuildMember(_ context.Context, _, _, _ string) error {
+	return nil
+}
+func (f *fakeDiscordClient) RemoveGuildMember(_ context.Context, _, _ string) error {
+	return nil
+}
+func (f *fakeDiscordClient) GetChannelOverwrites(_ context.Context, _ string) ([]*discordgo.PermissionOverwrite, error) {
+	return nil, nil
+}
+
 // workerFakeStore implements store.Store for worker tests.
 type workerFakeStore struct {
 	users            map[string]*domain.User
@@ -179,6 +196,38 @@ func (f *workerFakeStore) InsertAuditEntry(_ context.Context, _ store.InsertAudi
 }
 func (f *workerFakeStore) ListSpaces(_ context.Context, _ store.ListSpacesParams) ([]*domain.Space, error) {
 	panic("ListSpaces")
+}
+
+// M3 store methods — not exercised by project_agent_role tests; all panic.
+func (f *workerFakeStore) CreateSpaceMember(_ context.Context, _ store.CreateSpaceMemberParams) (*domain.SpaceMember, error) {
+	panic("CreateSpaceMember")
+}
+func (f *workerFakeStore) GetSpaceMemberBySpaceAndUser(_ context.Context, _, _ string) (*domain.SpaceMember, error) {
+	panic("GetSpaceMemberBySpaceAndUser")
+}
+func (f *workerFakeStore) SetSpaceMemberOverwriteApplied(_ context.Context, _ string) (*domain.SpaceMember, error) {
+	panic("SetSpaceMemberOverwriteApplied")
+}
+func (f *workerFakeStore) RevokeSpaceMember(_ context.Context, _ string) (*domain.SpaceMember, error) {
+	panic("RevokeSpaceMember")
+}
+func (f *workerFakeStore) ListSpaceMembers(_ context.Context, _ string) ([]*domain.SpaceMember, error) {
+	panic("ListSpaceMembers")
+}
+func (f *workerFakeStore) ListCollaboratorChannels(_ context.Context, _ string) ([]*domain.SpaceMember, error) {
+	panic("ListCollaboratorChannels")
+}
+func (f *workerFakeStore) ListDirectory(_ context.Context, _ store.ListDirectoryParams) ([]*store.DirectoryEntry, error) {
+	panic("ListDirectory")
+}
+func (f *workerFakeStore) UpdateSpaceReconciledAt(_ context.Context, _ string) error {
+	panic("UpdateSpaceReconciledAt")
+}
+func (f *workerFakeStore) ListActiveSpaceMembers(_ context.Context, _ string) ([]*domain.SpaceMember, error) {
+	panic("ListActiveSpaceMembers")
+}
+func (f *workerFakeStore) UpdateDiscordUserID(_ context.Context, _, _ string) error {
+	panic("UpdateDiscordUserID")
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
