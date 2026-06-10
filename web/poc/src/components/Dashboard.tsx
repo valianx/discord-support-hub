@@ -1,13 +1,14 @@
 import { useState, useEffect, useCallback } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle, XCircle, Loader2, Clock } from 'lucide-react'
+import { CheckCircle, XCircle, Loader2, Clock, Building2 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { Separator } from '@/components/ui/separator'
 import { SettingsDialog } from '@/components/SettingsDialog'
 import { ProvisionSpaceDialog } from '@/components/ProvisionSpaceDialog'
+import { RegisterMerchantDialog } from '@/components/RegisterMerchantDialog'
 import { SpacesTable } from '@/components/SpacesTable'
-import { listSpaces, type Space, type ApiConfig, ApiError } from '@/lib/api'
+import { listSpaces, listMerchants, type Space, type Merchant, type ApiConfig, ApiError } from '@/lib/api'
 import { getApiKey, getBaseUrl, hasApiKey } from '@/lib/settings'
 
 type ConnectionStatus = 'unknown' | 'checking' | 'ok' | 'error'
@@ -21,14 +22,13 @@ export function Dashboard() {
   const [spacesLoading, setSpacesLoading] = useState(false)
   const [spacesLoadError, setSpacesLoadError] = useState(false)
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('unknown')
+  const [merchants, setMerchants] = useState<Merchant[]>([])
+  const [merchantsLoadError, setMerchantsLoadError] = useState(false)
 
   const refreshConfig = useCallback(() => {
     setApiConfig({ baseUrl: getBaseUrl(), apiKey: getApiKey() })
   }, [])
 
-  // Stable callbacks — these accept the config as a parameter so they are
-  // not recreated when apiConfig changes (avoids effect retrigger loops).
-  //
   // Uses an authenticated probe (GET /v1/channels?limit=1) instead of the
   // unauthenticated /readyz so "Connected" means the key actually works.
   const runCheckConnection = useCallback(async (config: ApiConfig) => {
@@ -65,6 +65,22 @@ export function Dashboard() {
     }
   }, [])
 
+  const runLoadMerchants = useCallback(async (config: ApiConfig) => {
+    if (!config.apiKey) return
+    setMerchantsLoadError(false)
+    try {
+      const result = await listMerchants(config, { is_active: true })
+      setMerchants(result.items)
+    } catch (err) {
+      setMerchantsLoadError(true)
+      const message =
+        err instanceof ApiError
+          ? `[${err.code}] ${err.message}`
+          : 'Could not load merchants — check your API key and hub URL.'
+      toast.error('Failed to load merchants', { description: message })
+    }
+  }, [])
+
   // Snapshot values used as effect dependencies — only re-run when key or URL
   // actually change, without holding a stale closure over the full config object.
   const apiKey = apiConfig.apiKey
@@ -74,6 +90,7 @@ export function Dashboard() {
     const config: ApiConfig = { apiKey, baseUrl }
     void runCheckConnection(config) // eslint-disable-line react-hooks/set-state-in-effect
     void runLoadSpaces(config)
+    void runLoadMerchants(config)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiKey, baseUrl])
 
@@ -83,6 +100,14 @@ export function Dashboard() {
 
   function handleRefreshSpaces() {
     void runLoadSpaces(apiConfig)
+  }
+
+  function handleMerchantRegistered(merchant: Merchant) {
+    setMerchants((prev) => {
+      // Avoid duplicates if the list already contains this merchant.
+      const exists = prev.some((m) => m.id === merchant.id)
+      return exists ? prev : [...prev, merchant]
+    })
   }
 
   return (
@@ -127,6 +152,31 @@ export function Dashboard() {
 
         {hasApiKey() && (
           <>
+            {/* Merchants section */}
+            <section>
+              <div className="flex items-center justify-between mb-3">
+                <div>
+                  <h2 className="text-lg font-semibold">Merchants</h2>
+                  <p className="text-sm text-slate-500">
+                    {merchantsLoadError
+                      ? 'Merchant list could not be loaded — see the error notification.'
+                      : merchants.length === 0
+                        ? 'No active merchants yet — register one to get started.'
+                        : `${merchants.length} active merchant${merchants.length === 1 ? '' : 's'} registered.`}
+                  </p>
+                </div>
+                <RegisterMerchantDialog
+                  apiConfig={apiConfig}
+                  onRegistered={handleMerchantRegistered}
+                />
+              </div>
+
+              {merchants.length > 0 && (
+                <MerchantList merchants={merchants} />
+              )}
+              <Separator className="mt-3" />
+            </section>
+
             {/* Provision section */}
             <section>
               <div className="flex items-center justify-between mb-3">
@@ -139,6 +189,7 @@ export function Dashboard() {
                 <ProvisionSpaceDialog
                   apiConfig={apiConfig}
                   onProvisioned={handleRefreshSpaces}
+                  merchants={merchants}
                 />
               </div>
               <Separator />
@@ -158,6 +209,23 @@ export function Dashboard() {
           </>
         )}
       </main>
+    </div>
+  )
+}
+
+function MerchantList({ merchants }: { merchants: Merchant[] }) {
+  return (
+    <div className="flex flex-wrap gap-2 py-2">
+      {merchants.map((m) => (
+        <div
+          key={m.id}
+          className="flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm"
+        >
+          <Building2 className="h-3.5 w-3.5 text-slate-400 shrink-0" />
+          <span className="font-medium text-slate-800">{m.name}</span>
+          <span className="text-slate-400 text-xs">({m.external_ref})</span>
+        </div>
+      ))}
     </div>
   )
 }
