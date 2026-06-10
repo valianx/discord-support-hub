@@ -270,6 +270,19 @@ func getJSON(router *gin.Engine, path string, headers map[string]string) *httpte
 	return w
 }
 
+// putJSON performs a PUT request with a JSON body and returns the recorder.
+func putJSON(router *gin.Engine, path string, body any, headers map[string]string) *httptest.ResponseRecorder {
+	b, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPut, path, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
+}
+
 // ─── AC-1: POST /merchants/{merchantId}/channels ──────────────────────────────
 
 // TestProvisionSpace_Returns202WithLocation verifies that a valid control-plane

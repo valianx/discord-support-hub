@@ -1,12 +1,14 @@
 // provision_space.go implements the KindProvisionSpace worker handler (M2b, §4.4).
 //
-// Fail-closed invariant (NFR-4, §4.4):
+// Fail-closed invariant (NFR-4, §4.4, AC-M6-2):
+//  0. Create merchant role via GuildRoleCreate (idempotent: skip when spaces.merchant_role_id set).
 //  1. Acquire the per-merchant distributed lock (§3.3).
 //  2. Take a global + per-route rate-limit token before every Discord call (§3.1).
 //  3. Call CreateChannelDenied — the channel is born with @everyone deny-VIEW_CHANNEL
-//     so there is NO window in which it is world-readable (AC-2).
-//  4. Apply the category-level Agent-role allow.
-//  5. Persist discord_channel_id + acl_state='applied'.
+//     so there is NO window in which it is world-readable (AC-M6-2).
+//  4. Apply the merchant role allow on the channel (VIEW+SEND, role-based access).
+//  5. Apply the category-level Agent-role allow (agents see all spaces via category).
+//  6. Persist discord_channel_id + merchant_role_id + acl_state='applied'.
 //
 // If ANY ACL step fails, the handler returns SkipRetry (terminal), marks the space
 // acl_state='degraded'/'failed', writes an audit entry, and leaves the channel invisible
@@ -57,6 +59,10 @@ type provisionSpaceConfig struct {
 	everyoneRoleID  string // Discord @everyone role id (equals guildID in Discord)
 	agentRoleID     string // Discord Agent role id — MUST NOT equal guildID (NFR-5)
 	defaultCategory string // default Discord category id when request omits category_id
+
+	// M6: welcome channel config (AC-M6-7). Empty channelName disables ensure.
+	welcomeChannelName    string // default "bienvenida"
+	welcomeChannelMessage string // WELCOME_MESSAGE env var; empty posts nothing
 }
 
 type provisionSpaceHandler struct {
@@ -170,7 +176,14 @@ func (h *provisionSpaceHandler) handle(ctx context.Context, task *asynq.Task) (r
 				"Agent allow cannot be applied (NFR-5)", payload.SpaceID))
 	}
 
-	// --- Step 1: Create channel already denied (fail-closed, §4.4) ---
+	// --- Step 0 (M6): Ensure merchant role exists (AC-M6-1, idempotent) ---
+	merchantRoleID, err := h.ensureMerchantRole(ctx, sp, payload)
+	if err != nil {
+		// Role creation failure is retryable — no Discord channel yet.
+		return fmt.Errorf("provision_space: ensure merchant role: %w", err)
+	}
+
+	// --- Step 1: Create channel already denied (fail-closed, §4.4, AC-M6-2) ---
 	// Rate-limit guard before the Discord call.
 	if err := h.takeTokens(ctx, "POST/channels"); err != nil {
 		return err // *RateLimitError triggers RetryDelayFunc with Retry-After
@@ -192,11 +205,26 @@ func (h *provisionSpaceHandler) handle(ctx context.Context, task *asynq.Task) (r
 	slog.InfoContext(ctx, "provision_space: channel created (born denied to @everyone)",
 		"space_id", payload.SpaceID, "discord_channel_id", channelID)
 
-	// --- Step 2: Apply category-level Agent allow (fail-closed: any error = terminal) ---
+	// --- Step 2 (M6): Apply merchant-role allow on the channel (AC-M6-2) ---
+	// Fail-closed: if this fails the channel stays invisible. Terminal — we do not retry
+	// into a half-open ACL (channel has @everyone deny from creation).
+	if merchantRoleID != "" {
+		if rErr := h.takeTokens(ctx, "PUT/channels/"+channelID+"/permissions/role"); rErr != nil {
+			return rErr
+		}
+		if aclErr := h.cfg.discord.SetRoleChannelAllow(ctx, channelID, merchantRoleID); aclErr != nil {
+			if isDiscord429(aclErr) {
+				return h.handle429(ctx, "PUT/channels/"+channelID+"/permissions/role", aclErr)
+			}
+			return h.failClosed(ctx, payload.SpaceID, payload.MerchantID, channelID, "merchant_role_allow_failed", aclErr)
+		}
+		slog.InfoContext(ctx, "provision_space: merchant role allow applied",
+			"space_id", payload.SpaceID, "role_id", merchantRoleID)
+	}
+
+	// --- Step 3: Apply category-level Agent allow (fail-closed: any error = terminal) ---
 	// The channel already exists at this point. If the Agent allow fails, we leave the
-	// channel invisible (@everyone deny from creation is still in effect). We mark the
-	// space degraded and archive the task so we never retry into a half-open ACL (AC-3).
-	// categoryID is guaranteed non-empty here (checked above).
+	// channel invisible. We mark the space degraded and archive the task (AC-3).
 	// fix(NFR-5): use agentRoleID — NOT guildID — to avoid granting @everyone view access.
 	if rErr := h.takeTokens(ctx, "PUT/channels/"+categoryID+"/permissions"); rErr != nil {
 		// Rate limit on the ACL step — still retryable (channel is still invisible).
@@ -209,7 +237,7 @@ func (h *provisionSpaceHandler) handle(ctx context.Context, task *asynq.Task) (r
 		return h.failClosed(ctx, payload.SpaceID, payload.MerchantID, channelID, "acl_apply_failed", aclErr)
 	}
 
-	// --- Step 3: Persist discord_channel_id + acl_state='applied' ---
+	// --- Step 4: Persist discord_channel_id + acl_state='applied' ---
 	var catPtr *string
 	if categoryID != "" {
 		catPtr = &categoryID
@@ -225,22 +253,87 @@ func (h *provisionSpaceHandler) handle(ctx context.Context, task *asynq.Task) (r
 		return fmt.Errorf("provision_space: persist discord channel: %w", err)
 	}
 
-	// --- Step 4: Advance job to completed, write audit entry, invalidate cache ---
+	// --- Step 5 (M6): Ensure welcome channel #bienvenida (AC-M6-7, non-fatal) ---
+	if h.cfg.welcomeChannelName != "" {
+		_, wErr := h.cfg.discord.EnsureWelcomeChannel(
+			ctx, h.cfg.guildID, categoryID,
+			h.cfg.welcomeChannelName, h.cfg.welcomeChannelMessage,
+		)
+		if wErr != nil {
+			slog.WarnContext(ctx, "provision_space: welcome channel ensure failed (non-fatal)",
+				"space_id", payload.SpaceID, "err", wErr)
+		}
+	}
+
+	// --- Step 6: Advance job to completed, write audit entry, invalidate cache ---
 	h.transitionJob(ctx, payload.SpaceID, domain.JobStatusCompleted, nil)
 
 	_ = h.cfg.store.InsertAuditEntry(ctx, store.InsertAuditEntryParams{
 		Action:     "space.provision",
 		MerchantID: &payload.MerchantID,
 		SpaceID:    &payload.SpaceID,
-		Detail:     map[string]any{"discord_channel_id": channelID, "category_id": categoryID},
+		Detail: map[string]any{
+			"discord_channel_id": channelID,
+			"category_id":        categoryID,
+			"merchant_role_id":   merchantRoleID,
+		},
 	})
 
 	h.invalidateSpaceCache(ctx, payload.SpaceID)
 
 	slog.InfoContext(ctx, "provision_space: completed",
 		"space_id", payload.SpaceID, "discord_channel_id", channelID,
-		"acl_state", domain.ACLStateApplied)
+		"merchant_role_id", merchantRoleID, "acl_state", domain.ACLStateApplied)
 	return nil
+}
+
+// ensureMerchantRole creates the merchant role in Discord if not already stored (AC-M6-1).
+// Idempotent: if spaces.merchant_role_id is already set, returns it without a Discord call.
+// Returns an empty string (no error) when the merchant name is empty (skip role creation).
+func (h *provisionSpaceHandler) ensureMerchantRole(
+	ctx context.Context,
+	sp *domain.Space,
+	payload queue.ProvisionSpacePayload,
+) (string, error) {
+	// Idempotent: already stored from a previous (partial) run.
+	if sp.MerchantRoleID != nil && *sp.MerchantRoleID != "" {
+		return *sp.MerchantRoleID, nil
+	}
+
+	if payload.MerchantID == "" {
+		return "", nil
+	}
+
+	// Use the space name as the role name (unique per merchant).
+	roleName := payload.SpaceName
+	if roleName == "" {
+		roleName = "support-" + payload.MerchantID[:8]
+	}
+
+	if err := h.takeTokens(ctx, "POST/guilds/roles"); err != nil {
+		return "", err
+	}
+
+	roleID, err := h.cfg.discord.CreateMerchantRole(ctx, h.cfg.guildID, roleName)
+	if err != nil {
+		if isDiscord429(err) {
+			return "", h.handle429(ctx, "POST/guilds/roles", err)
+		}
+		return "", fmt.Errorf("GuildRoleCreate: %w", err)
+	}
+
+	// Persist the role id so a retry or reconciler does not create a duplicate.
+	if _, pErr := h.cfg.store.UpdateSpaceMerchantRoleID(ctx, sp.ID, roleID); pErr != nil {
+		// Non-fatal if the role was created but Postgres was not updated.
+		// The next run will find MerchantRoleID nil and try again.
+		// In practice the UNIQUE constraint prevents duplicates at the Postgres level.
+		slog.WarnContext(ctx, "provision_space: could not persist merchant_role_id",
+			"space_id", sp.ID, "role_id", roleID, "err", pErr)
+	}
+
+	slog.InfoContext(ctx, "provision_space: merchant role created",
+		"space_id", sp.ID, "role_id", roleID, "role_name", roleName)
+	return roleID, nil
 }
 
 // takeTokens acquires one global token and one per-route token before a Discord call.

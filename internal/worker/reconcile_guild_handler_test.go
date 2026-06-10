@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/bwmarrin/discordgo"
 	"github.com/hibiken/asynq"
 	"github.com/valianx/discord-support-hub/internal/domain"
 	"github.com/valianx/discord-support-hub/internal/queue"
@@ -36,7 +35,7 @@ func TestReconcileGuildHandler_DispatchesToEngine(t *testing.T) {
 
 	// counting store: tracks ListActiveProvisionedSpaces calls as a proxy for ReconcileGuild.
 	cs := &countingGuildStore{}
-	engine := reconcile.NewEngine(cs, &noopGuildDiscord{})
+	engine := reconcile.NewEngine(cs, &noopGuildDiscord{}, "test-guild-handler")
 
 	mux := worker.NewServeMux(worker.Config{
 		ReconcileEngine: engine,
@@ -175,20 +174,13 @@ func (s *countingGuildStore) InsertAuditEntry(_ context.Context, _ store.InsertA
 
 func (s *countingGuildStore) UpdateSpaceReconciledAt(_ context.Context, _ string) error { return nil }
 
-func (s *countingGuildStore) SetSpaceMemberOverwriteApplied(_ context.Context, _ string) (*domain.SpaceMember, error) {
-	return nil, store.ErrNotFound
-}
 
-// ─── No-op Discord client ─────────────────────────────────────────────────────
+// ─── No-op Discord client (M6 role-based interface) ──────────────────────────
 
 type noopGuildDiscord struct{}
 
-func (d *noopGuildDiscord) GetChannelOverwrites(_ context.Context, _ string) ([]*discordgo.PermissionOverwrite, error) {
+func (d *noopGuildDiscord) GetGuildMembersByRole(_ context.Context, _, _ string) ([]string, error) {
 	return nil, nil
 }
-func (d *noopGuildDiscord) SetCollaboratorOverwrite(_ context.Context, _, _ string) error {
-	return nil
-}
-func (d *noopGuildDiscord) DeleteCollaboratorOverwrite(_ context.Context, _, _ string) error {
-	return nil
-}
+func (d *noopGuildDiscord) AssignMerchantRole(_ context.Context, _, _, _ string) error { return nil }
+func (d *noopGuildDiscord) RemoveMerchantRole(_ context.Context, _, _, _ string) error { return nil }

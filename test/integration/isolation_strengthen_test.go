@@ -1,104 +1,38 @@
-// Package integration_test — M3 isolation strengthening tests (AC-1, AC-6, AC-8).
+// Package integration_test — M6 isolation strengthening tests (AC-1, AC-M6-8).
 //
-// These tests extend the base isolation_test.go with scenarios that make the
-// assertions more explicit and robust:
+// These tests extend the base isolation_test.go with more explicit multi-merchant
+// scenarios:
 //
-//   - AC-1: explicit multi-merchant fixture where a collaborator has overwrites on
-//     merchants A and C but not B — reconciler must leave A and C alone and never
-//     touch B (the "sees A and C, never B" scenario).
-//   - AC-1: a collaborator with zero space_members rows across the entire guild sees
-//     nothing — reconciler makes no apply calls and no revoke calls.
-//   - AC-6: unbacked overwrite is present in Discord AND backed overwrite is simultaneously
-//     missing → reconciler applies exactly two repairs: one revoke + one re-apply.
-//   - AC-8: the collaborator overwrite allow-mask must NOT include PermissionCreateInstantInvite;
-//     this is tested by inspecting the permission bits that SetCollaboratorOverwrite would set,
-//     confirmed by the mock's internal counter (extends the existing structural test with an
-//     explicit permission-bit assertion on a fake that records allow/deny masks).
+//   - AC-1: three-merchant fixture — collabX has roles in Space-A and Space-C but
+//     NOT Space-B; the reconciler must revoke Space-B's role from collabX.
+//   - AC-1: a collaborator with zero space_members rows has all merchant roles revoked.
+//   - AC-M6-8: simultaneous revoke (stale holder) + assign (missing holder) in one pass.
+//   - AC-M6-9 (structural): the reconciler never calls per-user overwrite operations;
+//     it uses only role-level operations (GetGuildMembersByRole, AssignMerchantRole,
+//     RemoveMerchantRole).
 package integration_test
 
 import (
 	"context"
 	"testing"
-	"time"
 
-	"github.com/bwmarrin/discordgo"
 	"github.com/valianx/discord-support-hub/internal/domain"
 	"github.com/valianx/discord-support-hub/internal/reconcile"
 )
 
-// ─── Enhanced Discord fake with permission tracking ───────────────────────────
-
-// maskTrackingDiscord is a Discord fake that also records the permission masks
-// passed to SetCollaboratorOverwrite. Used to verify that no invite permissions
-// are granted (AC-8).
-type maskTrackingDiscord struct {
-	isolationDiscord
-	// appliedMasks records (allow, deny) pairs for each SetCollaboratorOverwrite call.
-	appliedMasks []maskRecord
-}
-
-type maskRecord struct {
-	ChannelID     string
-	DiscordUserID string
-	AllowMask     int64
-	DenyMask      int64
-}
-
-// PermissionCreateInstantInvite is the Discord permission bit for creating invite links.
-// This value matches discordgo.PermissionCreateInstantInvite.
-const permissionCreateInstantInvite = discordgo.PermissionCreateInstantInvite
-
-func newMaskTrackingDiscord() *maskTrackingDiscord {
-	return &maskTrackingDiscord{
-		isolationDiscord: isolationDiscord{
-			channelOverwrites: make(map[string][]*discordgo.PermissionOverwrite),
-		},
-	}
-}
-
-// SetCollaboratorOverwrite is overridden to capture call details.
-// In the real implementation (internal/discord) this calls ChannelPermissionSet with
-// allow = PermissionViewChannel|PermissionSendMessages and deny = 0.
-// The fake records the intent so we can assert the contract.
-func (d *maskTrackingDiscord) SetCollaboratorOverwrite(_ context.Context, channelID, discordUserID string) error {
-	// Record a call with the expected production mask values.
-	// Production code must never set PermissionCreateInstantInvite in the allow mask.
-	// We use 0 for both allow and deny here (the mock does not apply real Discord calls);
-	// the assertion below checks that PermissionCreateInstantInvite is NOT set.
-	d.appliedMasks = append(d.appliedMasks, maskRecord{
-		ChannelID:     channelID,
-		DiscordUserID: discordUserID,
-		// Allow mask: PermissionViewChannel | PermissionSendMessages only.
-		// This matches what internal/discord.SetCollaboratorOverwrite sets in production.
-		AllowMask: discordgo.PermissionViewChannel | discordgo.PermissionSendMessages,
-		DenyMask:  0, // no explicit deny on the collaborator overwrite
-	})
-	d.appliedOverwrites = append(d.appliedOverwrites, applyCall{channelID, discordUserID})
-	d.channelOverwrites[channelID] = append(d.channelOverwrites[channelID],
-		&discordgo.PermissionOverwrite{
-			ID:    discordUserID,
-			Type:  discordgo.PermissionOverwriteTypeMember,
-			Allow: discordgo.PermissionViewChannel | discordgo.PermissionSendMessages,
-			Deny:  0,
-		})
-	return nil
-}
-
-// ─── AC-1: multi-merchant A-and-C-but-not-B fixture ──────────────────────────
+// ─── AC-1: three-merchant A-and-C-but-not-B fixture ─────────────────────────
 
 // TestIsolation_CollaboratorSeesAandC_NotB is the explicit "three-merchant" test.
 //
 // Setup:
-//   - Merchant-A: Space-A, CollabX is invited (space_member row exists, overwrite applied).
-//   - Merchant-B: Space-B, CollabX has NO space_member row, but an overwrite was manually
-//     added to their Discord channel (isolation breach).
-//   - Merchant-C: Space-C, CollabX is invited (space_member row exists, overwrite applied).
+//   - Merchant-A: Space-A, collabX holds the role (correctly backed by space_member).
+//   - Merchant-B: Space-B, collabX holds the role WITHOUT a space_member row (breach).
+//   - Merchant-C: Space-C, collabX holds the role (correctly backed by space_member).
 //
 // After reconciling all three spaces:
-//   - Space-A: 0 revokes, 0 re-applies (all backed and applied).
-//   - Space-B: 1 revoke (the unbacked overwrite).
-//   - Space-C: 0 revokes, 0 re-applies (all backed and applied).
-//   - Total: CollabX has no access to Space-B. CollabX still has access to Space-A and Space-C.
+//   - Space-A: 0 role changes (correctly synced).
+//   - Space-B: 1 revocation (stale role holder).
+//   - Space-C: 0 role changes (correctly synced).
 func TestIsolation_CollaboratorSeesAandC_NotB(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -117,84 +51,80 @@ func TestIsolation_CollaboratorSeesAandC_NotB(t *testing.T) {
 	s := newIsolationStore()
 	d := newIsolationDiscord()
 
-	// Merchant-A: Space-A, CollabX properly invited and overwrite applied.
-	s.addSpace(appliedSpace(spaceA, "merchant-a-3merch", chanA))
+	spA := appliedSpace(spaceA, "merchant-a-3merch", chanA)
+	spB := appliedSpace(spaceB, "merchant-b-3merch", chanB)
+	spC := appliedSpace(spaceC, "merchant-c-3merch", chanC)
+	s.addSpace(spA)
+	s.addSpace(spB)
+	s.addSpace(spC)
+
 	s.addUser(collaboratorUser(collabX, dX))
-	s.addMember(activeSpaceMember("sm-a-3merch", spaceA, collabX, true))
-	d.addOverwrite(chanA, dX) // backed + applied
+	s.addMember(activeSpaceMember("sm-a-3merch", spaceA, collabX))
+	s.addMember(activeSpaceMember("sm-c-3merch", spaceC, collabX))
+	// collabX holds roles in A, B, C; only A and C are backed.
+	d.addRoleHolder(testIsolationGuildID, *spA.MerchantRoleID, dX)
+	d.addRoleHolder(testIsolationGuildID, *spB.MerchantRoleID, dX) // NOT backed — breach
+	d.addRoleHolder(testIsolationGuildID, *spC.MerchantRoleID, dX)
 
-	// Merchant-B: Space-B, CollabX has no space_member row but a manual overwrite (breach).
-	s.addSpace(appliedSpace(spaceB, "merchant-b-3merch", chanB))
-	d.addOverwrite(chanB, dX) // NOT backed — isolation breach
+	engine := reconcile.NewEngine(s, d, testIsolationGuildID)
 
-	// Merchant-C: Space-C, CollabX properly invited and overwrite applied.
-	s.addSpace(appliedSpace(spaceC, "merchant-c-3merch", chanC))
-	s.addMember(activeSpaceMember("sm-c-3merch", spaceC, collabX, true))
-	d.addOverwrite(chanC, dX) // backed + applied
-
-	engine := reconcile.NewEngine(s, d)
-
-	// Reconcile all three spaces.
 	for _, sid := range []string{spaceA, spaceB, spaceC} {
 		if err := engine.ReconcileSpace(ctx, sid); err != nil {
 			t.Fatalf("ReconcileSpace(%s) failed: %v", sid, err)
 		}
 	}
 
-	// Exactly one revoke expected — the unbacked overwrite in Space-B.
-	if len(d.revokedOverwrites) != 1 {
-		t.Fatalf("AC-1 isolation: expected exactly 1 revoke (Space-B), got %d: %v",
-			len(d.revokedOverwrites), d.revokedOverwrites)
+	// Exactly one revocation — the unbacked role in Space-B.
+	if len(d.revokedRoles) != 1 {
+		t.Fatalf("AC-1 isolation: expected exactly 1 revocation (Space-B), got %d", len(d.revokedRoles))
 	}
-	rev := d.revokedOverwrites[0]
-	if rev.ChannelID != chanB {
-		t.Errorf("revoke must target channel %s (Space-B), got %s", chanB, rev.ChannelID)
+	if d.revokedRoles[0].DiscordUserID != dX {
+		t.Errorf("revocation must target collabX (%s), got %s", dX, d.revokedRoles[0].DiscordUserID)
 	}
-	if rev.DiscordUserID != dX {
-		t.Errorf("revoke must target collabX discord ID %s, got %s", dX, rev.DiscordUserID)
+	if d.revokedRoles[0].RoleID != *spB.MerchantRoleID {
+		t.Errorf("revocation must target Space-B's role (%s), got %s", *spB.MerchantRoleID, d.revokedRoles[0].RoleID)
 	}
 
-	// Zero applies expected (both backed overwrites were already applied).
-	if len(d.appliedOverwrites) != 0 {
-		t.Errorf("AC-1 isolation: no re-applies expected, got %d", len(d.appliedOverwrites))
+	// Zero assignments expected (A and C were already in sync).
+	if len(d.assignedRoles) != 0 {
+		t.Errorf("AC-1 isolation: no role assignments expected, got %d", len(d.assignedRoles))
 	}
 
-	// CollabX's overwrite must remain in Space-A and Space-C.
-	owA := d.channelOverwrites[chanA]
-	found := false
-	for _, ow := range owA {
-		if ow.ID == dX {
-			found = true
+	// collabX must still hold Space-A's and Space-C's roles.
+	holdersA := d.roleHolders[testIsolationGuildID+":"+*spA.MerchantRoleID]
+	foundA := false
+	for _, uid := range holdersA {
+		if uid == dX {
+			foundA = true
 		}
 	}
-	if !found {
-		t.Errorf("AC-1 isolation: collabX overwrite must persist in Space-A after reconcile")
+	if !foundA {
+		t.Error("AC-1 isolation: collabX must still hold Space-A's merchant role after reconcile")
 	}
 
-	owC := d.channelOverwrites[chanC]
-	found = false
-	for _, ow := range owC {
-		if ow.ID == dX {
-			found = true
+	holdersC := d.roleHolders[testIsolationGuildID+":"+*spC.MerchantRoleID]
+	foundC := false
+	for _, uid := range holdersC {
+		if uid == dX {
+			foundC = true
 		}
 	}
-	if !found {
-		t.Errorf("AC-1 isolation: collabX overwrite must persist in Space-C after reconcile")
+	if !foundC {
+		t.Error("AC-1 isolation: collabX must still hold Space-C's merchant role after reconcile")
 	}
 
-	// CollabX's overwrite must NOT exist in Space-B after reconcile.
-	for _, ow := range d.channelOverwrites[chanB] {
-		if ow.ID == dX {
-			t.Errorf("AC-1 isolation breach: collabX overwrite still present in Space-B after reconcile")
+	// collabX must NOT hold Space-B's role after reconcile.
+	for _, uid := range d.roleHolders[testIsolationGuildID+":"+*spB.MerchantRoleID] {
+		if uid == dX {
+			t.Error("AC-1 isolation breach: collabX still holds Space-B's merchant role after reconcile")
 		}
 	}
 }
 
-// ─── AC-1: zero space_members — sees nothing ─────────────────────────────────
+// ─── AC-1: zero space_members — all role holders revoked ─────────────────────
 
-// TestIsolation_ZeroSpaceMembers_ReconcilerIsNoop verifies that when a space has
-// zero active space_members rows, the reconciler revokes ALL existing Discord
-// member-type overwrites (none are backed → all are isolation breaches).
+// TestIsolation_ZeroSpaceMembers_ReconcilerRevokesAll verifies that when a space has
+// zero active space_members rows, all Discord role holders are revoked (none are backed).
 func TestIsolation_ZeroSpaceMembers_ReconcilerRevokesAll(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -209,180 +139,150 @@ func TestIsolation_ZeroSpaceMembers_ReconcilerRevokesAll(t *testing.T) {
 	s := newIsolationStore()
 	d := newIsolationDiscord()
 
-	s.addSpace(appliedSpace(spaceID, "merchant-zero", chanID))
-	// No space_members rows at all.
-	d.addOverwrite(chanID, orphan1) // both unbacked
-	d.addOverwrite(chanID, orphan2)
+	sp := appliedSpace(spaceID, "merchant-zero", chanID)
+	s.addSpace(sp)
+	// No space_members rows — both role holders are stale.
+	d.addRoleHolder(testIsolationGuildID, *sp.MerchantRoleID, orphan1)
+	d.addRoleHolder(testIsolationGuildID, *sp.MerchantRoleID, orphan2)
 
-	engine := reconcile.NewEngine(s, d)
+	engine := reconcile.NewEngine(s, d, testIsolationGuildID)
 	if err := engine.ReconcileSpace(ctx, spaceID); err != nil {
 		t.Fatalf("ReconcileSpace failed: %v", err)
 	}
 
-	// Both unbacked overwrites must be revoked.
-	if len(d.revokedOverwrites) != 2 {
-		t.Fatalf("AC-1: 2 unbacked overwrites must be revoked, got %d: %v",
-			len(d.revokedOverwrites), d.revokedOverwrites)
+	// Both stale holders must be revoked.
+	if len(d.revokedRoles) != 2 {
+		t.Fatalf("AC-1: 2 stale role holders must be revoked, got %d", len(d.revokedRoles))
 	}
-	// Zero applies expected.
-	if len(d.appliedOverwrites) != 0 {
-		t.Errorf("zero space_members: no re-applies expected, got %d", len(d.appliedOverwrites))
+	if len(d.assignedRoles) != 0 {
+		t.Errorf("zero space_members: no role assignments expected, got %d", len(d.assignedRoles))
 	}
 }
 
-// ─── AC-6: simultaneous revoke + re-apply ────────────────────────────────────
+// ─── AC-M6-8: simultaneous revoke + assign ───────────────────────────────────
 
-// TestIsolation_SimultaneousRevokeAndReapply verifies that when in one reconcile pass
-// an unbacked overwrite exists AND a backed overwrite is missing, the reconciler
-// applies both repairs: one revoke for the orphan and one re-apply for the missing one.
-func TestIsolation_SimultaneousRevokeAndReapply(t *testing.T) {
+// TestIsolation_SimultaneousRevokeAndAssign verifies that when in one reconcile pass
+// a stale role holder exists AND a backed member is missing the role, the reconciler
+// applies both repairs: one removal + one assignment.
+func TestIsolation_SimultaneousRevokeAndAssign(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
 	const (
-		spaceID  = "space-dual-repair"
-		chanID   = "chan-dual-repair"
-		okUser   = "user-ok-dual"
-		dOKUser  = "discord-ok-dual"
-		badUser  = "discord-orphan-dual"
-		memberID = "sm-ok-dual"
+		spaceID   = "space-dual-repair"
+		chanID    = "chan-dual-repair"
+		okUser    = "user-ok-dual"
+		dOKUser   = "discord-ok-dual"
+		staleUser = "discord-stale-dual"
+		memberID  = "sm-ok-dual"
 	)
 
 	s := newIsolationStore()
 	d := newIsolationDiscord()
 
-	s.addSpace(appliedSpace(spaceID, "merchant-dual", chanID))
+	sp := appliedSpace(spaceID, "merchant-dual", chanID)
+	s.addSpace(sp)
 	s.addUser(collaboratorUser(okUser, dOKUser))
-	s.addMember(activeSpaceMember(memberID, spaceID, okUser, true))
-	// okUser's overwrite is MISSING from Discord (needs re-apply).
-	// badUser has an overwrite but no backing row (needs revoke).
-	d.addOverwrite(chanID, badUser)
+	s.addMember(activeSpaceMember(memberID, spaceID, okUser))
+	// dOKUser does NOT hold the role (needs assignment).
+	// staleUser holds the role WITHOUT a space_member row (needs removal).
+	d.addRoleHolder(testIsolationGuildID, *sp.MerchantRoleID, staleUser)
 
-	engine := reconcile.NewEngine(s, d)
+	engine := reconcile.NewEngine(s, d, testIsolationGuildID)
 	if err := engine.ReconcileSpace(ctx, spaceID); err != nil {
 		t.Fatalf("ReconcileSpace failed: %v", err)
 	}
 
-	// Exactly one revoke (badUser).
-	if len(d.revokedOverwrites) != 1 {
-		t.Fatalf("AC-6: expected 1 revoke, got %d: %v", len(d.revokedOverwrites), d.revokedOverwrites)
+	// Exactly one removal (staleUser).
+	if len(d.revokedRoles) != 1 {
+		t.Fatalf("AC-M6-8: expected 1 role removal, got %d", len(d.revokedRoles))
 	}
-	if d.revokedOverwrites[0].DiscordUserID != badUser {
-		t.Errorf("revoke must target %s, got %s", badUser, d.revokedOverwrites[0].DiscordUserID)
+	if d.revokedRoles[0].DiscordUserID != staleUser {
+		t.Errorf("removal must target %s, got %s", staleUser, d.revokedRoles[0].DiscordUserID)
 	}
 
-	// Exactly one re-apply (okUser whose overwrite was missing).
-	if len(d.appliedOverwrites) != 1 {
-		t.Fatalf("AC-6: expected 1 re-apply, got %d: %v", len(d.appliedOverwrites), d.appliedOverwrites)
+	// Exactly one assignment (dOKUser whose role was missing).
+	if len(d.assignedRoles) != 1 {
+		t.Fatalf("AC-M6-8: expected 1 role assignment, got %d", len(d.assignedRoles))
 	}
-	if d.appliedOverwrites[0].DiscordUserID != dOKUser {
-		t.Errorf("re-apply must target %s, got %s", dOKUser, d.appliedOverwrites[0].DiscordUserID)
+	if d.assignedRoles[0].DiscordUserID != dOKUser {
+		t.Errorf("assignment must target %s, got %s", dOKUser, d.assignedRoles[0].DiscordUserID)
 	}
 }
 
-// ─── AC-8: PermissionCreateInstantInvite absent from allow mask ───────────────
+// ─── AC-M6-9 (structural): role-only operations ──────────────────────────────
 
-// TestIsolation_SetCollaboratorOverwrite_NeverGrantsInstantInvite verifies that the
-// production allow mask for a per-user collaborator overwrite does NOT include
-// PermissionCreateInstantInvite (NFR-14, AC-8).
+// TestIsolation_ReconcilerUsesRoleOps_NoOverwrites verifies that the M6 reconciler
+// never calls per-user channel overwrite operations. All access changes go through
+// role assignment/removal only (AC-M6-9: per-user overwrites removed).
 //
-// This test uses the maskTrackingDiscord fake which records the allow/deny masks
-// that would be passed to ChannelPermissionSet. The production code path
-// (reconcile.Engine → discord.SetCollaboratorOverwrite) must only grant
-// PermissionViewChannel | PermissionSendMessages — never invite permissions.
-func TestIsolation_SetCollaboratorOverwrite_NeverGrantsInstantInvite(t *testing.T) {
+// This is a structural test: we use the standard isolationDiscord fake which only
+// implements the role-based interface. If the reconciler ever tried to call an overwrite
+// method, it would fail to compile — the interface mismatch is the assertion.
+//
+// At runtime we verify that a full reconcile pass (both add and remove paths) touches
+// zero channel-overwrite entries, confirming the role-only model.
+func TestIsolation_ReconcilerUsesRoleOps_NoOverwrites(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
 	const (
-		spaceID  = "space-mask-test"
-		chanID   = "chan-mask-test"
-		userID   = "user-mask-test"
-		dUserID  = "discord-mask-test"
-		memberID = "sm-mask-test"
+		spaceID      = "space-roleonly"
+		chanID       = "chan-roleonly"
+		okUser       = "user-roleonly"
+		dOKUser      = "discord-roleonly-ok"
+		staleHolder  = "discord-roleonly-stale"
+		memberID     = "sm-roleonly"
 	)
 
 	s := newIsolationStore()
-	d := newMaskTrackingDiscord()
+	d := newIsolationDiscord()
 
-	s.addSpace(appliedSpace(spaceID, "merchant-mask", chanID))
-	s.addUser(collaboratorUser(userID, dUserID))
-	s.addMember(activeSpaceMember(memberID, spaceID, userID, true))
-	// No overwrite in Discord — triggers a re-apply so we can inspect the mask.
+	sp := appliedSpace(spaceID, "merchant-roleonly", chanID)
+	s.addSpace(sp)
+	s.addUser(collaboratorUser(okUser, dOKUser))
+	s.addMember(activeSpaceMember(memberID, spaceID, okUser))
+	// staleHolder in Discord but not in Postgres (will be removed).
+	d.addRoleHolder(testIsolationGuildID, *sp.MerchantRoleID, staleHolder)
 
-	engine := reconcile.NewEngine(s, d)
+	// dOKUser NOT in roleHolders (will be assigned).
+
+	engine := reconcile.NewEngine(s, d, testIsolationGuildID)
 	if err := engine.ReconcileSpace(ctx, spaceID); err != nil {
 		t.Fatalf("ReconcileSpace failed: %v", err)
 	}
 
-	if len(d.appliedMasks) == 0 {
-		t.Fatal("AC-8: expected at least one SetCollaboratorOverwrite call to verify the mask")
+	// Both role changes applied.
+	if len(d.revokedRoles) != 1 || len(d.assignedRoles) != 1 {
+		t.Errorf("expected 1 revoke + 1 assign; got revoke=%d assign=%d",
+			len(d.revokedRoles), len(d.assignedRoles))
 	}
 
-	for _, m := range d.appliedMasks {
-		if m.AllowMask&permissionCreateInstantInvite != 0 {
-			t.Errorf(
-				"AC-8/NFR-14 violated: SetCollaboratorOverwrite for channel=%s user=%s"+
-					" includes PermissionCreateInstantInvite (bit 0x%x) in allow mask 0x%x",
-				m.ChannelID, m.DiscordUserID, permissionCreateInstantInvite, m.AllowMask,
-			)
+	// Structural verification: roleHolders is the only state mutated by the reconciler.
+	// The isolationDiscord struct has no overwrite state — this compiles only because
+	// the reconciler uses the role-based interface exclusively.
+	holdersBefore := len(d.roleHolders)
+	if holdersBefore == 0 {
+		t.Error("roleHolders should have entries after role operations")
+	}
+
+	// dOKUser must now hold the role; staleHolder must not.
+	holders := d.roleHolders[testIsolationGuildID+":"+*sp.MerchantRoleID]
+	foundOK := false
+	for _, uid := range holders {
+		if uid == dOKUser {
+			foundOK = true
+		}
+		if uid == staleHolder {
+			t.Error("staleHolder should not hold the role after reconcile")
 		}
 	}
+	if !foundOK {
+		t.Error("dOKUser should hold the role after reconcile")
+	}
 }
 
-// ─── AC-3 / stub assessment: linkDiscordUserID and enqueuePendingInvites ──────
+// ─── compile-time domain assertion ───────────────────────────────────────────
 
-// TestOAuthCallback_StubAssessment_LinkAndEnqueueAreNoops documents the known
-// partial coverage of the OAuth2 callback path due to the two documented stubs.
-//
-// Per the implementation report (M3 Known Limitations):
-//   - linkDiscordUserID is a no-op stub (TODO M3+). The user's discord_user_id is NOT
-//     updated in Postgres after a successful OAuth2 callback. The reconciler's next
-//     sweep will catch un-projected space_member rows and re-apply overwrites.
-//   - enqueuePendingInvites is a no-op stub (TODO M3+). Pending invite_collaborator
-//     jobs are not re-enqueued after account connection.
-//
-// This test is a documented gap note, not an executable assertion. It uses a compile-time
-// type that would fail to build if the stub functions are removed, confirming they still
-// exist and have not been silently promoted to real implementations.
-//
-// Gap classification: AC-2/AC-3 are PARTIALLY met. Token storage and OAuth2 redirect
-// work end-to-end. The discord_user_id link and pending-invite re-trigger do not fire
-// at callback time — they are deferred to the reconcile sweep (Postgres always wins).
-func TestOAuthCallback_StubAssessment_LinkAndEnqueueAreNoops(t *testing.T) {
-	// This test exists to document the gap and to anchor future work.
-	// When linkDiscordUserID and enqueuePendingInvites are promoted from stubs to real
-	// implementations (TODO M3+), this test should be replaced with an assertion that:
-	//   1. After a successful callback, store.GetUserByID returns a user with a non-nil
-	//      discord_user_id matching the Discord user returned by /users/@me.
-	//   2. After account connection, a KindInviteCollaborator job is enqueued for each
-	//      active space_member row that had overwrite_applied=false.
-	//
-	// Current state: both stubs return immediately (linkDiscordUserID returns nil,
-	// enqueuePendingInvites is a void no-op). The token IS stored encrypted (AC-3
-	// token storage is fully met). The user link and job re-enqueue are NOT done at
-	// callback time — this is a documented partial gap in AC-2/AC-3.
-	t.Log("GAP: linkDiscordUserID and enqueuePendingInvites are stubs (TODO M3+).")
-	t.Log("AC-2/AC-3 token storage: FULLY MET.")
-	t.Log("AC-2/AC-3 user-link + pending-invite-trigger at callback time: NOT MET (stubs).")
-	t.Log("Mitigation: reconciler sweep applies overwrites for any un-linked space_member rows.")
-
-	// Sentinel: the stub functions exist in the production code at package-level.
-	// If these were deleted, the handlers package would not compile, and any test
-	// in this file that imports it would fail at build time.
-	// (No runtime assertion needed — this is a documentation / awareness test.)
-}
-
-// ─── helpers ─────────────────────────────────────────────────────────────────
-
-// collaboratorUserWithExpiry creates a collaborator fixture with a known expiry time
-// useful for time-bound reconcile tests.
-func collaboratorUserWithExpiry(userID, discordUserID string) *domain.User {
-	u := collaboratorUser(userID, discordUserID)
-	t := time.Now().Add(24 * time.Hour)
-	u.ProvisionedAt = &t
-	return u
-}
-
-// Compile-time assertion: domain.User.ProvisionedAt field exists.
-var _ = (*domain.User)(nil)
+// ensure domain.SpaceLifecycleActive is a valid lifecycle state (compile-time guard).
+var _ = domain.SpaceLifecycleActive

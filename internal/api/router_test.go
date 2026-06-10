@@ -128,12 +128,19 @@ func TestAgentEndpoints_NoAuth(t *testing.T) {
 }
 
 // TestStubHandlers_TransversalEndpoints verifies transversal routes return 501.
+// M6: /v1/oauth/discord/callback removed (AC-M6-9 — OAuth2 fully removed).
 func TestStubHandlers_TransversalEndpoints(t *testing.T) {
 	r := newTestRouter()
 
 	assertNotImplemented(t, r, http.MethodGet, "/v1/directory")
 	assertNotImplemented(t, r, http.MethodGet, "/v1/audit")
-	assertNotImplemented(t, r, http.MethodGet, "/v1/oauth/discord/callback")
+}
+
+// TestOAuthCallback_NotRegistered_Returns404 verifies that the OAuth2 callback route
+// was removed in M6 (AC-M6-9) and returns 404 (no longer registered).
+func TestOAuthCallback_NotRegistered_Returns404(t *testing.T) {
+	r := newTestRouter()
+	assertStatus(t, r, http.MethodGet, "/v1/oauth/discord/callback", http.StatusNotFound)
 }
 
 // TestStubHandlers_JobEndpoints verifies the jobs polling route returns 501.

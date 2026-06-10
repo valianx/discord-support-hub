@@ -2,7 +2,11 @@
 // The interface enables mocking in tests (NFR-8 pluggable seam).
 // M0: constructor only.
 // M1: role assignment/removal methods for agent projection (GuildMemberRoleAdd/Remove).
-// M2+: channel create, overwrites, member add.
+// M2+: channel create, overwrites.
+// M6: merchant role lifecycle (CreateMerchantRole, SetRoleChannelAllow, AssignMerchantRole,
+//     RemoveMerchantRole, GetGuildMembersByRole, EnsureWelcomeChannel).
+//     OAuth2 guild-join (AddGuildMember) and per-user overwrites (SetCollaboratorOverwrite)
+//     are removed; access is now role-based (AC-M6-2, AC-M6-9).
 package discord
 
 import (
@@ -28,6 +32,38 @@ type Client interface {
 	// Used when an agent is removed from the roster (M1, §6.1).
 	RemoveAgentRole(ctx context.Context, guildID, discordUserID, agentRoleID string) error
 
+	// CreateMerchantRole creates a new guild role named after the merchant and returns
+	// its Discord role id. Idempotency is enforced by the caller: if spaces.merchant_role_id
+	// is already set, CreateMerchantRole is skipped (AC-M6-1).
+	CreateMerchantRole(ctx context.Context, guildID, name string) (roleID string, err error)
+
+	// SetRoleChannelAllow grants VIEW_CHANNEL + SEND_MESSAGES to a role on a channel
+	// via a role-type PermissionOverwriteTypeRole allow. Used after CreateChannelDenied
+	// to open the channel to the merchant role (AC-M6-2, fail-closed invariant preserved).
+	SetRoleChannelAllow(ctx context.Context, channelID, roleID string) error
+
+	// AssignMerchantRole adds a Discord role to a guild member (GuildMemberRoleAdd).
+	// Used by the reconciler to repair a collaborator who is missing the merchant role
+	// but is present in Postgres space_members (AC-M6-8).
+	AssignMerchantRole(ctx context.Context, guildID, discordUserID, roleID string) error
+
+	// RemoveMerchantRole strips a Discord role from a guild member (GuildMemberRoleRemove).
+	// Used by the reconciler to revoke access when a collaborator is no longer in
+	// Postgres space_members (AC-M6-8).
+	RemoveMerchantRole(ctx context.Context, guildID, discordUserID, roleID string) error
+
+	// GetGuildMembersByRole returns the Discord user ids of all guild members currently
+	// holding the given role. Used by the reconciler to build the real-state set (AC-M6-8).
+	// Returns an empty slice (not an error) when no members hold the role.
+	GetGuildMembersByRole(ctx context.Context, guildID, roleID string) ([]string, error)
+
+	// EnsureWelcomeChannel creates or returns the #bienvenida (or configured name) channel
+	// under categoryID with @everyone VIEW_CHANNEL allow. If a channel with the given name
+	// already exists in the category it is returned as-is (idempotent). The message
+	// parameter is posted only on creation; existing channels keep their history.
+	// Returns the channel id (AC-M6-7).
+	EnsureWelcomeChannel(ctx context.Context, guildID, categoryID, channelName, message string) (channelID string, err error)
+
 	// CreateChannelDenied creates a Discord text channel with an @everyone deny-VIEW_CHANNEL
 	// overwrite in the initial PermissionOverwrites so the channel is invisible from the
 	// instant it exists (fail-closed, NFR-4, §4.4).
@@ -45,24 +81,10 @@ type Client interface {
 	// Used by the fail-closed path to re-assert the @everyone deny after a partial failure.
 	SetChannelPermissionDeny(ctx context.Context, channelID, targetID string, targetType discordgo.PermissionOverwriteType) error
 
-	// SetCollaboratorOverwrite applies a per-user permission overwrite on channelID for
-	// discordUserID, granting VIEW_CHANNEL + SEND_MESSAGES (PermissionOverwriteTypeMember).
-	// This is the ONLY access grant for a collaborator — no role, no category access.
-	// Isolation invariant: each collaborator's access is bounded to exactly the spaces
-	// they hold an overwrite on (NFR-5, §6.2).
-	SetCollaboratorOverwrite(ctx context.Context, channelID, discordUserID string) error
-
 	// DeleteCollaboratorOverwrite removes the per-user permission overwrite for discordUserID
-	// on channelID (PermissionOverwriteTypeMember). Used by both the channel-scope expulsion
-	// path and the reconciler when revoking an unbacked overwrite (§6.3, §4.2).
+	// on channelID (PermissionOverwriteTypeMember). Used for server-scope expulsion where the
+	// collaborator has a legacy per-user overwrite, and by channel-scope expulsion (§6.3).
 	DeleteCollaboratorOverwrite(ctx context.Context, channelID, discordUserID string) error
-
-	// AddGuildMember adds a user to the guild using their guilds.join OAuth2 access token
-	// (GuildMemberAdd). The accessToken is the per-user guilds.join token stored encrypted
-	// in oauth_tokens (§6.2, §7). No roles are applied at join; collaborator access is
-	// granted via SetCollaboratorOverwrite separately.
-	// Returns nil (no error) when the user is already a guild member.
-	AddGuildMember(ctx context.Context, guildID, discordUserID, accessToken string) error
 
 	// RemoveGuildMember removes a user from the guild entirely (GuildMemberRemove).
 	// Used for server-scope expulsion (§6.3).
@@ -212,45 +234,143 @@ func (s *Session) ApplyCategoryAgentAllow(_ context.Context, categoryID, agentRo
 	return nil
 }
 
-// SetCollaboratorOverwrite applies a per-user permission overwrite granting
-// VIEW_CHANNEL + SEND_MESSAGES to discordUserID on channelID (PermissionOverwriteTypeMember).
-// This is the only access grant for a collaborator — no role is assigned (NFR-5, §6.2).
-func (s *Session) SetCollaboratorOverwrite(_ context.Context, channelID, discordUserID string) error {
+// CreateMerchantRole creates a new guild role named after the merchant (AC-M6-1).
+// The role has no hoisting, no mentioning, and no colour by default — just a name.
+// Idempotency: the caller checks spaces.merchant_role_id before calling; if it is
+// already set, this method is never invoked a second time.
+func (s *Session) CreateMerchantRole(_ context.Context, guildID, name string) (string, error) {
+	role, err := s.session.GuildRoleCreate(guildID, &discordgo.RoleParams{
+		Name: name,
+	})
+	if err != nil {
+		return "", fmt.Errorf("discord: create merchant role %q in guild %s: %w", name, guildID, err)
+	}
+	return role.ID, nil
+}
+
+// SetRoleChannelAllow grants VIEW_CHANNEL + SEND_MESSAGES to a role on a channel
+// (PermissionOverwriteTypeRole, allow). This opens the channel to merchant-role holders
+// after CreateChannelDenied has made it born-denied (AC-M6-2, fail-closed preserved).
+func (s *Session) SetRoleChannelAllow(_ context.Context, channelID, roleID string) error {
 	allow := int64(discordgo.PermissionViewChannel | discordgo.PermissionSendMessages)
 	if err := s.session.ChannelPermissionSet(
 		channelID,
-		discordUserID,
-		discordgo.PermissionOverwriteTypeMember,
+		roleID,
+		discordgo.PermissionOverwriteTypeRole,
 		allow,
 		0, // deny: none
 	); err != nil {
-		return fmt.Errorf("discord: set collaborator overwrite on channel %s for user %s: %w",
-			channelID, discordUserID, err)
+		return fmt.Errorf("discord: set role channel allow on %s for role %s: %w",
+			channelID, roleID, err)
 	}
 	return nil
 }
 
+// AssignMerchantRole adds the merchant role to a guild member (reconciler repair path, AC-M6-8).
+func (s *Session) AssignMerchantRole(_ context.Context, guildID, discordUserID, roleID string) error {
+	if err := s.session.GuildMemberRoleAdd(guildID, discordUserID, roleID); err != nil {
+		return fmt.Errorf("discord: assign merchant role %s to user %s: %w", roleID, discordUserID, err)
+	}
+	return nil
+}
+
+// RemoveMerchantRole strips the merchant role from a guild member (reconciler revocation, AC-M6-8).
+func (s *Session) RemoveMerchantRole(_ context.Context, guildID, discordUserID, roleID string) error {
+	if err := s.session.GuildMemberRoleRemove(guildID, discordUserID, roleID); err != nil {
+		return fmt.Errorf("discord: remove merchant role %s from user %s: %w", roleID, discordUserID, err)
+	}
+	return nil
+}
+
+// GetGuildMembersByRole returns the Discord user ids of all guild members holding roleID.
+// The Discord API does not provide a role-member index endpoint; we page GuildMembers (up to
+// 1 000 per call) and filter by role. For guilds under ~200 merchants this is acceptable;
+// a dedicated index endpoint can be introduced if scale requires it.
+// Returns an empty slice (not an error) when no members hold the role.
+func (s *Session) GetGuildMembersByRole(_ context.Context, guildID, roleID string) ([]string, error) {
+	const pageSize = 1000
+	var out []string
+	var afterID string
+
+	for {
+		members, err := s.session.GuildMembers(guildID, afterID, pageSize)
+		if err != nil {
+			return nil, fmt.Errorf("discord: get guild members for role %s: %w", roleID, err)
+		}
+		for _, m := range members {
+			for _, r := range m.Roles {
+				if r == roleID {
+					out = append(out, m.User.ID)
+					break
+				}
+			}
+		}
+		if len(members) < pageSize {
+			break // last page
+		}
+		afterID = members[len(members)-1].User.ID
+	}
+	return out, nil
+}
+
+// EnsureWelcomeChannel creates or returns the welcome channel (AC-M6-7).
+// If a text channel with channelName already exists under categoryID it is returned as-is.
+// A new channel is created with @everyone VIEW_CHANNEL allow (visible to all guild members).
+// The welcome message is posted on creation only; existing channels keep their history.
+func (s *Session) EnsureWelcomeChannel(
+	_ context.Context,
+	guildID, categoryID, channelName, message string,
+) (string, error) {
+	// Check if the channel already exists in the category.
+	channels, err := s.session.GuildChannels(guildID)
+	if err != nil {
+		return "", fmt.Errorf("discord: list channels for welcome check: %w", err)
+	}
+	for _, ch := range channels {
+		if ch.ParentID == categoryID && ch.Name == channelName {
+			return ch.ID, nil
+		}
+	}
+
+	// Create the welcome channel with @everyone VIEW_CHANNEL allow so it is visible
+	// to all guild members (the category may have a deny for merchants; the explicit
+	// allow on this channel overrides it per Discord's channel-level precedence).
+	ch, err := s.session.GuildChannelCreateComplex(guildID, discordgo.GuildChannelCreateData{
+		Name:     channelName,
+		Type:     discordgo.ChannelTypeGuildText,
+		ParentID: categoryID,
+		PermissionOverwrites: []*discordgo.PermissionOverwrite{
+			{
+				ID:    guildID, // @everyone role id = guild id in Discord
+				Type:  discordgo.PermissionOverwriteTypeRole,
+				Allow: discordgo.PermissionViewChannel,
+			},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("discord: create welcome channel %q: %w", channelName, err)
+	}
+
+	// Post the welcome message on creation if one is provided.
+	if message != "" {
+		_, err = s.session.ChannelMessageSendComplex(ch.ID, &discordgo.MessageSend{
+			Content:         message,
+			AllowedMentions: &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}},
+		})
+		if err != nil {
+			// Non-fatal: the channel was created; the message send failure is logged.
+			slog.Warn("discord: welcome message send failed (channel created)", "channel_id", ch.ID, "err", err)
+		}
+	}
+	return ch.ID, nil
+}
+
 // DeleteCollaboratorOverwrite removes the per-user overwrite for discordUserID on channelID.
-// Used for channel-scope expulsion and reconciler revocation of unbacked overwrites (§6.3, §4.2).
+// Used for server-scope expulsion and any remaining legacy per-user overwrites (§6.3).
 func (s *Session) DeleteCollaboratorOverwrite(_ context.Context, channelID, discordUserID string) error {
 	if err := s.session.ChannelPermissionDelete(channelID, discordUserID); err != nil {
 		return fmt.Errorf("discord: delete collaborator overwrite on channel %s for user %s: %w",
 			channelID, discordUserID, err)
-	}
-	return nil
-}
-
-// AddGuildMember adds a user to the guild via OAuth2 guilds.join.
-// accessToken is the per-user OAuth2 access token stored encrypted in oauth_tokens.
-// Returns nil when the user is already a guild member (idempotent).
-func (s *Session) AddGuildMember(_ context.Context, guildID, discordUserID, accessToken string) error {
-	params := &discordgo.GuildMemberAddParams{
-		AccessToken: accessToken,
-	}
-	if err := s.session.GuildMemberAdd(guildID, discordUserID, params); err != nil {
-		// Discord returns 204 No Content when the member is already in the guild;
-		// discordgo does not surface this as an error — so any error here is real.
-		return fmt.Errorf("discord: add guild member %s: %w", discordUserID, err)
 	}
 	return nil
 }

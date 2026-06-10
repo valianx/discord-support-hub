@@ -50,7 +50,14 @@ type provisionMockDiscord struct {
 	// SetChannelPermissionDeny
 	setPermDenyCalls []string
 
-	// Inherited stubs (AssignAgentRole etc.)
+	// M6: CreateMerchantRole — tracked for AC-M6-1 idempotency assertions.
+	createMerchantRoleCalls  []createMerchantRoleArgs
+	createMerchantRoleReturn string // returned role id; defaults to "role-provision-stub"
+	createMerchantRoleErr    error
+
+	// M6: SetRoleChannelAllow — tracked for AC-M6-2 assertions.
+	setRoleChannelAllowCalls [][2]string // each call: [channelID, roleID]
+	setRoleChannelAllowErr   error
 }
 
 type createChannelDeniedArgs struct {
@@ -115,13 +122,7 @@ func (m *provisionMockDiscord) SetChannelPermissionDeny(
 }
 
 // M3 discord.Client methods — not exercised by provision tests.
-func (m *provisionMockDiscord) SetCollaboratorOverwrite(_ context.Context, _, _ string) error {
-	return nil
-}
 func (m *provisionMockDiscord) DeleteCollaboratorOverwrite(_ context.Context, _, _ string) error {
-	return nil
-}
-func (m *provisionMockDiscord) AddGuildMember(_ context.Context, _, _, _ string) error {
 	return nil
 }
 func (m *provisionMockDiscord) RemoveGuildMember(_ context.Context, _, _ string) error {
@@ -129,6 +130,50 @@ func (m *provisionMockDiscord) RemoveGuildMember(_ context.Context, _, _ string)
 }
 func (m *provisionMockDiscord) GetChannelOverwrites(_ context.Context, _ string) ([]*discordgo.PermissionOverwrite, error) {
 	return nil, nil
+}
+
+// M6 discord.Client methods — role-based model.
+
+// createMerchantRoleCalls records calls to CreateMerchantRole for AC-M6-1 idempotency tests.
+// Fields are appended here so the test can verify: called once on first run, not called on repeat.
+type createMerchantRoleArgs struct {
+	GuildID   string
+	RoleName  string
+}
+
+// provisionMockDiscord.createMerchantRoleCalls and createMerchantRoleReturn are used by
+// AC-M6-1 tests to assert idempotent role creation.
+// The struct already has these appended below; we embed per-call args for completeness.
+
+func (m *provisionMockDiscord) CreateMerchantRole(_ context.Context, guildID, roleName string) (string, error) {
+	m.createMerchantRoleCalls = append(m.createMerchantRoleCalls, createMerchantRoleArgs{
+		GuildID:  guildID,
+		RoleName: roleName,
+	})
+	if m.createMerchantRoleErr != nil {
+		return "", m.createMerchantRoleErr
+	}
+	if m.createMerchantRoleReturn != "" {
+		return m.createMerchantRoleReturn, nil
+	}
+	return "role-provision-stub", nil
+}
+
+func (m *provisionMockDiscord) SetRoleChannelAllow(_ context.Context, channelID, roleID string) error {
+	m.setRoleChannelAllowCalls = append(m.setRoleChannelAllowCalls, [2]string{channelID, roleID})
+	return m.setRoleChannelAllowErr
+}
+func (m *provisionMockDiscord) AssignMerchantRole(_ context.Context, _, _, _ string) error {
+	return nil
+}
+func (m *provisionMockDiscord) RemoveMerchantRole(_ context.Context, _, _, _ string) error {
+	return nil
+}
+func (m *provisionMockDiscord) GetGuildMembersByRole(_ context.Context, _, _ string) ([]string, error) {
+	return nil, nil
+}
+func (m *provisionMockDiscord) EnsureWelcomeChannel(_ context.Context, _, _, _, _ string) (string, error) {
+	return "", nil
 }
 
 // M4 discord.Client methods — not exercised by provision tests.
@@ -246,6 +291,20 @@ func (f *provisionFakeStore) ListSpaces(_ context.Context, _ store.ListSpacesPar
 
 func (f *provisionFakeStore) UpdateOutboxPayload(_ context.Context, _ string, _ map[string]any) error {
 	return nil
+}
+
+// UpdateSpaceMerchantRoleID persists the merchant role ID on the in-memory space
+// (M6, AC-M6-1). Called by provisionSpaceHandler.ensureMerchantRole.
+func (f *provisionFakeStore) UpdateSpaceMerchantRoleID(
+	_ context.Context,
+	spaceID, roleID string,
+) (*domain.Space, error) {
+	sp, ok := f.spaces[spaceID]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	sp.MerchantRoleID = &roleID
+	return sp, nil
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -684,5 +743,147 @@ func TestProvisionSpace_SuccessInvalidatesCache(t *testing.T) {
 	}
 	if val != nil {
 		t.Error("want spaces:list cache key deleted after provisioning, but it still exists")
+	}
+}
+
+// ─── AC-M6-1: Idempotent merchant role creation ───────────────────────────────
+
+// TestProvisionSpace_EnsureMerchantRole_CalledOnce verifies that on the first provision
+// run (no merchant_role_id set), CreateMerchantRole is called exactly once and the
+// returned role ID is persisted to the store (AC-M6-1 idempotent role create).
+func TestProvisionSpace_EnsureMerchantRole_CalledOnce(t *testing.T) {
+	s := newProvisionFakeStore()
+	sp := pendingSpace("space-m6-1", "merchant-m6-1")
+	// No MerchantRoleID set → first run.
+	sp.MerchantRoleID = nil
+	s.spaces["space-m6-1"] = sp
+
+	d := &provisionMockDiscord{
+		createChannelDeniedID:   "discord-ch-m6-1",
+		createMerchantRoleReturn: "new-merchant-role-001",
+	}
+	task := makeProvisionTask("space-m6-1", "merchant-m6-1", "test-space-m6-1", "cat-m6-1")
+
+	if err := runProvisionHandler(s, d, task); err != nil {
+		t.Fatalf("AC-M6-1: unexpected error on first provision: %v", err)
+	}
+
+	// CreateMerchantRole must have been called exactly once.
+	if len(d.createMerchantRoleCalls) != 1 {
+		t.Errorf("AC-M6-1: want CreateMerchantRole called once, got %d calls",
+			len(d.createMerchantRoleCalls))
+	}
+
+	// merchant_role_id must have been persisted to the store.
+	updatedSpace := s.spaces["space-m6-1"]
+	if updatedSpace.MerchantRoleID == nil {
+		t.Fatal("AC-M6-1: want merchant_role_id persisted to store, got nil")
+	}
+	if *updatedSpace.MerchantRoleID != "new-merchant-role-001" {
+		t.Errorf("AC-M6-1: want merchant_role_id=%q, got %q",
+			"new-merchant-role-001", *updatedSpace.MerchantRoleID)
+	}
+}
+
+// TestProvisionSpace_EnsureMerchantRole_AlreadySet_SkipsCreate verifies that when
+// merchant_role_id is already set on the space, CreateMerchantRole is NOT called —
+// the existing role is reused (AC-M6-1 idempotent skip).
+func TestProvisionSpace_EnsureMerchantRole_AlreadySet_SkipsCreate(t *testing.T) {
+	s := newProvisionFakeStore()
+	existingRoleID := "existing-role-abc"
+	sp := pendingSpace("space-m6-2", "merchant-m6-2")
+	sp.MerchantRoleID = &existingRoleID // already set from a prior run
+	s.spaces["space-m6-2"] = sp
+
+	d := &provisionMockDiscord{
+		createChannelDeniedID: "discord-ch-m6-2",
+	}
+	task := makeProvisionTask("space-m6-2", "merchant-m6-2", "test-space-m6-2", "cat-m6-2")
+
+	if err := runProvisionHandler(s, d, task); err != nil {
+		t.Fatalf("AC-M6-1: unexpected error on idempotent provision: %v", err)
+	}
+
+	// CreateMerchantRole must NOT have been called (role already exists).
+	if len(d.createMerchantRoleCalls) != 0 {
+		t.Errorf("AC-M6-1: want CreateMerchantRole NOT called when merchant_role_id already set, got %d calls",
+			len(d.createMerchantRoleCalls))
+	}
+
+	// merchant_role_id must still be the original value.
+	updatedSpace := s.spaces["space-m6-2"]
+	if updatedSpace.MerchantRoleID == nil || *updatedSpace.MerchantRoleID != existingRoleID {
+		t.Errorf("AC-M6-1: want merchant_role_id=%q unchanged, got %v",
+			existingRoleID, updatedSpace.MerchantRoleID)
+	}
+}
+
+// ─── AC-M6-2: SetRoleChannelAllow called after channel creation ───────────────
+
+// TestProvisionSpace_SetRoleChannelAllow_CalledAfterChannelCreate verifies that
+// SetRoleChannelAllow is called after the channel is created — not before — so the
+// merchant-role allow is applied only on an extant channel (AC-M6-2).
+func TestProvisionSpace_SetRoleChannelAllow_CalledAfterChannelCreate(t *testing.T) {
+	s := newProvisionFakeStore()
+	sp := pendingSpace("space-m6-3", "merchant-m6-3")
+	existingRoleID := "merchant-role-m6-3"
+	sp.MerchantRoleID = &existingRoleID
+	s.spaces["space-m6-3"] = sp
+
+	d := &provisionMockDiscord{
+		createChannelDeniedID: "discord-ch-m6-3",
+	}
+	task := makeProvisionTask("space-m6-3", "merchant-m6-3", "test-space-m6-3", "cat-m6-3")
+
+	if err := runProvisionHandler(s, d, task); err != nil {
+		t.Fatalf("AC-M6-2: unexpected error: %v", err)
+	}
+
+	// CreateChannelDenied must have been called (channel created).
+	if len(d.createChannelDeniedCalls) != 1 {
+		t.Fatalf("AC-M6-2: want CreateChannelDenied called once, got %d", len(d.createChannelDeniedCalls))
+	}
+
+	// SetRoleChannelAllow must have been called after channel creation.
+	if len(d.setRoleChannelAllowCalls) != 1 {
+		t.Errorf("AC-M6-2: want SetRoleChannelAllow called once, got %d calls",
+			len(d.setRoleChannelAllowCalls))
+	}
+
+	// The role ID passed must be the merchant role ID (not the agent role ID).
+	if len(d.setRoleChannelAllowCalls) > 0 {
+		gotRoleID := d.setRoleChannelAllowCalls[0][1]
+		if gotRoleID != existingRoleID {
+			t.Errorf("AC-M6-2: want SetRoleChannelAllow called with merchant role %q, got %q",
+				existingRoleID, gotRoleID)
+		}
+	}
+}
+
+// TestProvisionSpace_NoPerUserOverwrite verifies that the old per-user overwrite methods
+// (removed in M6) are never called during provisioning — only the role-based allow is
+// used (AC-M6-2 no-per-user-overwrite invariant).
+func TestProvisionSpace_NoPerUserOverwrite(t *testing.T) {
+	s := newProvisionFakeStore()
+	sp := pendingSpace("space-m6-4", "merchant-m6-4")
+	existingRoleID := "merchant-role-m6-4"
+	sp.MerchantRoleID = &existingRoleID
+	s.spaces["space-m6-4"] = sp
+
+	d := &provisionMockDiscord{
+		createChannelDeniedID: "discord-ch-m6-4",
+	}
+	task := makeProvisionTask("space-m6-4", "merchant-m6-4", "test-space-m6-4", "cat-m6-4")
+
+	if err := runProvisionHandler(s, d, task); err != nil {
+		t.Fatalf("AC-M6-2: unexpected error: %v", err)
+	}
+
+	// SetChannelPermissionDeny (per-user overwrite method) must NOT have been called.
+	// (It's the old add-user overwrite path, removed in M6.)
+	if len(d.setPermDenyCalls) != 0 {
+		t.Errorf("AC-M6-2: SetChannelPermissionDeny (per-user overwrite) must NOT be called — "+
+			"M6 uses role-based allow only; got %d call(s): %v",
+			len(d.setPermDenyCalls), d.setPermDenyCalls)
 	}
 }

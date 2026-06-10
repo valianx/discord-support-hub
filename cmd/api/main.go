@@ -1,6 +1,7 @@
 // cmd/api is the HTTP API server entrypoint.
 // It loads config, initialises dependencies, builds the Gin router,
 // and serves until SIGINT or SIGTERM triggers a graceful shutdown.
+// M6: OAuth2 wiring removed (AC-M6-9).
 package main
 
 import (
@@ -16,10 +17,8 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/valianx/discord-support-hub/internal/api"
 	"github.com/valianx/discord-support-hub/internal/config"
-	"github.com/valianx/discord-support-hub/internal/oauth"
 	"github.com/valianx/discord-support-hub/internal/observability"
 	"github.com/valianx/discord-support-hub/internal/queue"
-	"github.com/valianx/discord-support-hub/internal/secrets"
 	"github.com/valianx/discord-support-hub/internal/store/postgres"
 	"github.com/valianx/discord-support-hub/internal/version"
 )
@@ -46,13 +45,9 @@ func main() {
 		slog.Error("startup: missing required config", "error", err)
 		os.Exit(1)
 	}
-	// M3: the Agent role must be a real, distinct role — not @everyone (NFR-5).
+	// The Agent role must be a real, distinct role — not @everyone (NFR-5).
 	if err = cfg.RequireAgentRoleID(); err != nil {
 		slog.Error("startup: missing required config", "error", err)
-		os.Exit(1)
-	}
-	if err = cfg.ValidateEncryptionKey(); err != nil {
-		slog.Error("startup: invalid encryption key — fix ENCRYPTION_KEY before starting", "error", err)
 		os.Exit(1)
 	}
 
@@ -66,7 +61,7 @@ func main() {
 	}
 	defer pg.Close()
 
-	// Valkey (Redis-compatible) client — cache + nonce store + coordination.
+	// Valkey (Redis-compatible) client — cache + coordination.
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     cfg.ValkeyAddr,
 		Password: cfg.ValkeyPassword,
@@ -78,45 +73,14 @@ func main() {
 	queueClient := queue.NewClient(cfg.ValkeyAddr, cfg.ValkeyPassword, cfg.ValkeyDB)
 	defer queueClient.Close() //nolint:errcheck
 
-	// M3: AES-256-GCM encrypter for OAuth2 token storage at rest (NFR-6).
-	enc, err := secrets.NewEncrypter(cfg.EncryptionKey, 1)
-	if err != nil {
-		slog.Error("startup: could not initialise encrypter", "error", err)
-		os.Exit(1)
-	}
-
-	// M3: Valkey-backed nonce store for HMAC state token single-use enforcement (AC-3).
-	nonceStore := oauth.NewValkeyNonceStore(rdb)
-
-	// M3: HMAC state manager — requires OAUTH_HMAC_SECRET (32+ bytes hex-encoded).
-	var stateManager *oauth.StateManager
-	if cfg.OAuthHMACSecret != "" {
-		sm, smErr := oauth.NewStateManager(cfg.OAuthHMACSecret, nonceStore)
-		if smErr != nil {
-			slog.Error("startup: could not initialise OAuth2 state manager", "error", smErr)
-			os.Exit(1)
-		}
-		stateManager = sm
-	} else {
-		slog.Warn("startup: OAUTH_HMAC_SECRET not set — OAuth2 callback will return 501 (non-fatal for non-OAuth deployments)")
-	}
-
-	// M3: token store wraps the encrypter and postgres store (NFR-6, AC-3).
-	tokenStore := oauth.NewTokenStore(pg, enc)
-
 	// Build the Gin router with real auth and handler dependencies.
 	router := api.NewRouter(api.RouterConfig{
-		CORSAllowedOrigins:       cfg.CORSAllowedOrigins,
-		Metrics:                  metrics,
-		Store:                    pg,
-		QueueClient:              queueClient,
-		DiscordOAuthClientID:     cfg.DiscordOAuthClientID,
-		DiscordOAuthClientSecret: cfg.DiscordOAuthClientSecret,
-		DiscordOAuthRedirectURL:  cfg.DiscordOAuthRedirectURL,
-		StateManager:             stateManager,
-		TokenStore:               tokenStore,
-		PGPinger:                 pg,
-		RedisPinger:              &redisPinger{rdb},
+		CORSAllowedOrigins: cfg.CORSAllowedOrigins,
+		Metrics:            metrics,
+		Store:              pg,
+		QueueClient:        queueClient,
+		PGPinger:           pg,
+		RedisPinger:        &redisPinger{rdb},
 	})
 
 	srv := &http.Server{

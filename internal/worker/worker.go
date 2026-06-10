@@ -3,6 +3,7 @@
 // M1: project_agent_role handler is real (assigns/removes Agent role via Discord).
 // M2: rate-limit retry config (RetryDelayFunc, IsFailure, SkipRetry) wired.
 // M2b+: provision, membership handlers.
+// M6: notify queue added (KindSendInvite); OAuth2 token store removed (AC-M6-9).
 package worker
 
 import (
@@ -13,8 +14,8 @@ import (
 	"github.com/hibiken/asynq"
 	"github.com/valianx/discord-support-hub/internal/cache"
 	"github.com/valianx/discord-support-hub/internal/discord"
+	"github.com/valianx/discord-support-hub/internal/email"
 	"github.com/valianx/discord-support-hub/internal/lock"
-	"github.com/valianx/discord-support-hub/internal/oauth"
 	"github.com/valianx/discord-support-hub/internal/observability"
 	"github.com/valianx/discord-support-hub/internal/queue"
 	"github.com/valianx/discord-support-hub/internal/ratelimit"
@@ -48,9 +49,6 @@ type Config struct {
 	EveryoneRoleID    string // Discord @everyone role id (equals guildID in Discord)
 	DefaultCategoryID string // optional default Discord category for spaces without category_id
 
-	// M3: OAuth2 token store for the invite_collaborator handler (guilds.join).
-	TokenStore *oauth.TokenStore
-
 	// M3: reconcile engine for post-mutation targeted sweeps.
 	ReconcileEngine *reconcile.Engine
 
@@ -61,13 +59,21 @@ type Config struct {
 	// Pass observability.DefaultMetrics (or the instance returned by InitMetrics) to
 	// activate real metric recording on the provision worker path.
 	Metrics *observability.Metrics
+
+	// M6: SMTP sender for the notify queue (AC-M6-5). Nil = no-op (send logs a warning).
+	// Validation occurs at send time, not boot.
+	EmailSender *email.Sender
+
+	// M6: welcome channel config for the provision worker (AC-M6-7).
+	WelcomeChannelName    string // WELCOME_CHANNEL_NAME env var; default "bienvenida"
+	WelcomeChannelMessage string // WELCOME_MESSAGE env var; empty posts nothing
 }
 
 // provisionMaxRetry is the MaxRetry for the provision queue. Rate-limit retries are
 // expected flow (IsFailure returns false for them), so the budget is generous (AC-8).
 const provisionMaxRetry = 10
 
-// New creates an asynq.Server with the four-queue topology and handlers registered.
+// New creates an asynq.Server with the five-queue topology and handlers registered.
 // Queue priorities match docs/02-architecture.md §3.4.
 // RetryDelayFunc and IsFailure are wired for rate-limit handling (AC-5, AC-8, §3.2).
 func New(cfg Config) *Server {
@@ -84,6 +90,7 @@ func New(cfg Config) *Server {
 				queue.QueueMembership: 3, // high
 				queue.QueueReconcile:  1, // low
 				queue.QueueMarking:    1, // low
+				queue.QueueNotify:     2, // default — invite emails (AC-M6-6)
 			},
 			// RetryDelayFunc returns Retry-After for rate-limit errors; exponential
 			// backoff for all other transient errors (AC-5, §3.2).
@@ -133,27 +140,29 @@ func registerHandlers(mux *asynq.ServeMux, cfg Config) {
 	// M2b: real provision_space handler.
 	// fix(NFR-5): wire AgentRoleID (not guildID) so the category allow targets the Agent role,
 	// and defaultCategory so spaces without category_id still receive the Agent allow.
+	// M6: welcome channel config injected (AC-M6-7).
 	provisionHandler := newProvisionSpaceHandler(provisionSpaceConfig{
-		store:           cfg.Store,
-		discord:         cfg.DiscordClient,
-		limiter:         cfg.Limiter,
-		locker:          cfg.Locker,
-		cache:           cfg.Cache,
-		metrics:         cfg.Metrics, // fix(AC-2): wire metrics so /metrics reflects real outcomes
-		guildID:         cfg.DiscordGuildID,
-		everyoneRoleID:  cfg.EveryoneRoleID,
-		agentRoleID:     cfg.AgentRoleID,
-		defaultCategory: cfg.DefaultCategoryID,
+		store:                 cfg.Store,
+		discord:               cfg.DiscordClient,
+		limiter:               cfg.Limiter,
+		locker:                cfg.Locker,
+		cache:                 cfg.Cache,
+		metrics:               cfg.Metrics, // fix(AC-2): wire metrics so /metrics reflects real outcomes
+		guildID:               cfg.DiscordGuildID,
+		everyoneRoleID:        cfg.EveryoneRoleID,
+		agentRoleID:           cfg.AgentRoleID,
+		defaultCategory:       cfg.DefaultCategoryID,
+		welcomeChannelName:    cfg.WelcomeChannelName,
+		welcomeChannelMessage: cfg.WelcomeChannelMessage,
 	})
 	mux.HandleFunc(queue.KindProvisionSpace, provisionHandler)
 
 	// M3: real invite and expel handlers.
 	inviteHandler := newInviteCollaboratorHandler(inviteCollaboratorConfig{
-		store:      cfg.Store,
-		discord:    cfg.DiscordClient,
-		locker:     cfg.Locker,
-		tokenStore: cfg.TokenStore,
-		guildID:    cfg.DiscordGuildID,
+		store:   cfg.Store,
+		discord: cfg.DiscordClient,
+		locker:  cfg.Locker,
+		guildID: cfg.DiscordGuildID,
 	})
 	mux.HandleFunc(queue.KindInviteCollaborator, inviteHandler)
 
@@ -197,6 +206,13 @@ func registerHandlers(mux *asynq.ServeMux, cfg Config) {
 
 	// M5: real reconcile_guild handler — runs the full sweep across all active spaces.
 	mux.HandleFunc(queue.KindReconcileGuild, newReconcileGuildHandler(cfg.ReconcileEngine, cfg.DiscordGuildID))
+
+	// M6: send_invite handler — emails the merchant invite link to a collaborator (AC-M6-5).
+	sendInviteHandler := newSendInviteHandler(sendInviteConfig{
+		store:  cfg.Store,
+		sender: cfg.EmailSender,
+	})
+	mux.HandleFunc(queue.KindSendInvite, sendInviteHandler)
 }
 
 // stubHandler returns an asynq.HandlerFunc that logs receipt and returns nil.

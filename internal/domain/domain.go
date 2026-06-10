@@ -60,14 +60,18 @@ const (
 
 // Merchant is a customer that owns exactly one support space (1:1, enforced by UNIQUE).
 // Collaborators are NOT owned by a merchant; their tenant associations derive from space_members.
+// The per-merchant invite-with-role link is stored here (operator-created, reusable for all
+// collaborators of this merchant; nil until the operator stores it via PUT /merchants/{id}/invite).
 type Merchant struct {
-	ID          string
-	ExternalRef string
-	Name        string
-	HelpDeskURL *string
-	IsActive    bool
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	ID               string
+	ExternalRef      string
+	Name             string
+	HelpDeskURL      *string
+	InviteLink       *string    // native Discord invite-with-role URL; nil blocks :send-invite
+	InviteLinkSetAt  *time.Time // timestamp of last PUT /merchants/{id}/invite
+	IsActive         bool
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 // User is an identity in the roster — either an internal agent or an external collaborator.
@@ -90,11 +94,14 @@ type User struct {
 
 // Space is the private support channel per merchant (channel mode only in v1, FR-2).
 // The 1:1 merchant↔space constraint is enforced by UNIQUE(merchant_id) on the spaces table.
+// MerchantRoleID is the Discord role auto-created on provision; the channel allow grants
+// it VIEW+SEND. Collaborators acquire it via the merchant's stored invite-with-role link.
 type Space struct {
 	ID                string
 	MerchantID        string
 	DiscordChannelID  *string // nil until the worker provisions the channel
 	DiscordCategoryID *string
+	MerchantRoleID    *string // nil until the provision worker creates the merchant role
 	Name              string
 	LifecycleState    SpaceLifecycleState
 	ACLState          ACLState // fail-closed: only "applied" is accessible
@@ -108,17 +115,18 @@ type Space struct {
 }
 
 // SpaceMember records a collaborator's desired access to one space (FR-3, FR-4).
-// This is desired state; the worker projects it onto Discord as a per-user permission overwrite.
-// The reconciler revokes any Discord overwrite not backed by a row here (NFR-5).
+// Access is role-based: the collaborator acquires the merchant role via the stored
+// invite-with-role link. The reconciler diffs role membership against these rows (NFR-5).
 type SpaceMember struct {
-	ID               string
-	SpaceID          string
-	UserID           string
-	Role             SpaceMemberRole
-	OverwriteApplied bool
-	InvitedBy        *string
-	CreatedAt        time.Time
-	RevokedAt        *time.Time
+	ID              string
+	SpaceID         string
+	UserID          string
+	Role            SpaceMemberRole
+	InviteSentAt    *time.Time // stamped by the notify worker on successful SMTP send
+	RoleObservedAt  *time.Time // optional: set when the reconciler/console observes the role
+	InvitedBy       *string
+	CreatedAt       time.Time
+	RevokedAt       *time.Time
 }
 
 // AuditEntry is an append-only record of provisioning, membership, lifecycle, and expulsion
@@ -151,22 +159,6 @@ type APIKey struct {
 // IsActive reports whether the key has not been revoked.
 func (k *APIKey) IsActive() bool {
 	return k.RevokedAt == nil
-}
-
-// OAuthToken stores an encrypted per-user OAuth2 token (NFR-6, §7).
-// Only ciphertext + nonce + key version are persisted; plaintext never hits the DB.
-type OAuthToken struct {
-	ID                   string
-	UserID               string
-	AccessTokenCipher    []byte
-	AccessTokenNonce     []byte
-	RefreshTokenCipher   []byte // nil if no refresh token
-	RefreshTokenNonce    []byte // nil if no refresh token
-	EncryptionKeyVersion int
-	Scopes               string
-	ExpiresAt            *time.Time
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
 }
 
 // Job mirrors asynq task state in Postgres so callers can poll an authoritative source

@@ -10,8 +10,8 @@ import (
 )
 
 // Store is the primary storage abstraction.
-// M1 adds: merchants create/get, users create/get/list/deactivate, api_keys lifecycle,
-// oauth_tokens upsert/get. M2 adds spaces, jobs, idempotency, and outbox.
+// M1 adds: merchants create/get, users create/get/list/deactivate, api_keys lifecycle.
+// M2 adds spaces, jobs, idempotency, and outbox. M6 removes oauth_tokens (AC-M6-9).
 type Store interface {
 	// Ping checks whether the database is reachable. Used by the readiness probe.
 	Ping(ctx context.Context) error
@@ -31,6 +31,11 @@ type Store interface {
 	// ListMerchants returns merchants ordered by created_at ASC with optional filters and
 	// cursor-based pagination. Limit of 0 uses the default page size (50).
 	ListMerchants(ctx context.Context, p ListMerchantsParams) ([]*domain.Merchant, error)
+
+	// SetMerchantInviteLink stores the native Discord invite-with-role URL for a merchant
+	// and stamps invite_link_set_at = now(). Returns ErrNotFound when the merchant does not exist.
+	// Used by PUT /merchants/{id}/invite (AC-M6-3).
+	SetMerchantInviteLink(ctx context.Context, merchantID, inviteLink string) (*domain.Merchant, error)
 
 	// --- Users ---
 
@@ -85,16 +90,6 @@ type Store interface {
 	// TouchAPIKeyLastUsed updates last_used_at to now for the given key id.
 	TouchAPIKeyLastUsed(ctx context.Context, id string) error
 
-	// --- OAuth Tokens ---
-
-	// UpsertOAuthToken stores or replaces an encrypted OAuth token for a user.
-	// Replaces an existing row on conflict (UNIQUE user_id).
-	UpsertOAuthToken(ctx context.Context, p UpsertOAuthTokenParams) (*domain.OAuthToken, error)
-
-	// GetOAuthTokenByUserID returns the current encrypted token for a user.
-	// Returns ErrNotFound when no token has been stored yet.
-	GetOAuthTokenByUserID(ctx context.Context, userID string) (*domain.OAuthToken, error)
-
 	// --- Spaces ---
 
 	// CreateSpace inserts a new spaces row (desired state before worker provisions it).
@@ -111,6 +106,11 @@ type Store interface {
 	// UpdateSpaceDiscordChannel stamps discord_channel_id and acl_state on the space
 	// after the worker has provisioned the Discord channel.
 	UpdateSpaceDiscordChannel(ctx context.Context, p UpdateSpaceDiscordChannelParams) (*domain.Space, error)
+
+	// UpdateSpaceMerchantRoleID persists the Discord merchant role id after
+	// GuildRoleCreate succeeds. Idempotent: a re-run with the same roleID is a no-op.
+	// Used by the provision worker (AC-M6-1).
+	UpdateSpaceMerchantRoleID(ctx context.Context, spaceID, roleID string) (*domain.Space, error)
 
 	// UpdateSpaceACLState updates the acl_state of a space (e.g. applied → degraded).
 	UpdateSpaceACLState(ctx context.Context, spaceID string, state domain.ACLState) (*domain.Space, error)
@@ -182,9 +182,9 @@ type Store interface {
 	// Returns ErrNotFound when no row exists.
 	GetSpaceMemberBySpaceAndUser(ctx context.Context, spaceID, userID string) (*domain.SpaceMember, error)
 
-	// SetSpaceMemberOverwriteApplied marks overwrite_applied=true once the Discord
-	// per-user permission overwrite has been projected successfully.
-	SetSpaceMemberOverwriteApplied(ctx context.Context, id string) (*domain.SpaceMember, error)
+	// StampSpaceMemberInviteSent marks invite_sent_at = now() on a space_member row
+	// once the notify worker has sent the invite email successfully (AC-M6-5).
+	StampSpaceMemberInviteSent(ctx context.Context, id string) (*domain.SpaceMember, error)
 
 	// RevokeSpaceMember sets revoked_at on the space_member row (channel-scope expulsion).
 	// The row is kept for audit purposes; the Discord overwrite is revoked by the worker.
@@ -264,18 +264,6 @@ type CreateAPIKeyParams struct {
 	Name    string
 	KeyHash []byte
 	Scope   string
-}
-
-// UpsertOAuthTokenParams carries the encrypted token fields for upserting.
-type UpsertOAuthTokenParams struct {
-	UserID               string
-	AccessTokenCipher    []byte
-	AccessTokenNonce     []byte
-	RefreshTokenCipher   []byte // nil if not present
-	RefreshTokenNonce    []byte // nil if not present
-	EncryptionKeyVersion int
-	Scopes               string
-	ExpiresAt            *time.Time
 }
 
 // CreateSpaceParams carries fields for creating a new desired-state space row.

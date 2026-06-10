@@ -1,20 +1,15 @@
-// invite_collaborator.go implements the KindInviteCollaborator worker handler (M3, §6.2).
+// invite_collaborator.go implements the KindInviteCollaborator worker handler (M3/M6).
 //
-// The handler:
-//  1. Decodes InviteCollaboratorPayload.
-//  2. Acquires the per-space distributed lock (§3.3 — prevents concurrent overwrite clobbering).
-//  3. Loads the user and space from Postgres.
-//  4. If the user has a discord_user_id + an oauth token: adds them to the guild via
-//     GuildMemberAdd (guilds.join token, no role applied at join).
-//  5. Applies the per-user permission overwrite (ChannelPermissionSet, PermissionOverwriteTypeMember,
-//     allow VIEW_CHANNEL+SEND_MESSAGES) on the space's channel — the ONLY access grant (NFR-5, §6.2).
-//  6. Marks overwrite_applied=true on the space_member row.
-//  7. Writes an audit entry.
-//  8. Enqueues a post-mutation targeted reconcile for the space (§4.3).
+// M6 pivot: collaborators are granted access via a merchant invite-with-role link, not
+// per-user permission overwrites. This handler's responsibility is now limited to:
+//  1. Decode InviteCollaboratorPayload.
+//  2. Acquire the per-space distributed lock.
+//  3. Verify the space is provisioned and the space_member row exists.
+//  4. Write an audit entry confirming the invite task was processed.
+//  5. Enqueue a post-mutation targeted reconcile for the space.
 //
-// If the user has not yet connected Discord (no discord_user_id), the handler exits
-// without applying the overwrite. The backoffice presents a connect_url; the OAuth2
-// callback re-enqueues this task when the token is captured.
+// Actual email delivery is handled by the KindSendInvite task on the notify queue.
+// Guild-join and per-user overwrites are removed (AC-M6-9).
 package worker
 
 import (
@@ -27,25 +22,23 @@ import (
 	"github.com/hibiken/asynq"
 	"github.com/valianx/discord-support-hub/internal/domain"
 	"github.com/valianx/discord-support-hub/internal/lock"
-	"github.com/valianx/discord-support-hub/internal/oauth"
 	"github.com/valianx/discord-support-hub/internal/queue"
 	"github.com/valianx/discord-support-hub/internal/store"
 )
 
 // inviteCollaboratorConfig carries all dependencies for the invite handler.
 type inviteCollaboratorConfig struct {
-	store      store.Store
-	discord    discordInvite
-	locker     lock.Locker
-	tokenStore *oauth.TokenStore
-	guildID    string
+	store   store.Store
+	discord discordInvite
+	locker  lock.Locker
+	guildID string
 }
 
 // discordInvite is the Discord sub-interface needed by the invite handler.
-// Declared locally to keep the dependency surface minimal.
+// M6: narrowed — no AddGuildMember or SetCollaboratorOverwrite needed post-pivot.
 type discordInvite interface {
-	AddGuildMember(ctx context.Context, guildID, discordUserID, accessToken string) error
-	SetCollaboratorOverwrite(ctx context.Context, channelID, discordUserID string) error
+	// Placeholder to keep the interface non-empty. Future M7+ methods go here.
+	// The provision handler holds the role-assignment surface.
 }
 
 type inviteCollaboratorHandler struct {
@@ -53,7 +46,7 @@ type inviteCollaboratorHandler struct {
 }
 
 func newInviteCollaboratorHandler(cfg inviteCollaboratorConfig) asynq.HandlerFunc {
-	if cfg.store == nil || cfg.discord == nil {
+	if cfg.store == nil {
 		return stubHandler(queue.KindInviteCollaborator)
 	}
 	if cfg.locker == nil {
@@ -76,7 +69,7 @@ func (h *inviteCollaboratorHandler) handle(ctx context.Context, task *asynq.Task
 	slog.InfoContext(ctx, "invite_collaborator: starting",
 		"space_id", payload.SpaceID, "user_id", payload.UserID)
 
-	// Acquire per-space lock to prevent concurrent overwrite clobbering (§3.3).
+	// Acquire per-space lock to prevent concurrent membership mutations (§3.3).
 	token, ok, err := h.cfg.locker.AcquireSpace(ctx, payload.SpaceID)
 	if err != nil {
 		return fmt.Errorf("invite_collaborator: acquire space lock: %w", err)
@@ -88,7 +81,7 @@ func (h *inviteCollaboratorHandler) handle(ctx context.Context, task *asynq.Task
 	}
 	defer func() { _ = h.cfg.locker.ReleaseSpace(ctx, payload.SpaceID, token) }()
 
-	// Load the space to get the discord_channel_id.
+	// Load the space to verify it is provisioned.
 	sp, err := h.cfg.store.GetSpaceByID(ctx, payload.SpaceID)
 	if err != nil {
 		return fmt.Errorf("invite_collaborator: load space: %w", err)
@@ -99,16 +92,7 @@ func (h *inviteCollaboratorHandler) handle(ctx context.Context, task *asynq.Task
 			payload.SpaceID, sp.ACLState)
 	}
 
-	// Load the user.
-	user, err := h.cfg.store.GetUserByID(ctx, payload.UserID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return fmt.Errorf("%w: invite_collaborator: user %s not found", asynq.SkipRetry, payload.UserID)
-		}
-		return fmt.Errorf("invite_collaborator: load user: %w", err)
-	}
-
-	// Load the space_member row (desired state must exist before we project).
+	// Verify the space_member row still exists (desired state).
 	sm, err := h.cfg.store.GetSpaceMemberBySpaceAndUser(ctx, payload.SpaceID, payload.UserID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -120,69 +104,22 @@ func (h *inviteCollaboratorHandler) handle(ctx context.Context, task *asynq.Task
 		return fmt.Errorf("invite_collaborator: load space_member: %w", err)
 	}
 
-	// Idempotency: already applied.
-	if sm.OverwriteApplied {
-		slog.InfoContext(ctx, "invite_collaborator: overwrite already applied, skipping",
-			"space_id", payload.SpaceID, "user_id", payload.UserID)
-		return nil
-	}
-
-	// If the user has not yet connected Discord, we cannot add them to the guild.
-	// The job will be re-enqueued by the OAuth2 callback when the token arrives.
-	if user.DiscordUserID == nil || *user.DiscordUserID == "" {
-		slog.InfoContext(ctx, "invite_collaborator: user has no discord_user_id yet, waiting for OAuth2 connect",
-			"user_id", payload.UserID)
-		// Retryable — the backoffice will prompt the user to connect, then the OAuth2
-		// callback will re-enqueue this task.
-		return fmt.Errorf("invite_collaborator: user %s has not connected Discord yet; retry after OAuth2 connect",
-			payload.UserID)
-	}
-
-	channelID := *sp.DiscordChannelID
-	discordUserID := *user.DiscordUserID
-
-	// Add to guild via guilds.join token if a token is available.
-	// Idempotent: GuildMemberAdd returns 204 if already a member.
-	if h.cfg.tokenStore != nil {
-		accessToken, tokenErr := h.cfg.tokenStore.LoadAccessToken(ctx, payload.UserID)
-		if tokenErr == nil && accessToken != "" {
-			if addErr := h.cfg.discord.AddGuildMember(ctx, h.cfg.guildID, discordUserID, accessToken); addErr != nil {
-				slog.WarnContext(ctx, "invite_collaborator: add guild member failed (may already be a member)",
-					"user_id", payload.UserID, "error", addErr)
-				// Non-fatal if 400 (already member); we proceed with the overwrite regardless.
-				// A real 403 or 500 would be retried by the outer retry logic.
-			}
-		}
-	}
-
-	// Apply the per-user permission overwrite — the ONLY access grant (NFR-5, §6.2).
-	if err := h.cfg.discord.SetCollaboratorOverwrite(ctx, channelID, discordUserID); err != nil {
-		return fmt.Errorf("invite_collaborator: set collaborator overwrite: %w", err)
-	}
-
-	// Mark overwrite applied in Postgres.
-	if _, err := h.cfg.store.SetSpaceMemberOverwriteApplied(ctx, sm.ID); err != nil {
-		// Non-fatal — log and continue. The reconciler will see the overwrite exists in
-		// Discord but overwrite_applied=false and will mark it on its next pass.
-		slog.WarnContext(ctx, "invite_collaborator: could not mark overwrite_applied",
-			"space_member_id", sm.ID, "error", err)
-	}
-
-	// Write audit entry.
+	// Write audit entry — access is granted via the merchant invite link (AC-M6-9).
 	_ = h.cfg.store.InsertAuditEntry(ctx, store.InsertAuditEntryParams{
-		Action:       "collaborator.invite",
+		Action:       "collaborator.invite_processed",
 		SpaceID:      &payload.SpaceID,
 		TargetUserID: &payload.UserID,
 		ActorUserID:  nilIfEmpty(payload.InvitedBy),
 		Detail: map[string]any{
-			"discord_user_id": discordUserID,
-			"channel_id":      channelID,
+			"space_member_id": sm.ID,
+			"channel_id":      *sp.DiscordChannelID,
+			// M6: access is via merchant invite link, not per-user overwrite
 		},
 	})
 
-	slog.InfoContext(ctx, "invite_collaborator: overwrite applied",
+	slog.InfoContext(ctx, "invite_collaborator: processed",
 		"space_id", payload.SpaceID, "user_id", payload.UserID,
-		"discord_user_id", discordUserID)
+		"space_member_id", sm.ID)
 	return nil
 }
 
