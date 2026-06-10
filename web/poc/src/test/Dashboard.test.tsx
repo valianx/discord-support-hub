@@ -9,7 +9,6 @@ beforeEach(() => {
     status: 503,
     json: async () => ({ code: 'unavailable', message: 'Service unavailable' }),
   }))
-  sessionStorage.clear()
 })
 
 describe('Dashboard smoke render', () => {
@@ -23,20 +22,13 @@ describe('Dashboard smoke render', () => {
     expect(screen.getByText('Backoffice POC')).toBeInTheDocument()
   })
 
-  it('renders the Settings button', () => {
+  it('renders the Merchants section heading', () => {
     render(<App />)
-    expect(screen.getByRole('button', { name: /settings/i })).toBeInTheDocument()
+    expect(screen.getByText('Merchants')).toBeInTheDocument()
   })
 
-  it('renders the security banner', () => {
+  it('renders the Provision section heading', () => {
     render(<App />)
-    expect(
-      screen.getByText(/local operator tool/i)
-    ).toBeInTheDocument()
-  })
-
-  it('prompts for API key when none is set', () => {
-    render(<App />)
-    expect(screen.getByText(/no api key configured/i)).toBeInTheDocument()
+    expect(screen.getByText('Provision')).toBeInTheDocument()
   })
 })

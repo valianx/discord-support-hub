@@ -134,12 +134,23 @@ services:
 
   # Frontend — nginx serving the Vite SPA build; proxies /v1, /livez, /readyz, /metrics to api.
   # Open http://localhost:3000 in your browser.
+  #
+  # The nginx reverse-proxy injects "Authorization: Bearer <key>" on every /v1/ request
+  # using BACKOFFICE_API_KEY. The browser never sees or holds the key.
+  # Mint a key with:
+  #   docker compose -f deploy/docker-compose.test.yml --profile tools run --rm keygen
+  # Then set it in deploy/.env.demo (git-ignored) or export it in your shell before `up`.
   frontend:
     build:
       context: ../web/poc
       dockerfile: Dockerfile
     ports:
       - "3000:80"
+    environment:
+      # Operator mints a key with the keygen tool and sets this variable.
+      # The value is injected into the nginx config at container start via envsubst.
+      BACKOFFICE_API_KEY: "${BACKOFFICE_API_KEY:-}"
+      NGINX_ENVSUBST_FILTER: "BACKOFFICE_API_KEY"
     depends_on:
       api:
         condition: service_started

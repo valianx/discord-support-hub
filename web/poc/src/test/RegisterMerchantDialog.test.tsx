@@ -35,7 +35,6 @@ const mockToastError = vi.mocked(toast.error)
 
 const config: ApiConfig = {
   baseUrl: 'http://localhost:8080',
-  apiKey: 'test-key-abc123',
 }
 
 const createdMerchant: Merchant = {

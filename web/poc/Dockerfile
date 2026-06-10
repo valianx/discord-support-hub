@@ -19,12 +19,18 @@ RUN npm run build
 # ── Stage 2: serve ────────────────────────────────────────────────────────────
 FROM nginx:alpine AS final
 
-# Remove the default nginx config and install ours.
-RUN rm /etc/nginx/conf.d/default.conf
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# Remove the default nginx config; the entrypoint regenerates it from the template.
+RUN rm -f /etc/nginx/conf.d/default.conf
+
+# Install the nginx config template. The official nginx:alpine entrypoint runs
+# envsubst over /etc/nginx/templates/*.template and writes to /etc/nginx/conf.d/.
+# NGINX_ENVSUBST_FILTER restricts substitution to only ${BACKOFFICE_API_KEY},
+# which leaves all native nginx variables ($host, $remote_addr, etc.) untouched.
+COPY nginx.conf.template /etc/nginx/templates/default.conf.template
+
+ENV NGINX_ENVSUBST_FILTER="BACKOFFICE_API_KEY"
 
 # Copy the Vite build output into the nginx document root.
 COPY --from=node /app/dist /usr/share/nginx/html
 
 EXPOSE 80
-CMD ["nginx", "-g", "daemon off;"]

@@ -6,7 +6,6 @@ import type { ApiConfig, Merchant } from '@/lib/api'
 
 const config: ApiConfig = {
   baseUrl: 'http://localhost:8080',
-  apiKey: 'test-key-abc123',
 }
 
 const sampleMerchants: Merchant[] = [

@@ -152,12 +152,13 @@ export interface ReadyzResponse {
 }
 
 // -------------------------------------------------------------------------
-// Client factory — creates an API client bound to a base URL and bearer key.
+// Client factory — creates an API client bound to a base URL.
+// Authorization is injected by the nginx reverse-proxy server-side; the browser
+// sends no Authorization header.
 // -------------------------------------------------------------------------
 
 export interface ApiConfig {
   baseUrl: string
-  apiKey: string
 }
 
 async function request<T>(
@@ -169,7 +170,6 @@ async function request<T>(
 ): Promise<T> {
   const url = `${config.baseUrl.replace(/\/$/, '')}${path}`
   const headers: Record<string, string> = {
-    Authorization: `Bearer ${config.apiKey}`,
     ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
     ...extraHeaders,
   }
