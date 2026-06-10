@@ -45,6 +45,10 @@ type Store interface {
 	// Returns ErrNotFound when no row matches.
 	GetUserByDiscordID(ctx context.Context, discordUserID string) (*domain.User, error)
 
+	// GetUserByEmail returns the user with the given email address.
+	// Returns ErrNotFound when no row matches.
+	GetUserByEmail(ctx context.Context, email string) (*domain.User, error)
+
 	// ListAgents returns all users of type=agent, active or not depending on includeInactive.
 	ListAgents(ctx context.Context, includeInactive bool) ([]*domain.User, error)
 

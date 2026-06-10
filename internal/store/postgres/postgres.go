@@ -191,6 +191,16 @@ func (s *Store) GetUserByDiscordID(ctx context.Context, discordUserID string) (*
 	return scanUser(row)
 }
 
+// GetUserByEmail returns the user with the given email address.
+// Returns store.ErrNotFound when no row matches.
+func (s *Store) GetUserByEmail(ctx context.Context, email string) (*domain.User, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, type, is_admin, discord_user_id, email, display_name,
+		       provisioned_at, is_active, created_at, updated_at
+		FROM users WHERE email = $1`, email)
+	return scanUser(row)
+}
+
 // ListAgents returns all users of type=agent.
 func (s *Store) ListAgents(ctx context.Context, includeInactive bool) ([]*domain.User, error) {
 	query := `SELECT id, type, is_admin, discord_user_id, email, display_name,

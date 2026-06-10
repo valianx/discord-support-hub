@@ -108,6 +108,9 @@ func (f *agentFakeStore) ListMerchants(_ context.Context, _ store.ListMerchantsP
 func (f *agentFakeStore) GetUserByDiscordID(_ context.Context, _ string) (*domain.User, error) {
 	panic("GetUserByDiscordID")
 }
+func (f *agentFakeStore) GetUserByEmail(_ context.Context, _ string) (*domain.User, error) {
+	panic("GetUserByEmail")
+}
 func (f *agentFakeStore) SetUserProvisionedAt(_ context.Context, _ string) (*domain.User, error) {
 	panic("SetUserProvisionedAt")
 }
