@@ -86,6 +86,26 @@ export interface LifecycleAction {
   action: 'open' | 'resolve' | 'archive' | 'reopen'
 }
 
+export interface Merchant {
+  id: string
+  external_ref: string
+  name: string
+  help_desk_url: string | null
+  is_active: boolean
+  created_at: string
+}
+
+export interface RegisterMerchantRequest {
+  external_ref: string
+  name: string
+  help_desk_url?: string | null
+}
+
+export interface ListMerchantsResponse {
+  items: Merchant[]
+  next_cursor?: string | null
+}
+
 export interface ListSpacesResponse {
   items: Space[]
   next_cursor?: string | null
@@ -158,6 +178,35 @@ export async function checkReadiness(baseUrl: string): Promise<ReadyzResponse> {
     throw new Error(`Readiness check failed: ${response.status}`)
   }
   return response.json() as Promise<ReadyzResponse>
+}
+
+// -------------------------------------------------------------------------
+// Merchants
+// -------------------------------------------------------------------------
+
+export function registerMerchant(
+  config: ApiConfig,
+  body: RegisterMerchantRequest,
+  idempotencyKey?: string
+): Promise<Merchant> {
+  return request<Merchant>(
+    config,
+    'POST',
+    '/v1/merchants',
+    body,
+    idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}
+  )
+}
+
+export function listMerchants(
+  config: ApiConfig,
+  params?: { cursor?: string; is_active?: boolean }
+): Promise<ListMerchantsResponse> {
+  const qs = new URLSearchParams()
+  if (params?.cursor) qs.set('cursor', params.cursor)
+  if (params?.is_active !== undefined) qs.set('is_active', String(params.is_active))
+  const query = qs.toString() ? `?${qs.toString()}` : ''
+  return request<ListMerchantsResponse>(config, 'GET', `/v1/merchants${query}`)
 }
 
 // -------------------------------------------------------------------------

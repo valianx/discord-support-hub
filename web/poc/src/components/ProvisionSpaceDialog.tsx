@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import { Plus } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -13,12 +13,30 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog'
-import { type ApiConfig, provisionSpace, pollJob, type Job, type JobStatus } from '@/lib/api'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import {
+  type ApiConfig,
+  provisionSpace,
+  listMerchants,
+  pollJob,
+  type Job,
+  type JobStatus,
+  type Merchant,
+  ApiError,
+} from '@/lib/api'
 import { toast } from 'sonner'
 
 interface ProvisionSpaceDialogProps {
   apiConfig: ApiConfig
   onProvisioned: () => void
+  /** Merchant list from the parent — kept fresh after Register Merchant. */
+  merchants?: Merchant[]
 }
 
 function jobStatusVariant(status: JobStatus) {
@@ -31,31 +49,71 @@ function jobStatusVariant(status: JobStatus) {
   }
 }
 
-export function ProvisionSpaceDialog({ apiConfig, onProvisioned }: ProvisionSpaceDialogProps) {
+export function ProvisionSpaceDialog({ apiConfig, onProvisioned, merchants: propMerchants }: ProvisionSpaceDialogProps) {
   const [open, setOpen] = useState(false)
   const [merchantId, setMerchantId] = useState('')
+  const [manualMerchantId, setManualMerchantId] = useState('')
   const [spaceName, setSpaceName] = useState('')
   const [loading, setLoading] = useState(false)
   const [activeJob, setActiveJob] = useState<Job | null>(null)
+  // Locally-fetched fallback when the parent provides no merchants yet.
+  const [fetchedMerchants, setFetchedMerchants] = useState<Merchant[]>([])
+  const [merchantsLoading, setMerchantsLoading] = useState(false)
+  // Avoid re-fetching on every open if the parent already supplies merchants.
+  const hasFetched = useRef(false)
+
+  // Prefer the parent's list (always current after registrations); fall back to fetched.
+  const merchants = (propMerchants && propMerchants.length > 0)
+    ? propMerchants
+    : fetchedMerchants
+
+  async function fetchMerchants() {
+    if (!apiConfig.apiKey || hasFetched.current) return
+    setMerchantsLoading(true)
+    try {
+      const result = await listMerchants(apiConfig, { is_active: true })
+      setFetchedMerchants(result.items)
+      hasFetched.current = true
+    } catch (err) {
+      const message =
+        err instanceof ApiError
+          ? `[${err.code}] ${err.message}`
+          : 'Could not load merchants — check your API key and hub URL.'
+      toast.error('Failed to load merchants', { description: message })
+      // Operator can still fall back to the manual UUID field.
+    } finally {
+      setMerchantsLoading(false)
+    }
+  }
 
   function handleOpenChange(isOpen: boolean) {
+    if (isOpen) {
+      void fetchMerchants()
+    }
     if (!isOpen && !loading) {
       setMerchantId('')
+      setManualMerchantId('')
       setSpaceName('')
       setActiveJob(null)
     }
     setOpen(isOpen)
   }
 
+  function resolvedMerchantId(): string {
+    if (merchantId && merchantId !== '__manual__') return merchantId
+    return manualMerchantId.trim()
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
-    if (!merchantId.trim() || !spaceName.trim()) return
+    const mid = resolvedMerchantId()
+    if (!mid || !spaceName.trim()) return
 
     setLoading(true)
     setActiveJob(null)
 
     try {
-      const result = await provisionSpace(apiConfig, merchantId.trim(), {
+      const result = await provisionSpace(apiConfig, mid, {
         name: spaceName.trim(),
       })
       const job = result.job
@@ -83,6 +141,9 @@ export function ProvisionSpaceDialog({ apiConfig, onProvisioned }: ProvisionSpac
     }
   }
 
+  const hasMerchants = merchants.length > 0
+  const showManualInput = !hasMerchants || merchantId === '__manual__'
+
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
@@ -102,16 +163,46 @@ export function ProvisionSpaceDialog({ apiConfig, onProvisioned }: ProvisionSpac
         <form onSubmit={handleSubmit}>
           <div className="grid gap-4 py-2">
             <div className="grid gap-2">
-              <Label htmlFor="merchant-id">Merchant ID (UUID)</Label>
-              <Input
-                id="merchant-id"
-                placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-                value={merchantId}
-                onChange={(e) => setMerchantId(e.target.value)}
-                disabled={loading}
-                required
-              />
+              <Label htmlFor="provision-merchant">Merchant</Label>
+              {hasMerchants ? (
+                <Select
+                  value={merchantId}
+                  onValueChange={setMerchantId}
+                  disabled={loading || merchantsLoading}
+                >
+                  <SelectTrigger id="provision-merchant">
+                    <SelectValue placeholder={merchantsLoading ? 'Loading merchants…' : 'Select a merchant'} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {merchants.map((m) => (
+                      <SelectItem key={m.id} value={m.id}>
+                        {m.name} ({m.external_ref})
+                      </SelectItem>
+                    ))}
+                    <SelectItem value="__manual__">Enter UUID manually…</SelectItem>
+                  </SelectContent>
+                </Select>
+              ) : (
+                <p className="text-xs text-slate-500">
+                  No merchants found — enter a UUID below, or register a merchant first.
+                </p>
+              )}
             </div>
+
+            {showManualInput && (
+              <div className="grid gap-2">
+                <Label htmlFor="merchant-id-manual">Merchant ID (UUID)</Label>
+                <Input
+                  id="merchant-id-manual"
+                  placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                  value={manualMerchantId}
+                  onChange={(e) => setManualMerchantId(e.target.value)}
+                  disabled={loading}
+                  required={showManualInput}
+                />
+              </div>
+            )}
+
             <div className="grid gap-2">
               <Label htmlFor="space-name">Space Name</Label>
               <Input
@@ -143,7 +234,7 @@ export function ProvisionSpaceDialog({ apiConfig, onProvisioned }: ProvisionSpac
           </div>
 
           <DialogFooter className="mt-4">
-            <Button type="submit" disabled={loading}>
+            <Button type="submit" disabled={loading || !resolvedMerchantId()}>
               {loading ? 'Provisioning…' : 'Provision'}
             </Button>
           </DialogFooter>
