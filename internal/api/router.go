@@ -35,6 +35,10 @@ type RouterConfig struct {
 	// Cache is the Valkey read cache. Handlers use it for space reads.
 	Cache cache.Cache
 
+	// GuildID is the Discord guild (server) id. Forwarded to handlers for the
+	// discord_deep_link computation (AC-M7-2). Empty string disables the field.
+	GuildID string
+
 	// Health check pingable dependencies.
 	PGPinger    observability.Pinger
 	RedisPinger observability.Pinger
@@ -60,11 +64,12 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 		r.GET("/metrics", gin.WrapH(cfg.Metrics.Handler()))
 	}
 
-	// Build the handler struct with all M6 deps wired in.
+	// Build the handler struct with all M6/M7 deps wired in.
 	h := handlers.NewHandlers(handlers.Config{
 		Store:       cfg.Store,
 		QueueClient: cfg.QueueClient,
 		Cache:       cfg.Cache,
+		GuildID:     cfg.GuildID,
 	})
 
 	// All v1 routes require Layer A authentication.

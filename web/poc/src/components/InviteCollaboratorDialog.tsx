@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Copy, Check } from 'lucide-react'
+import { Send } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -11,7 +11,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { type ApiConfig, inviteCollaborator } from '@/lib/api'
+import {
+  type ApiConfig,
+  type SpaceMember,
+  registerCollaborator,
+  sendCollaboratorInvite,
+  ApiError,
+} from '@/lib/api'
 import { toast } from 'sonner'
 
 interface InviteCollaboratorDialogProps {
@@ -20,7 +26,11 @@ interface InviteCollaboratorDialogProps {
   spaceId: string
   spaceName: string
   apiConfig: ApiConfig
+  /** Pass false when the space's merchant has no invite link set, to proactively disable Send Invitation. */
+  merchantInviteLinkSet?: boolean
 }
+
+type DialogStep = 'register' | 'registered'
 
 export function InviteCollaboratorDialog({
   open,
@@ -28,141 +38,159 @@ export function InviteCollaboratorDialog({
   spaceId,
   spaceName,
   apiConfig,
+  merchantInviteLinkSet = true,
 }: InviteCollaboratorDialogProps) {
+  const [name, setName] = useState('')
   const [email, setEmail] = useState('')
-  const [discordId, setDiscordId] = useState('')
-  const [displayName, setDisplayName] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [connectUrl, setConnectUrl] = useState<string | null>(null)
-  const [copied, setCopied] = useState(false)
+  const [registering, setRegistering] = useState(false)
+  const [sendingInvite, setSendingInvite] = useState(false)
+  const [step, setStep] = useState<DialogStep>('register')
+  const [registeredMember, setRegisteredMember] = useState<SpaceMember | null>(null)
+
+  function resetForm() {
+    setName('')
+    setEmail('')
+    setStep('register')
+    setRegisteredMember(null)
+  }
 
   function handleOpenChange(isOpen: boolean) {
     if (!isOpen) {
-      setEmail('')
-      setDiscordId('')
-      setDisplayName('')
-      setConnectUrl(null)
-      setCopied(false)
+      resetForm()
     }
     onOpenChange(isOpen)
   }
 
-  async function handleSubmit(e: React.FormEvent) {
+  async function handleRegister(e: React.FormEvent) {
     e.preventDefault()
-    if (!email.trim() && !discordId.trim()) {
-      toast.error('Provide an email or Discord ID')
+    if (!name.trim() || !email.trim()) {
+      toast.error('Name and email are required')
       return
     }
 
-    setLoading(true)
+    setRegistering(true)
     try {
-      const result = await inviteCollaborator(apiConfig, spaceId, {
-        email: email.trim() || null,
-        discord_user_id: discordId.trim() || null,
-        display_name: displayName.trim() || null,
+      const member = await registerCollaborator(apiConfig, spaceId, {
+        name: name.trim(),
+        email: email.trim(),
       })
-
-      toast.success('Invite accepted (202)')
-
-      if (result.connect_url) {
-        setConnectUrl(result.connect_url)
-      } else {
-        handleOpenChange(false)
-      }
+      setRegisteredMember(member)
+      setStep('registered')
+      toast.success(`${name.trim()} registered on this space`)
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      toast.error(`Invite failed: ${message}`)
+      if (err instanceof ApiError && err.status === 409) {
+        toast.error('This collaborator is already registered on this space')
+      } else {
+        const message = err instanceof Error ? err.message : String(err)
+        toast.error(`Registration failed: ${message}`)
+      }
     } finally {
-      setLoading(false)
+      setRegistering(false)
     }
   }
 
-  async function handleCopyUrl() {
-    if (!connectUrl) return
-    await navigator.clipboard.writeText(connectUrl)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+  async function handleSendInvite() {
+    if (!registeredMember) return
+
+    setSendingInvite(true)
+    try {
+      await sendCollaboratorInvite(apiConfig, spaceId, registeredMember.user_id)
+      toast.success(`Invitation email queued for ${registeredMember.display_name ?? email}`)
+      handleOpenChange(false)
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        toast.error(
+          'No invite link set for this merchant. Set one via Merchant → Set Invite Link first.',
+          { duration: 6000 }
+        )
+      } else {
+        const message = err instanceof Error ? err.message : String(err)
+        toast.error(`Failed to send invite: ${message}`)
+      }
+    } finally {
+      setSendingInvite(false)
+    }
   }
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Invite Collaborator</DialogTitle>
+          <DialogTitle>Register Collaborator</DialogTitle>
           <DialogDescription>
-            Invite a collaborator to <strong>{spaceName}</strong>.
+            Add a collaborator to <strong>{spaceName}</strong> by name and work email.
           </DialogDescription>
         </DialogHeader>
 
-        {!connectUrl ? (
-          <form onSubmit={handleSubmit}>
+        {step === 'register' && (
+          <form onSubmit={handleRegister}>
             <div className="grid gap-4 py-2">
               <div className="grid gap-2">
-                <Label htmlFor="collab-email">Email</Label>
+                <Label htmlFor="collab-name">Full Name</Label>
+                <Input
+                  id="collab-name"
+                  placeholder="Jane Doe"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  disabled={registering}
+                  required
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="collab-email">Work Email</Label>
                 <Input
                   id="collab-email"
                   type="email"
-                  placeholder="user@example.com"
+                  placeholder="jane@example.com"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  disabled={loading}
-                />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="collab-discord-id">Discord User ID</Label>
-                <Input
-                  id="collab-discord-id"
-                  placeholder="Snowflake ID (optional if email given)"
-                  value={discordId}
-                  onChange={(e) => setDiscordId(e.target.value)}
-                  disabled={loading}
-                />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="collab-display-name">Display Name (optional)</Label>
-                <Input
-                  id="collab-display-name"
-                  placeholder="Jane Doe"
-                  value={displayName}
-                  onChange={(e) => setDisplayName(e.target.value)}
-                  disabled={loading}
+                  disabled={registering}
+                  required
                 />
               </div>
             </div>
             <DialogFooter className="mt-4">
-              <Button type="submit" disabled={loading}>
-                {loading ? 'Sending…' : 'Invite'}
+              <Button type="submit" disabled={registering}>
+                {registering ? 'Registering…' : 'Register'}
               </Button>
             </DialogFooter>
           </form>
-        ) : (
+        )}
+
+        {step === 'registered' && registeredMember && (
           <div className="grid gap-4 py-2">
             <p className="text-sm text-slate-700">
-              The collaborator must complete{' '}
-              <strong>Connect with Discord</strong> before they can access the
-              space. Share this one-time OAuth2 link:
+              <strong>{registeredMember.display_name ?? email}</strong> is now registered on this
+              space. Send the merchant's invite-with-role link to their email to grant Discord
+              access.
             </p>
-            <div className="flex items-center gap-2">
-              <Input
-                readOnly
-                value={connectUrl}
-                className="font-mono text-xs"
-              />
-              <Button
-                variant="outline"
-                size="icon"
-                onClick={handleCopyUrl}
-                title="Copy to clipboard"
-              >
-                {copied ? (
-                  <Check className="h-4 w-4 text-green-600" />
-                ) : (
-                  <Copy className="h-4 w-4" />
-                )}
+            {merchantInviteLinkSet ? (
+              <div className="rounded-md bg-blue-50 border border-blue-200 px-3 py-2 text-sm text-blue-800">
+                The invite email will be sent from the hub's SMTP relay using the merchant's stored
+                invite link.
+              </div>
+            ) : (
+              <div className="rounded-md bg-amber-50 border border-amber-200 px-3 py-2 text-sm text-amber-800">
+                This merchant has no invite link set — sending will fail. Set it first via{' '}
+                <strong>Merchant → Set Invite Link</strong>.
+              </div>
+            )}
+            <DialogFooter className="flex-row justify-between sm:justify-between mt-2">
+              <Button variant="outline" onClick={() => handleOpenChange(false)}>
+                Done (send later)
               </Button>
-            </div>
-            <DialogFooter>
-              <Button onClick={() => handleOpenChange(false)}>Done</Button>
+              <Button
+                onClick={handleSendInvite}
+                disabled={sendingInvite || !merchantInviteLinkSet}
+                title={
+                  !merchantInviteLinkSet
+                    ? 'Set this merchant\'s invite link first'
+                    : undefined
+                }
+              >
+                <Send className="h-4 w-4 mr-2" />
+                {sendingInvite ? 'Sending…' : 'Send Invitation'}
+              </Button>
             </DialogFooter>
           </div>
         )}

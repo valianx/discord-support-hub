@@ -81,6 +81,8 @@ func main() {
 		QueueClient:        queueClient,
 		PGPinger:           pg,
 		RedisPinger:        &redisPinger{rdb},
+		// GuildID enables the discord_deep_link field on space responses (AC-M7-2).
+		GuildID: cfg.DiscordGuildID,
 	})
 
 	srv := &http.Server{

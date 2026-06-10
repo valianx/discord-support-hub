@@ -1,13 +1,16 @@
 import { useState, useEffect, useCallback } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle, XCircle, Loader2, Clock, Building2 } from 'lucide-react'
+import { CheckCircle, XCircle, Loader2, Clock, Building2, Link } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Separator } from '@/components/ui/separator'
 import { SettingsDialog } from '@/components/SettingsDialog'
 import { ProvisionSpaceDialog } from '@/components/ProvisionSpaceDialog'
 import { RegisterMerchantDialog } from '@/components/RegisterMerchantDialog'
+import { MerchantInviteLinkDialog } from '@/components/MerchantInviteLinkDialog'
 import { SpacesTable } from '@/components/SpacesTable'
+import { AuditLogDialog } from '@/components/AuditLogDialog'
 import { listSpaces, listMerchants, type Space, type Merchant, type ApiConfig, ApiError } from '@/lib/api'
 import { getApiKey, getBaseUrl, hasApiKey } from '@/lib/settings'
 
@@ -24,6 +27,7 @@ export function Dashboard() {
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('unknown')
   const [merchants, setMerchants] = useState<Merchant[]>([])
   const [merchantsLoadError, setMerchantsLoadError] = useState(false)
+  const [inviteLinkMerchant, setInviteLinkMerchant] = useState<Merchant | null>(null)
 
   const refreshConfig = useCallback(() => {
     setApiConfig({ baseUrl: getBaseUrl(), apiKey: getApiKey() })
@@ -104,10 +108,13 @@ export function Dashboard() {
 
   function handleMerchantRegistered(merchant: Merchant) {
     setMerchants((prev) => {
-      // Avoid duplicates if the list already contains this merchant.
       const exists = prev.some((m) => m.id === merchant.id)
       return exists ? prev : [...prev, merchant]
     })
+  }
+
+  function handleMerchantInviteLinkUpdated(updated: Merchant) {
+    setMerchants((prev) => prev.map((m) => (m.id === updated.id ? updated : m)))
   }
 
   return (
@@ -172,7 +179,10 @@ export function Dashboard() {
               </div>
 
               {merchants.length > 0 && (
-                <MerchantList merchants={merchants} />
+                <MerchantList
+                  merchants={merchants}
+                  onSetInviteLink={setInviteLinkMerchant}
+                />
               )}
               <Separator className="mt-3" />
             </section>
@@ -195,7 +205,7 @@ export function Dashboard() {
               <Separator />
             </section>
 
-            {/* Spaces table */}
+            {/* Spaces table — AC-M7-1: list spaces, view members; AC-M7-2: deep link */}
             <section>
               <SpacesTable
                 spaces={spaces}
@@ -204,26 +214,73 @@ export function Dashboard() {
                 apiConfig={apiConfig}
                 onRefresh={handleRefreshSpaces}
                 onChanged={handleRefreshSpaces}
+                merchants={merchants}
               />
+            </section>
+
+            {/* Audit log — AC-M7-1: read audit log */}
+            <section>
+              <div className="flex items-center justify-between mb-3">
+                <div>
+                  <h2 className="text-lg font-semibold">Audit Log</h2>
+                  <p className="text-sm text-slate-500">
+                    Provisioning, membership, lifecycle, and expulsion events.
+                  </p>
+                </div>
+                <AuditLogDialog apiConfig={apiConfig} />
+              </div>
             </section>
           </>
         )}
       </main>
+
+      {/* Merchant invite link dialog — AC-M7-3: set per-merchant invite link */}
+      {inviteLinkMerchant && (
+        <MerchantInviteLinkDialog
+          open={true}
+          onOpenChange={(open) => !open && setInviteLinkMerchant(null)}
+          merchant={inviteLinkMerchant}
+          apiConfig={apiConfig}
+          onUpdated={handleMerchantInviteLinkUpdated}
+        />
+      )}
     </div>
   )
 }
 
-function MerchantList({ merchants }: { merchants: Merchant[] }) {
+interface MerchantListProps {
+  merchants: Merchant[]
+  onSetInviteLink: (merchant: Merchant) => void
+}
+
+function MerchantList({ merchants, onSetInviteLink }: MerchantListProps) {
   return (
     <div className="flex flex-wrap gap-2 py-2">
       {merchants.map((m) => (
         <div
           key={m.id}
-          className="flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm"
+          className="flex items-center gap-2 rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm"
         >
           <Building2 className="h-3.5 w-3.5 text-slate-400 shrink-0" />
           <span className="font-medium text-slate-800">{m.name}</span>
           <span className="text-slate-400 text-xs">({m.external_ref})</span>
+          {/* Invite link status indicator */}
+          {m.invite_link ? (
+            <Badge variant="success" className="text-xs shrink-0">link set</Badge>
+          ) : (
+            <Badge variant="warning" className="text-xs shrink-0">no link</Badge>
+          )}
+          {/* AC-M7-3: set/update merchant invite link */}
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6 shrink-0"
+            title="Set invite link"
+            onClick={() => onSetInviteLink(m)}
+          >
+            <Link className="h-3.5 w-3.5 text-slate-400 hover:text-slate-700" />
+            <span className="sr-only">Set invite link</span>
+          </Button>
         </div>
       ))}
     </div>

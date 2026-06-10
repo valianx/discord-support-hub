@@ -876,6 +876,15 @@ components:
         merchant_role_id:
           type: [string, 'null']
           description: The merchant's Discord role id (created on provision); grants VIEW+SEND on the channel. Null until provisioned.
+        discord_deep_link:
+          type: [string, 'null']
+          format: uri
+          description: |
+            Computed convenience field for the backoffice console (AC-M7-2). The deep link
+            `https://discord.com/channels/{guildId}/{channelId}` opens the space directly in
+            the Discord client. Emitted only when the space is provisioned (discord_channel_id
+            is set) and the hub is configured with DISCORD_GUILD_ID. No message content is
+            read or stored by the hub; this is a navigation-only link.
         lifecycle_state: { $ref: '#/components/schemas/SpaceLifecycleState' }
         acl_state: { $ref: '#/components/schemas/AclState' }
         last_activity_at: { type: [string, 'null'], format: date-time }

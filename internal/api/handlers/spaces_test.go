@@ -197,6 +197,10 @@ func (f *spacesFakeStore) UpdateOutboxPayload(
 // ─── Router helpers ───────────────────────────────────────────────────────────
 
 func buildSpaceRouter(s store.Store, principal *authz.Principal, c cache.Cache) *gin.Engine {
+	return buildSpaceRouterWithGuild(s, principal, c, "")
+}
+
+func buildSpaceRouterWithGuild(s store.Store, principal *authz.Principal, c cache.Cache, guildID string) *gin.Engine {
 	r := gin.New()
 	r.Use(middleware.Recovery())
 
@@ -210,8 +214,9 @@ func buildSpaceRouter(s store.Store, principal *authz.Principal, c cache.Cache) 
 	idem := middleware.Idempotency(s)
 
 	h := handlers.NewHandlers(handlers.Config{
-		Store: s,
-		Cache: c,
+		Store:   s,
+		Cache:   c,
+		GuildID: guildID,
 	})
 
 	r.POST("/v1/merchants/:merchantId/channels", idem, h.ProvisionSpace)
@@ -613,5 +618,110 @@ func TestGetSpace_NonControlPlane_Returns403(t *testing.T) {
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("want 403, got %d", w.Code)
+	}
+}
+
+// ─── AC-M7-2: discord_deep_link field ────────────────────────────────────────
+
+// TestGetSpace_DeepLink_PresentWhenProvisioned verifies that when a guild id is
+// configured and the space has a discord_channel_id (provisioned), the response
+// contains a discord_deep_link of the form https://discord.com/channels/{guildId}/{channelId}.
+func TestGetSpace_DeepLink_PresentWhenProvisioned(t *testing.T) {
+	s := newSpacesFakeStore()
+	channelID := "111222333444555666"
+	s.spaces["sp-deeplink-001"] = &domain.Space{
+		ID:               "sp-deeplink-001",
+		MerchantID:       "merchant-dl",
+		Name:             "dl-space",
+		DiscordChannelID: &channelID,
+		ACLState:         domain.ACLStateApplied,
+		LifecycleState:   domain.SpaceLifecycleActive,
+		CreatedAt:        time.Now(),
+	}
+
+	const guildID = "999888777666555444"
+	router := buildSpaceRouterWithGuild(s, spacesControlPlanePrincipal(), cache.NoopCache{}, guildID)
+	w := getJSON(router, "/v1/channels/sp-deeplink-001", nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+
+	wantLink := "https://discord.com/channels/" + guildID + "/" + channelID
+	gotLink, ok := body["discord_deep_link"].(string)
+	if !ok {
+		t.Fatalf("want discord_deep_link string in response, got: %v", body["discord_deep_link"])
+	}
+	if gotLink != wantLink {
+		t.Errorf("want discord_deep_link=%q, got %q", wantLink, gotLink)
+	}
+}
+
+// TestGetSpace_DeepLink_AbsentWhenNotProvisioned verifies that when the space has
+// no discord_channel_id (not yet provisioned), discord_deep_link is absent from the response.
+func TestGetSpace_DeepLink_AbsentWhenNotProvisioned(t *testing.T) {
+	s := newSpacesFakeStore()
+	s.spaces["sp-deeplink-002"] = &domain.Space{
+		ID:               "sp-deeplink-002",
+		MerchantID:       "merchant-dl",
+		Name:             "unprovisioned-space",
+		DiscordChannelID: nil, // not yet provisioned
+		ACLState:         domain.ACLStatePending,
+		LifecycleState:   domain.SpaceLifecycleActive,
+		CreatedAt:        time.Now(),
+	}
+
+	router := buildSpaceRouterWithGuild(s, spacesControlPlanePrincipal(), cache.NoopCache{}, "999888777666555444")
+	w := getJSON(router, "/v1/channels/sp-deeplink-002", nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+
+	if _, present := body["discord_deep_link"]; present {
+		t.Errorf("want discord_deep_link absent when space not provisioned, but it was present: %v", body["discord_deep_link"])
+	}
+}
+
+// TestGetSpace_DeepLink_AbsentWhenNoGuildID verifies that when no guild id is
+// configured (GuildID=""), discord_deep_link is absent even for provisioned spaces.
+func TestGetSpace_DeepLink_AbsentWhenNoGuildID(t *testing.T) {
+	s := newSpacesFakeStore()
+	channelID := "111222333444555666"
+	s.spaces["sp-deeplink-003"] = &domain.Space{
+		ID:               "sp-deeplink-003",
+		MerchantID:       "merchant-dl",
+		Name:             "dl-space-no-guild",
+		DiscordChannelID: &channelID,
+		ACLState:         domain.ACLStateApplied,
+		LifecycleState:   domain.SpaceLifecycleActive,
+		CreatedAt:        time.Now(),
+	}
+
+	// Empty guildID — deep link should not be emitted.
+	router := buildSpaceRouterWithGuild(s, spacesControlPlanePrincipal(), cache.NoopCache{}, "")
+	w := getJSON(router, "/v1/channels/sp-deeplink-003", nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+
+	if _, present := body["discord_deep_link"]; present {
+		t.Errorf("want discord_deep_link absent when guildID not configured, but it was present")
 	}
 }

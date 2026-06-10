@@ -18,6 +18,9 @@ type Config struct {
 	Store       store.Store
 	QueueClient *queue.Client
 	Cache       cache.Cache
+	// GuildID is the Discord guild (server) ID. Used to compute the discord_deep_link
+	// field on space responses (AC-M7-2). Empty string disables the field.
+	GuildID string
 }
 
 // Handlers groups all API handler methods and their shared dependencies.
@@ -25,6 +28,7 @@ type Handlers struct {
 	store       store.Store
 	queueClient *queue.Client
 	cache       cache.Cache
+	guildID     string
 }
 
 // NewHandlers creates a Handlers instance from the provided config.
@@ -37,6 +41,7 @@ func NewHandlers(cfg Config) *Handlers {
 		store:       cfg.Store,
 		queueClient: cfg.QueueClient,
 		cache:       c,
+		guildID:     cfg.GuildID,
 	}
 }
 

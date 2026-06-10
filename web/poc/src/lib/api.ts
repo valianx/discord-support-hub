@@ -35,15 +35,18 @@ export interface Space {
   last_activity_at: string | null
   created_at: string
   archived_at: string | null
+  // AC-M7-2: computed server-side from guildId + channelId; present only when provisioned.
+  discord_deep_link: string | null
 }
 
 export interface SpaceMember {
   user_id: string
   discord_user_id: string | null
   display_name: string | null
+  email: string | null
   merchant_id: string | null
   role: 'collaborator'
-  overwrite_applied: boolean
+  invite_sent_at: string | null
   invited_by: string | null
   created_at: string
 }
@@ -65,21 +68,15 @@ export interface JobAcceptedBody {
   job: Job
 }
 
-export interface InviteCollaboratorResponse extends JobAcceptedBody {
-  connect_url?: string | null
-}
-
 export interface ProvisionSpaceRequest {
   name: string
   category_id?: string | null
   welcome_message?: string | null
 }
 
-export interface InviteCollaboratorRequest {
-  user_id?: string | null
-  discord_user_id?: string | null
-  email?: string | null
-  display_name?: string | null
+export interface RegisterCollaboratorRequest {
+  name: string
+  email: string
 }
 
 export interface LifecycleAction {
@@ -91,6 +88,8 @@ export interface Merchant {
   external_ref: string
   name: string
   help_desk_url: string | null
+  invite_link: string | null
+  invite_link_set_at: string | null
   is_active: boolean
   created_at: string
 }
@@ -113,6 +112,38 @@ export interface ListSpacesResponse {
 
 export interface ListMembersResponse {
   items: SpaceMember[]
+}
+
+export interface DirectoryEntry {
+  space_id: string
+  space_name: string
+  merchant_id: string
+  merchant_name: string
+  user_id: string
+  user_display_name: string | null
+  role: 'agent' | 'collaborator'
+}
+
+export interface ListDirectoryResponse {
+  items: DirectoryEntry[]
+  next_cursor?: string | null
+}
+
+export interface AuditEntry {
+  id: number
+  action: string
+  actor_user_id: string | null
+  merchant_id: string | null
+  space_id: string | null
+  target_user_id: string | null
+  scope: 'channel' | 'server' | null
+  detail: Record<string, unknown> | null
+  created_at: string
+}
+
+export interface ListAuditResponse {
+  items: AuditEntry[]
+  next_cursor?: string | null
 }
 
 export interface ReadyzResponse {
@@ -209,6 +240,16 @@ export function listMerchants(
   return request<ListMerchantsResponse>(config, 'GET', `/v1/merchants${query}`)
 }
 
+export function setMerchantInviteLink(
+  config: ApiConfig,
+  merchantId: string,
+  inviteLink: string
+): Promise<Merchant> {
+  return request<Merchant>(config, 'PUT', `/v1/merchants/${merchantId}/invite`, {
+    invite_link: inviteLink,
+  })
+}
+
 // -------------------------------------------------------------------------
 // Spaces
 // -------------------------------------------------------------------------
@@ -265,17 +306,32 @@ export function listMembers(
 // Collaborators
 // -------------------------------------------------------------------------
 
-export function inviteCollaborator(
+export function registerCollaborator(
   config: ApiConfig,
   spaceId: string,
-  body: InviteCollaboratorRequest,
+  body: RegisterCollaboratorRequest,
   idempotencyKey?: string
-): Promise<InviteCollaboratorResponse> {
-  return request<InviteCollaboratorResponse>(
+): Promise<SpaceMember> {
+  return request<SpaceMember>(
     config,
     'POST',
     `/v1/channels/${spaceId}/collaborators`,
     body,
+    idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}
+  )
+}
+
+export function sendCollaboratorInvite(
+  config: ApiConfig,
+  spaceId: string,
+  userId: string,
+  idempotencyKey?: string
+): Promise<JobAcceptedBody> {
+  return request<JobAcceptedBody>(
+    config,
+    'POST',
+    `/v1/channels/${spaceId}/collaborators/${userId}/send-invite`,
+    undefined,
     idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}
   )
 }
@@ -294,6 +350,36 @@ export function expelCollaborator(
     undefined,
     idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}
   )
+}
+
+// -------------------------------------------------------------------------
+// Transversal — directory + audit
+// -------------------------------------------------------------------------
+
+export function getDirectory(
+  config: ApiConfig,
+  params?: { space_id?: string; merchant_id?: string; user_id?: string; limit?: number }
+): Promise<ListDirectoryResponse> {
+  const qs = new URLSearchParams()
+  if (params?.space_id) qs.set('space_id', params.space_id)
+  if (params?.merchant_id) qs.set('merchant_id', params.merchant_id)
+  if (params?.user_id) qs.set('user_id', params.user_id)
+  if (params?.limit) qs.set('limit', String(params.limit))
+  const query = qs.toString() ? `?${qs.toString()}` : ''
+  return request<ListDirectoryResponse>(config, 'GET', `/v1/directory${query}`)
+}
+
+export function getAudit(
+  config: ApiConfig,
+  params?: { space_id?: string; merchant_id?: string; since?: string; limit?: number }
+): Promise<ListAuditResponse> {
+  const qs = new URLSearchParams()
+  if (params?.space_id) qs.set('space_id', params.space_id)
+  if (params?.merchant_id) qs.set('merchant_id', params.merchant_id)
+  if (params?.since) qs.set('since', params.since)
+  if (params?.limit) qs.set('limit', String(params.limit))
+  const query = qs.toString() ? `?${qs.toString()}` : ''
+  return request<ListAuditResponse>(config, 'GET', `/v1/audit${query}`)
 }
 
 // -------------------------------------------------------------------------
