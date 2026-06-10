@@ -1,6 +1,8 @@
 // cmd/worker is the asynq worker entrypoint.
-// It boots the asynq.Server with the four-queue topology, registers handlers,
+// It boots the asynq.Server with the five-queue topology, registers handlers,
 // and shuts down gracefully on SIGINT/SIGTERM.
+// M6: OAuth2 token store removed (AC-M6-9). Email sender (SMTP) added (AC-M6-5).
+//     notify queue added (AC-M6-6). Welcome channel config wired (AC-M6-7).
 package main
 
 import (
@@ -13,12 +15,11 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/valianx/discord-support-hub/internal/config"
 	"github.com/valianx/discord-support-hub/internal/discord"
+	"github.com/valianx/discord-support-hub/internal/email"
 	"github.com/valianx/discord-support-hub/internal/lock"
-	"github.com/valianx/discord-support-hub/internal/oauth"
 	obsv "github.com/valianx/discord-support-hub/internal/observability"
 	"github.com/valianx/discord-support-hub/internal/queue"
 	"github.com/valianx/discord-support-hub/internal/reconcile"
-	"github.com/valianx/discord-support-hub/internal/secrets"
 	pgstore "github.com/valianx/discord-support-hub/internal/store/postgres"
 	"github.com/valianx/discord-support-hub/internal/worker"
 )
@@ -39,7 +40,7 @@ func main() {
 		slog.Error("startup: missing required config", "error", err)
 		os.Exit(1)
 	}
-	// M3: the Agent role must be a real, distinct role — not @everyone (NFR-5).
+	// The Agent role must be a real, distinct role — not @everyone (NFR-5).
 	if err = cfg.RequireAgentRoleID(); err != nil {
 		slog.Error("startup: missing required config", "error", err)
 		os.Exit(1)
@@ -62,20 +63,16 @@ func main() {
 	}
 	defer pg.Close()
 
-	// M3: AES-256-GCM encrypter for loading OAuth2 tokens needed by guilds.join (NFR-6).
-	// If ENCRYPTION_KEY is absent the token store is omitted (invite_collaborator falls back
-	// to not calling GuildMemberAdd — the bot must add the user manually or via another flow).
-	var tokenStore *oauth.TokenStore
-	if cfg.EncryptionKey != "" {
-		enc, encErr := secrets.NewEncrypter(cfg.EncryptionKey, 1)
-		if encErr != nil {
-			slog.Error("startup: could not initialise encrypter", "error", encErr)
-			os.Exit(1)
-		}
-		tokenStore = oauth.NewTokenStore(pg, enc)
-	} else {
-		slog.Warn("startup: ENCRYPTION_KEY not set — guilds.join will be skipped in invite_collaborator (non-fatal if OAuth2 not used)")
-	}
+	// M6: SMTP email sender for the notify queue (AC-M6-5).
+	// Validation occurs at send time; the sender is always constructed even if SMTP_HOST is empty
+	// (the send_invite handler will log a warning and skip the send if config is incomplete).
+	emailSender := email.NewSender(email.Config{
+		Host:     cfg.SMTPHost,
+		Port:     cfg.SMTPPort,
+		Username: cfg.SMTPUsername,
+		Password: cfg.SMTPPassword, // never logged
+		From:     cfg.SMTPFrom,
+	})
 
 	// Valkey client — used for the distributed reconcile lock (SEC-M5-002).
 	rdb := redis.NewClient(&redis.Options{
@@ -85,16 +82,14 @@ func main() {
 	})
 	defer rdb.Close() //nolint:errcheck
 
-	// M3/M5: reconcile engine — desired-state vs real Discord diff and repair (§4.2).
+	// M6: reconcile engine — role-based diff and repair (AC-M6-8).
 	// fix(SEC-M5-002): use NewEngineWithLocker so concurrent scheduled sweeps acquire a
 	// per-space lock before reconciling, preventing doubled Discord calls.
 	// fix(AC-2): WithMetrics so the guild sweep updates hub_active_spaces_total each run.
-	reconcileEngine := reconcile.NewEngineWithLocker(pg, discordSession, lock.New(rdb)).
+	reconcileEngine := reconcile.NewEngineWithLocker(pg, discordSession, cfg.DiscordGuildID, lock.New(rdb)).
 		WithMetrics(metrics)
 
 	// M5: wire the asynq Scheduler for the scheduled full-guild reconcile sweep (AC-5).
-	// The scheduler enqueues a reconcile:guild task on the low-priority reconcile queue at
-	// the cron interval from config (default every 5 minutes). An empty cron disables it.
 	if cfg.ReconcileSweepCron != "" {
 		scheduler, schedErr := worker.NewScheduler(
 			cfg.ValkeyAddr, cfg.ValkeyPassword, cfg.ValkeyDB,
@@ -113,11 +108,7 @@ func main() {
 		defer scheduler.Stop()
 	}
 
-	// fix(outbox-relay): wire the transactional outbox relay so pending outbox rows are
-	// actually enqueued as asynq tasks. Without this, CreateSpaceWithOutbox writes the row
-	// but no task is ever created → the provision worker sits idle → no Discord channel.
-	// The relay polls every 2 s (RelayConfig default), stamps enqueued_at, and stops cleanly
-	// when the context is cancelled (i.e. on SIGINT/SIGTERM).
+	// Transactional outbox relay — enqueues pending outbox rows as asynq tasks (NFR-3).
 	relayCtx, relayCancel := context.WithCancel(ctx)
 	queueClient := queue.NewClient(cfg.ValkeyAddr, cfg.ValkeyPassword, cfg.ValkeyDB)
 	defer func() {
@@ -127,7 +118,6 @@ func main() {
 	relay := worker.NewRelay(worker.RelayConfig{
 		Store:       pg,
 		QueueClient: queueClient,
-		// PollInterval and BatchSize use the NewRelay defaults (2 s / 100).
 	})
 	go func() {
 		slog.Info("outbox relay: starting")
@@ -136,24 +126,22 @@ func main() {
 	}()
 
 	// Build and start the asynq server.
-	// fix(NFR-5): AgentRoleID and DefaultCategoryID are now wired so the provision handler
-	// uses the real Agent role (not @everyone) and can apply the category allow consistently.
-	// fix(AC-5): AgentNicknameSuffix wired so AGENT_NICKNAME_SUFFIX env var can enable
-	// nickname marking at runtime (was always disabled regardless of env var).
 	srv := worker.New(worker.Config{
-		RedisAddr:           cfg.ValkeyAddr,
-		RedisPassword:       cfg.ValkeyPassword,
-		RedisDB:             cfg.ValkeyDB,
-		Concurrency:         cfg.WorkerConcurrency,
-		Store:               pg,
-		DiscordClient:       discordSession,
-		DiscordGuildID:      cfg.DiscordGuildID,
-		AgentRoleID:         cfg.DiscordAgentRoleID,
-		DefaultCategoryID:   cfg.DiscordCategoryID,
-		TokenStore:          tokenStore,
-		ReconcileEngine:     reconcileEngine,
-		AgentNicknameSuffix: cfg.AgentNicknameSuffix,
-		Metrics:             metrics, // fix(AC-2): wire real metrics to provision worker
+		RedisAddr:             cfg.ValkeyAddr,
+		RedisPassword:         cfg.ValkeyPassword,
+		RedisDB:               cfg.ValkeyDB,
+		Concurrency:           cfg.WorkerConcurrency,
+		Store:                 pg,
+		DiscordClient:         discordSession,
+		DiscordGuildID:        cfg.DiscordGuildID,
+		AgentRoleID:           cfg.DiscordAgentRoleID,
+		DefaultCategoryID:     cfg.DiscordCategoryID,
+		ReconcileEngine:       reconcileEngine,
+		AgentNicknameSuffix:   cfg.AgentNicknameSuffix,
+		Metrics:               metrics,
+		EmailSender:           emailSender,           // AC-M6-5
+		WelcomeChannelName:    cfg.WelcomeChannelName, // AC-M6-7
+		WelcomeChannelMessage: cfg.WelcomeMessage,     // AC-M6-7
 	})
 
 	// Start the worker in a goroutine; it blocks until Shutdown is called.

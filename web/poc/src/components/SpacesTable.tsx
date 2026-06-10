@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { MoreHorizontal, RefreshCw } from 'lucide-react'
+import { MoreHorizontal, RefreshCw, ExternalLink } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
@@ -18,7 +18,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { type ApiConfig, type Space, type SpaceLifecycleState, type AclState } from '@/lib/api'
+import { type ApiConfig, type Space, type SpaceLifecycleState, type AclState, type Merchant } from '@/lib/api'
 import { InviteCollaboratorDialog } from '@/components/InviteCollaboratorDialog'
 import { MembersDialog } from '@/components/MembersDialog'
 import { LifecycleDialog } from '@/components/LifecycleDialog'
@@ -30,6 +30,7 @@ interface SpacesTableProps {
   apiConfig: ApiConfig
   onRefresh: () => void
   onChanged: () => void
+  merchants?: Merchant[]
 }
 
 function lifecycleBadgeVariant(state: SpaceLifecycleState) {
@@ -64,10 +65,16 @@ export function SpacesTable({
   apiConfig,
   onRefresh,
   onChanged,
+  merchants = [],
 }: SpacesTableProps) {
   const [inviteSpace, setInviteSpace] = useState<Space | null>(null)
   const [membersSpace, setMembersSpace] = useState<Space | null>(null)
   const [lifecycleSpace, setLifecycleSpace] = useState<Space | null>(null)
+
+  function getMerchantInviteLinkSet(merchantId: string): boolean {
+    const merchant = merchants.find((m) => m.id === merchantId)
+    return merchant ? Boolean(merchant.invite_link) : true
+  }
 
   return (
     <div>
@@ -118,7 +125,22 @@ export function SpacesTable({
               {spaces.map((space) => (
                 <TableRow key={space.id}>
                   <TableCell className="font-medium">
-                    {space.name}
+                    <div className="flex items-center gap-2">
+                      <span>{space.name}</span>
+                      {/* AC-M7-2: "Open in Discord" deep link — navigation only, no message read */}
+                      {space.discord_deep_link && (
+                        <a
+                          href={space.discord_deep_link}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title="Open in Discord"
+                          className="text-slate-400 hover:text-indigo-600 transition-colors"
+                        >
+                          <ExternalLink className="h-3.5 w-3.5" />
+                          <span className="sr-only">Open in Discord</span>
+                        </a>
+                      )}
+                    </div>
                     {space.discord_channel_id && (
                       <div className="text-xs text-slate-400 mt-0.5 font-normal">
                         #{space.discord_channel_id}
@@ -157,12 +179,27 @@ export function SpacesTable({
                           View Members
                         </DropdownMenuItem>
                         <DropdownMenuItem onClick={() => setInviteSpace(space)}>
-                          Invite Collaborator
+                          Register Collaborator
                         </DropdownMenuItem>
                         <DropdownMenuSeparator />
                         <DropdownMenuItem onClick={() => setLifecycleSpace(space)}>
                           Change Lifecycle
                         </DropdownMenuItem>
+                        {space.discord_deep_link && (
+                          <>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem asChild>
+                              <a
+                                href={space.discord_deep_link}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                              >
+                                <ExternalLink className="h-3.5 w-3.5 mr-2" />
+                                Open in Discord
+                              </a>
+                            </DropdownMenuItem>
+                          </>
+                        )}
                       </DropdownMenuContent>
                     </DropdownMenu>
                   </TableCell>
@@ -180,6 +217,7 @@ export function SpacesTable({
           spaceId={inviteSpace.id}
           spaceName={inviteSpace.name}
           apiConfig={apiConfig}
+          merchantInviteLinkSet={getMerchantInviteLinkSet(inviteSpace.merchant_id)}
         />
       )}
 
@@ -190,6 +228,7 @@ export function SpacesTable({
           spaceId={membersSpace.id}
           spaceName={membersSpace.name}
           apiConfig={apiConfig}
+          merchantInviteLinkSet={getMerchantInviteLinkSet(membersSpace.merchant_id)}
         />
       )}
 

@@ -14,7 +14,6 @@
 //	export DISCORD_CATEGORY_ID=<category-id>
 //	export POSTGRES_DSN=<dsn>
 //	export VALKEY_ADDR=localhost:6379
-//	export ENCRYPTION_KEY=<base64-32-bytes>
 //	go test -v -tags integration ./test/integration/...
 //
 // The suite runs the M3 multi-tenant isolation suite live as the release gate (NFR-16).
@@ -32,7 +31,6 @@ import (
 	"github.com/valianx/discord-support-hub/internal/config"
 	"github.com/valianx/discord-support-hub/internal/discord"
 	"github.com/valianx/discord-support-hub/internal/reconcile"
-	"github.com/valianx/discord-support-hub/internal/secrets"
 	pgstore "github.com/valianx/discord-support-hub/internal/store/postgres"
 )
 
@@ -46,7 +44,6 @@ func requireGuildEnv(t *testing.T) {
 		"TEST_GUILD_ID",
 		"DISCORD_AGENT_ROLE_ID",
 		"POSTGRES_DSN",
-		"ENCRYPTION_KEY",
 	} {
 		if os.Getenv(v) == "" {
 			missing = append(missing, v)
@@ -98,7 +95,7 @@ func TestLive_ReconcileGuild_Smoke(t *testing.T) {
 	pg, disc, teardown := newLiveClients(t)
 	defer teardown()
 
-	engine := reconcile.NewEngine(pg, disc)
+	engine := reconcile.NewEngine(pg, disc, guildID)
 	if err := engine.ReconcileGuild(context.Background(), guildID); err != nil {
 		t.Errorf("ReconcileGuild smoke: unexpected error: %v", err)
 	}
@@ -122,7 +119,7 @@ func TestLive_IsolationSuite_MultiTenant(t *testing.T) {
 	pg, disc, teardown := newLiveClients(t)
 	defer teardown()
 
-	engine := reconcile.NewEngine(pg, disc)
+	engine := reconcile.NewEngine(pg, disc, guildID)
 
 	// Full-guild sweep against the real guild. The test guild should have zero active spaces
 	// on first run (no provisioned spaces), so this is a no-op sweep that confirms connectivity.
@@ -132,34 +129,16 @@ func TestLive_IsolationSuite_MultiTenant(t *testing.T) {
 	t.Log("live isolation sweep complete — guild is in a consistent state")
 }
 
-// TestLive_EncryptionKey_Valid verifies the ENCRYPTION_KEY decodes to 32 bytes (AES-256).
-// Fails loudly on misconfiguration so the operator is aware before running any test that
-// stores OAuth2 tokens (NFR-6).
-func TestLive_EncryptionKey_Valid(t *testing.T) {
+// TestLive_ConfigLoads verifies that config.Load succeeds when required env vars are present.
+// M6: ENCRYPTION_KEY removed (AES-GCM OAuth token store deleted, AC-M6-9).
+func TestLive_ConfigLoads(t *testing.T) {
 	requireGuildEnv(t)
 
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatalf("config load: %v", err)
 	}
-	if err := cfg.ValidateEncryptionKey(); err != nil {
-		t.Fatalf("ENCRYPTION_KEY validation failed: %v", err)
-	}
-	// Smoke-test the encrypter round-trip.
-	enc, err := secrets.NewEncrypter(cfg.EncryptionKey, 1)
-	if err != nil {
-		t.Fatalf("NewEncrypter: %v", err)
-	}
-	plaintext := []byte("live-integration-test-plaintext")
-	ev, err := enc.Encrypt(plaintext)
-	if err != nil {
-		t.Fatalf("Encrypt: %v", err)
-	}
-	decrypted, err := enc.Decrypt(ev)
-	if err != nil {
-		t.Fatalf("Decrypt: %v", err)
-	}
-	if string(decrypted) != string(plaintext) {
-		t.Errorf("round-trip mismatch: got %q", decrypted)
+	if cfg.DiscordBotToken == "" {
+		t.Error("DISCORD_BOT_TOKEN must be set for live suite")
 	}
 }

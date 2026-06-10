@@ -346,7 +346,7 @@ postgresListFallback:
 
 	items := make([]spaceResponse, 0, len(spaces))
 	for _, sp := range spaces {
-		items = append(items, toSpaceResponse(sp))
+		items = append(items, h.toSpaceResponse(sp))
 	}
 
 	var nextCursor *string
@@ -417,7 +417,7 @@ func (h *Handlers) GetSpace(c *gin.Context) {
 		return
 	}
 
-	resp := toSpaceResponse(sp)
+	resp := h.toSpaceResponse(sp)
 
 	// Write to cache.
 	if b, err := json.Marshal(resp); err == nil {
@@ -679,6 +679,10 @@ func (h *Handlers) SyncWelcome(c *gin.Context) {
 
 // ─── Response types ──────────────────────────────────────────────────────────
 
+// discordDeepLinkBase is the Discord channel deep-link URL prefix (AC-M7-2).
+// The full link is https://discord.com/channels/{guildId}/{channelId}.
+const discordDeepLinkBase = "https://discord.com/channels/"
+
 // spaceResponse is the JSON shape defined by the OpenAPI Space schema.
 type spaceResponse struct {
 	ID                string  `json:"id"`
@@ -691,9 +695,23 @@ type spaceResponse struct {
 	LastActivityAt    *string `json:"last_activity_at,omitempty"`
 	CreatedAt         string  `json:"created_at"`
 	ArchivedAt        *string `json:"archived_at,omitempty"`
+	// DiscordDeepLink is a computed convenience field for the console (AC-M7-2).
+	// Emitted only when both the guild id (server config) and the channel id (provisioned) are set.
+	DiscordDeepLink *string `json:"discord_deep_link,omitempty"`
 }
 
-func toSpaceResponse(sp *domain.Space) spaceResponse {
+// buildDeepLink returns the Discord channel deep-link URL when both guildID and channelID are
+// non-empty, or nil otherwise. The frontend uses this to open the conversation directly in Discord
+// without the hub ever reading message content (AC-M7-2).
+func buildDeepLink(guildID, channelID string) *string {
+	if guildID == "" || channelID == "" {
+		return nil
+	}
+	link := discordDeepLinkBase + guildID + "/" + channelID
+	return &link
+}
+
+func (h *Handlers) toSpaceResponse(sp *domain.Space) spaceResponse {
 	r := spaceResponse{
 		ID:                sp.ID,
 		MerchantID:        sp.MerchantID,
@@ -711,6 +729,10 @@ func toSpaceResponse(sp *domain.Space) spaceResponse {
 	if sp.ArchivedAt != nil {
 		s := sp.ArchivedAt.UTC().Format(time.RFC3339)
 		r.ArchivedAt = &s
+	}
+	// AC-M7-2: compute the deep link from server-side guild id + provisioned channel id.
+	if sp.DiscordChannelID != nil {
+		r.DiscordDeepLink = buildDeepLink(h.guildID, *sp.DiscordChannelID)
 	}
 	return r
 }

@@ -123,8 +123,7 @@ func (h *Handlers) AddAgent(c *gin.Context) {
 		}
 	}
 
-	connectURL := buildDiscordOAuthURL(h.discordOAuthClientID, h.discordOAuthRedirectURL, user.ID)
-
+	// M6: connect_url (OAuth2) removed (AC-M6-9). Agents join via Discord invite link.
 	resp := gin.H{
 		"id":              user.ID,
 		"type":            user.Type,
@@ -135,7 +134,6 @@ func (h *Handlers) AddAgent(c *gin.Context) {
 		"provisioned_at":  user.ProvisionedAt,
 		"is_active":       user.IsActive,
 		"created_at":      user.CreatedAt,
-		"connect_url":     connectURL,
 	}
 	c.JSON(http.StatusCreated, resp)
 }
@@ -246,15 +244,3 @@ func toAgentResponse(u *domain.User) agentResponse {
 	}
 }
 
-// buildDiscordOAuthURL constructs the "Connect with Discord" authorize URL.
-// The state parameter is the agent's hub user ID (M1 simplified; M3 adds HMAC signing).
-// TODO(M3): replace the state with an HMAC-signed, single-use token (CSRF protection).
-func buildDiscordOAuthURL(clientID, redirectURL, stateUserID string) string {
-	if clientID == "" || redirectURL == "" {
-		return ""
-	}
-	return fmt.Sprintf(
-		"https://discord.com/api/oauth2/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=identify%%20guilds.join&state=%s",
-		clientID, redirectURL, stateUserID,
-	)
-}

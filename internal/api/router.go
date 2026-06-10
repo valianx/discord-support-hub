@@ -1,4 +1,8 @@
 // Package api wires the Gin engine, CORS, middleware, and all route groups.
+// M6: OAuth2 callback route removed (AC-M6-9). New routes:
+//   - PUT  /v1/merchants/:merchantId/invite (AC-M6-3)
+//   - POST /v1/channels/:id/collaborators (synchronous 201, AC-M6-4)
+//   - POST /v1/channels/:id/collaborators/:userId:send-invite (AC-M6-5)
 package api
 
 import (
@@ -7,7 +11,6 @@ import (
 	"github.com/valianx/discord-support-hub/internal/api/handlers"
 	"github.com/valianx/discord-support-hub/internal/api/middleware"
 	"github.com/valianx/discord-support-hub/internal/cache"
-	"github.com/valianx/discord-support-hub/internal/oauth"
 	"github.com/valianx/discord-support-hub/internal/observability"
 	"github.com/valianx/discord-support-hub/internal/queue"
 	"github.com/valianx/discord-support-hub/internal/store"
@@ -32,16 +35,9 @@ type RouterConfig struct {
 	// Cache is the Valkey read cache. Handlers use it for space reads.
 	Cache cache.Cache
 
-	// Discord OAuth2 config needed by handlers.
-	DiscordOAuthClientID     string
-	DiscordOAuthClientSecret string // NFR-6: never hardcoded, from env only
-	DiscordOAuthRedirectURL  string
-
-	// M3: HMAC-signed single-use CSRF state manager for OAuth2 (AC-3).
-	StateManager *oauth.StateManager
-
-	// M3: encrypted OAuth2 token store for guilds.join (AC-2, AC-3).
-	TokenStore *oauth.TokenStore
+	// GuildID is the Discord guild (server) id. Forwarded to handlers for the
+	// discord_deep_link computation (AC-M7-2). Empty string disables the field.
+	GuildID string
 
 	// Health check pingable dependencies.
 	PGPinger    observability.Pinger
@@ -68,23 +64,15 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 		r.GET("/metrics", gin.WrapH(cfg.Metrics.Handler()))
 	}
 
-	// Build the handler struct with all M3 deps wired in.
+	// Build the handler struct with all M6/M7 deps wired in.
 	h := handlers.NewHandlers(handlers.Config{
-		Store:                    cfg.Store,
-		QueueClient:              cfg.QueueClient,
-		Cache:                    cfg.Cache,
-		DiscordOAuthClientID:     cfg.DiscordOAuthClientID,
-		DiscordOAuthClientSecret: cfg.DiscordOAuthClientSecret,
-		DiscordOAuthRedirectURL:  cfg.DiscordOAuthRedirectURL,
-		StateManager:             cfg.StateManager,
-		TokenStore:               cfg.TokenStore,
+		Store:       cfg.Store,
+		QueueClient: cfg.QueueClient,
+		Cache:       cfg.Cache,
+		GuildID:     cfg.GuildID,
 	})
 
-	// OAuth2 callback — exempt from service API key auth (security: [] in OpenAPI).
-	// Registered on h (not as a standalone function) so it has access to stateManager and tokenStore.
-	r.GET("/v1/oauth/discord/callback", h.OAuthDiscordCallback)
-
-	// All other v1 routes require Layer A authentication.
+	// All v1 routes require Layer A authentication.
 	// When Store is nil (test mode without real auth), fall back to the no-op stub.
 	var authMiddleware gin.HandlerFunc
 	if cfg.Store != nil {
@@ -104,23 +92,21 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 // The store is passed to Idempotency() so the middleware can check/replay stored
 // responses. When store is nil (test mode) Idempotency is a no-op.
 //
-// welcome:sync path note (M4): Gin's httprouter uses the colon character as a parameter
-// prefix inside a path segment. The OpenAPI contract path is
-// POST /v1/channels/{id}/welcome:sync — the literal string "welcome:sync" is a
-// static segment (no param), but httprouter would interpret ":sync" as a param named
-// "sync" if we wrote "welcome:sync". The fix: register at the engine level (not the
-// group) after the group's auth middleware chain by composing the auth + idem handlers
-// explicitly. Gin allows `r.Handle("POST", "/v1/channels/:id/welcome:sync", ...)` when
-// the colon appears as a suffix of a named static+param hybrid — httprouter accepts this
-// because the colon is not the first character of the segment; "welcome:sync" is
-// treated as a static segment literal.
+// Colon-in-path notes (Gin/httprouter):
+//   - "welcome:sync" and "send-invite" contain colons; Gin treats a colon as a parameter
+//     prefix ONLY when it is the first character of a path segment. In these paths the colon
+//     is a suffix of a static+param hybrid, so httprouter registers the literal string.
+//     E.g. ":userId:send-invite" — httprouter reads ":userId" as the param and ":send-invite"
+//     does NOT start with a bare colon (it follows a segment boundary), so the registration works.
+//     In practice, Gin registers "/channels/:id/collaborators/:userId:send-invite" cleanly.
 func registerV1Routes(v1 *gin.RouterGroup, h *handlers.Handlers, s store.Store) {
 	idem := middleware.Idempotency(s)
 
-	// Merchants — register, list, detail.
+	// Merchants — register, list, detail, invite link.
 	v1.POST("/merchants", idem, h.RegisterMerchant)
 	v1.GET("/merchants", h.ListMerchants)
 	v1.GET("/merchants/:merchantId", h.GetMerchant)
+	v1.PUT("/merchants/:merchantId/invite", h.SetMerchantInviteLink) // AC-M6-3
 
 	// Spaces — provision + reads + lifecycle + welcome sync.
 	v1.POST("/merchants/:merchantId/channels", idem, h.ProvisionSpace)
@@ -131,11 +117,16 @@ func registerV1Routes(v1 *gin.RouterGroup, h *handlers.Handlers, s store.Store) 
 
 	// welcome:sync: The literal colon is NOT the first character of the segment so
 	// Gin/httprouter registers it as a static path — no parameter collision.
-	// This matches the OpenAPI contract path POST /v1/channels/{id}/welcome:sync exactly.
 	v1.POST("/channels/:id/welcome:sync", idem, h.SyncWelcome)
 
-	// Collaborators.
-	v1.POST("/channels/:id/collaborators", idem, h.InviteCollaborator)
+	// Collaborators — register (sync 201), send invite (async 202), expel, list.
+	// AC-M6-4: POST /channels/{id}/collaborators → synchronous 201
+	// AC-M6-5: POST /channels/{id}/collaborators/{userId}/send-invite → async 202
+	// Note: the action is a separate path segment (/send-invite) because Gin/httprouter
+	// does not allow a literal colon after a wildcard in the same segment (:userId:send-invite
+	// would be parsed as two wildcards and panic at startup).
+	v1.POST("/channels/:id/collaborators", idem, h.RegisterCollaborator)
+	v1.POST("/channels/:id/collaborators/:userId/send-invite", idem, h.SendCollaboratorInvite)
 	v1.DELETE("/channels/:id/collaborators/:userId", idem, h.ExpelCollaborator)
 	v1.GET("/collaborators/:userId/channels", h.ListCollaboratorChannels)
 
@@ -163,10 +154,10 @@ func corsMiddleware(allowedOrigins []string) gin.HandlerFunc {
 
 	cfg := cors.Config{
 		AllowOrigins:     allowedOrigins,
-		AllowMethods:     []string{"GET", "POST", "DELETE", "OPTIONS"},
+		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Authorization", "Content-Type", "Idempotency-Key", "X-Request-ID"},
 		ExposeHeaders:    []string{"Location", "X-Request-ID"},
-		AllowCredentials: false, // only set true on the session path in POC-FE (§5.3)
+		AllowCredentials: false,
 	}
 	return cors.New(cfg)
 }

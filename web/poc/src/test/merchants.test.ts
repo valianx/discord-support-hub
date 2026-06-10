@@ -8,7 +8,6 @@ import {
 
 const config: ApiConfig = {
   baseUrl: 'http://localhost:8080',
-  apiKey: 'test-key-abc123',
 }
 
 const mockMerchant = {
@@ -25,7 +24,7 @@ describe('registerMerchant', () => {
     vi.restoreAllMocks()
   })
 
-  it('POSTs to /v1/merchants with bearer token and JSON body', async () => {
+  it('POSTs to /v1/merchants with JSON body and no client Authorization header', async () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 201,
@@ -42,9 +41,8 @@ describe('registerMerchant', () => {
     const [url, options] = mockFetch.mock.calls[0] as [string, RequestInit]
     expect(url).toBe('http://localhost:8080/v1/merchants')
     expect(options.method).toBe('POST')
-    expect((options.headers as Record<string, string>)['Authorization']).toBe(
-      `Bearer ${config.apiKey}`
-    )
+    // Authorization is injected by the nginx proxy — the client must NOT send it.
+    expect((options.headers as Record<string, string>)['Authorization']).toBeUndefined()
     expect((options.headers as Record<string, string>)['Content-Type']).toBe('application/json')
     expect(JSON.parse(options.body as string)).toEqual({
       external_ref: 'acme-corp',

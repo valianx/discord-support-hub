@@ -217,27 +217,124 @@ func (h *Handlers) GetMerchant(c *gin.Context) {
 	c.JSON(http.StatusOK, toMerchantResponse(m))
 }
 
+// ─── SetMerchantInviteLink ────────────────────────────────────────────────────
+
+// setMerchantInviteLinkRequest is the JSON body for PUT /merchants/{merchantId}/invite.
+type setMerchantInviteLinkRequest struct {
+	InviteLink string `json:"invite_link"`
+}
+
+// discordInviteURLPrefixes are the accepted Discord invite URL schemes (AC-M6-3).
+// Both the canonical short form and the full form are accepted.
+var discordInviteURLPrefixes = []string{
+	"https://discord.gg/",
+	"https://discord.com/invite/",
+}
+
+// SetMerchantInviteLink handles PUT /merchants/{merchantId}/invite (AC-M6-3).
+//
+// Control-plane gated. Stores the native Discord invite-with-role URL for a merchant.
+// Validates that the URL is a Discord invite URL. Returns 200 with the updated merchant.
+func (h *Handlers) SetMerchantInviteLink(c *gin.Context) {
+	if h.store == nil {
+		notImplemented(c)
+		return
+	}
+
+	p := middleware.GetPrincipal(c)
+	if !authz.RequireControlPlane(p) {
+		forbidden(c)
+		return
+	}
+
+	merchantID, ok := parseUUIDParam(c, "merchantId")
+	if !ok {
+		return
+	}
+
+	var req setMerchantInviteLinkRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "validation_error", "message": err.Error()})
+		return
+	}
+
+	if req.InviteLink == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "validation_error", "message": "invite_link is required"})
+		return
+	}
+
+	if msg := validateDiscordInviteURL(req.InviteLink); msg != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "validation_error", "message": msg})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	m, err := h.store.SetMerchantInviteLink(ctx, merchantID, req.InviteLink)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"code": "not_found", "message": "merchant not found"})
+			return
+		}
+		slog.ErrorContext(ctx, "set merchant invite link: store error", "merchant_id", merchantID, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": "could not store invite link"})
+		return
+	}
+
+	c.JSON(http.StatusOK, toMerchantResponse(m))
+}
+
+// validateDiscordInviteURL returns a non-empty error message when rawURL is not a
+// valid Discord invite URL (AC-M6-3).
+func validateDiscordInviteURL(rawURL string) string {
+	for _, prefix := range discordInviteURLPrefixes {
+		if strings.HasPrefix(rawURL, prefix) {
+			code := rawURL[len(prefix):]
+			if code == "" {
+				return "invite_link must include an invite code after the Discord host"
+			}
+			// Invite codes are alphanumeric + hyphens, typically 5–20 chars.
+			for _, ch := range code {
+				if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-') {
+					return "invite_link contains invalid characters in the invite code"
+				}
+			}
+			return ""
+		}
+	}
+	return "invite_link must be a Discord invite URL (https://discord.gg/... or https://discord.com/invite/...)"
+}
+
 // ─── Response type ────────────────────────────────────────────────────────────
 
 // merchantResponse is the JSON shape defined by the OpenAPI Merchant schema.
+// invite_link is included when set (AC-M6-3).
 type merchantResponse struct {
-	ID          string  `json:"id"`
-	ExternalRef string  `json:"external_ref"`
-	Name        string  `json:"name"`
-	HelpDeskURL *string `json:"help_desk_url"`
-	IsActive    bool    `json:"is_active"`
-	CreatedAt   string  `json:"created_at"`
+	ID              string  `json:"id"`
+	ExternalRef     string  `json:"external_ref"`
+	Name            string  `json:"name"`
+	HelpDeskURL     *string `json:"help_desk_url,omitempty"`
+	InviteLink      *string `json:"invite_link,omitempty"`
+	InviteLinkSetAt *string `json:"invite_link_set_at,omitempty"`
+	IsActive        bool    `json:"is_active"`
+	CreatedAt       string  `json:"created_at"`
 }
 
 func toMerchantResponse(m *domain.Merchant) merchantResponse {
-	return merchantResponse{
+	r := merchantResponse{
 		ID:          m.ID,
 		ExternalRef: m.ExternalRef,
 		Name:        m.Name,
 		HelpDeskURL: m.HelpDeskURL,
+		InviteLink:  m.InviteLink,
 		IsActive:    m.IsActive,
 		CreatedAt:   m.CreatedAt.UTC().Format(time.RFC3339),
 	}
+	if m.InviteLinkSetAt != nil {
+		s := m.InviteLinkSetAt.UTC().Format(time.RFC3339)
+		r.InviteLinkSetAt = &s
+	}
+	return r
 }
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────

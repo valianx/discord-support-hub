@@ -148,6 +148,8 @@ func queueForKind(kind string) string {
 		return queue.QueueReconcile
 	case queue.KindSyncWelcome, queue.KindApplyNicknameSuffix:
 		return queue.QueueMarking
+	case queue.KindSendInvite:
+		return queue.QueueNotify // AC-M6-6: notify queue is isolated from provision/membership
 	default:
 		return queue.QueueProvision // safe default
 	}

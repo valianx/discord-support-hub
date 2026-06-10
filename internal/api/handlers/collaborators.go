@@ -1,11 +1,12 @@
-// collaborators.go implements the collaborator membership handlers (M3).
+// collaborators.go implements the collaborator membership handlers (M6 onboarding pivot).
 //
-// All three endpoints are control-plane gated (RequireControlPlane).
+// All endpoints are control-plane gated (RequireControlPlane).
 // Collaborators themselves can never reach invite/expel (FR-20, AC-4).
 //
-// Invite: POST /channels/{id}/collaborators
-// Expel:  DELETE /channels/{id}/collaborators/{userId}?scope=channel|server
-// List:   GET /collaborators/{userId}/channels
+// RegisterCollaborator: POST /channels/{id}/collaborators (synchronous 201, AC-M6-4)
+// SendCollaboratorInvite: POST /channels/{id}/collaborators/{userId}:send-invite (202, AC-M6-5)
+// ExpelCollaborator: DELETE /channels/{id}/collaborators/{userId}
+// ListCollaboratorChannels: GET /collaborators/{userId}/channels
 package handlers
 
 import (
@@ -26,25 +27,22 @@ import (
 	"github.com/valianx/discord-support-hub/internal/store"
 )
 
-// ─── InviteCollaborator ───────────────────────────────────────────────────────
+// ─── RegisterCollaborator ─────────────────────────────────────────────────────
 
-// inviteCollaboratorRequest is the JSON body for POST /channels/{id}/collaborators.
-// At least one of user_id, discord_user_id, or email must be non-empty (OpenAPI anyOf).
-type inviteCollaboratorRequest struct {
-	UserID        string  `json:"user_id"`
-	DiscordUserID string  `json:"discord_user_id"`
-	Email         string  `json:"email"`
-	DisplayName   *string `json:"display_name"`
+// registerCollaboratorRequest is the JSON body for POST /channels/{id}/collaborators (AC-M6-4).
+// Requires name and email; no Discord identity needed at registration time.
+type registerCollaboratorRequest struct {
+	Name  string `json:"name"`
+	Email string `json:"email"`
 }
 
-// InviteCollaborator handles POST /channels/{id}/collaborators (FR-4, AC-2, AC-4).
+// RegisterCollaborator handles POST /channels/{id}/collaborators (AC-M6-4).
 //
-// Control-plane gated. Only Agents/Admins may invite (FR-20) — collaborators cannot (AC-4).
-// Accepts user_id, discord_user_id, or email to identify the collaborator; creates the user
-// row when identified by discord_user_id or email and no matching user exists.
-// Records the desired space_member row and enqueues an invite_collaborator job.
-// Returns 202 + connect_url if the user must connect Discord first (AC-2).
-func (h *Handlers) InviteCollaborator(c *gin.Context) {
+// Control-plane gated. Accepts {name, email} only — no Discord identity needed.
+// Creates the user row if no matching email exists.
+// Inserts the desired space_member row synchronously and returns 201.
+// No async task is enqueued here; the operator calls :send-invite separately.
+func (h *Handlers) RegisterCollaborator(c *gin.Context) {
 	if h.store == nil {
 		notImplemented(c)
 		return
@@ -62,30 +60,123 @@ func (h *Handlers) InviteCollaborator(c *gin.Context) {
 		return
 	}
 
-	var req inviteCollaboratorRequest
+	var req registerCollaboratorRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "validation_error", "message": err.Error()})
 		return
 	}
 
-	// OpenAPI anyOf: at least one identifier must be provided.
-	if req.UserID == "" && req.DiscordUserID == "" && req.Email == "" {
+	if req.Name == "" || req.Email == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"code":    "validation_error",
-			"message": "one of user_id, discord_user_id, or email is required",
+			"message": "name and email are required",
 		})
 		return
 	}
 
-	// Input hygiene — validated before any store call.
-	if msg := validateInviteInputs(&req); msg != "" {
+	if msg := validateEmailFormat(req.Email); msg != "" {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "validation_error", "message": msg})
+		return
+	}
+
+	if msg := rejectUnsafeRunes(req.Name); msg != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "validation_error", "message": "name " + msg})
 		return
 	}
 
 	ctx := c.Request.Context()
 
 	// Verify space exists.
+	if _, err := h.store.GetSpaceByID(ctx, spaceID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"code": "not_found", "message": "space not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": "failed to load space"})
+		return
+	}
+
+	// Resolve or create the collaborator user by email.
+	displayName := req.Name
+	user, httpStatus, resolveMsg := resolveOrCreateByEmailWithName(ctx, h.store, req.Email, &displayName)
+	if resolveMsg != "" {
+		c.JSON(httpStatus, gin.H{"code": "internal_error", "message": resolveMsg})
+		return
+	}
+
+	invitedBy := p.UserID
+
+	// Insert the desired space_member row (idempotent on conflict).
+	sm, smErr := h.store.CreateSpaceMember(ctx, store.CreateSpaceMemberParams{
+		SpaceID:   spaceID,
+		UserID:    user.ID,
+		Role:      domain.SpaceMemberRoleCollaborator,
+		InvitedBy: nilIfEmpty(invitedBy),
+	})
+	if smErr != nil {
+		if errors.Is(smErr, store.ErrConflict) {
+			// Already registered — fetch and return the existing row.
+			sm, smErr = h.store.GetSpaceMemberBySpaceAndUser(ctx, spaceID, user.ID)
+			if smErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": "failed to load existing membership"})
+				return
+			}
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": "failed to record membership"})
+			return
+		}
+	}
+
+	// Write audit entry.
+	_ = h.store.InsertAuditEntry(ctx, store.InsertAuditEntryParams{
+		Action:       "collaborator.register",
+		SpaceID:      &spaceID,
+		TargetUserID: &user.ID,
+		ActorUserID:  nilIfEmpty(invitedBy),
+		Detail: map[string]any{
+			"email": req.Email, // email in audit is acceptable (not a secret)
+		},
+	})
+
+	c.Header("Location", fmt.Sprintf("/v1/channels/%s/collaborators/%s", spaceID, user.ID))
+	c.JSON(http.StatusCreated, gin.H{
+		"space_member_id": sm.ID,
+		"space_id":        spaceID,
+		"user_id":         user.ID,
+		"role":            string(sm.Role),
+		"created_at":      sm.CreatedAt.UTC().Format(time.RFC3339),
+	})
+}
+
+// ─── SendCollaboratorInvite ───────────────────────────────────────────────────
+
+// SendCollaboratorInvite handles POST /channels/{id}/collaborators/{userId}:send-invite (AC-M6-5).
+//
+// Control-plane gated. Enqueues a KindSendInvite task on the notify queue.
+// Returns 409 when the merchant has no invite link stored (AC-M6-5 precondition).
+// Returns 202 when the task is enqueued.
+func (h *Handlers) SendCollaboratorInvite(c *gin.Context) {
+	if h.store == nil {
+		notImplemented(c)
+		return
+	}
+
+	p := middleware.GetPrincipal(c)
+	if !authz.RequireControlPlane(p) {
+		forbidden(c)
+		return
+	}
+
+	spaceID := c.Param("id")
+	userID := c.Param("userId")
+	if spaceID == "" || userID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "validation_error", "message": "space id and user id are required"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Load space to get the merchant id.
 	sp, err := h.store.GetSpaceByID(ctx, spaceID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -95,59 +186,49 @@ func (h *Handlers) InviteCollaborator(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": "failed to load space"})
 		return
 	}
-	_ = sp // existence verification only
 
-	// Resolve the collaborator user via the three-path lookup / create flow.
-	user, httpStatus, resolveMsg := resolveOrCreateCollaborator(ctx, h.store, &req)
-	if resolveMsg != "" {
-		c.JSON(httpStatus, gin.H{"code": "not_found", "message": resolveMsg})
+	// Verify the merchant has an invite link stored (fail 409 if not — AC-M6-5).
+	merchant, err := h.store.GetMerchantByID(ctx, sp.MerchantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": "failed to load merchant"})
 		return
 	}
-	if user == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": "failed to resolve collaborator"})
-		return
-	}
-
-	invitedBy := p.UserID
-
-	// Insert the desired space_member row (idempotent on conflict).
-	_, smErr := h.store.CreateSpaceMember(ctx, store.CreateSpaceMemberParams{
-		SpaceID:   spaceID,
-		UserID:    user.ID,
-		Role:      domain.SpaceMemberRoleCollaborator,
-		InvitedBy: nilIfEmpty(invitedBy),
-	})
-	if smErr != nil && !errors.Is(smErr, store.ErrConflict) {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": "failed to record membership"})
+	if merchant.InviteLink == nil || *merchant.InviteLink == "" {
+		c.JSON(http.StatusConflict, gin.H{
+			"code":    "no_invite_link",
+			"message": "merchant has no invite link stored; set one via PUT /merchants/{id}/invite first",
+		})
 		return
 	}
 
-	// Build connect_url when the user has not yet linked their Discord account (AC-2).
-	var connectURL *string
-	if user.DiscordUserID == nil && h.stateManager != nil {
-		state, stateErr := h.stateManager.Issue(ctx, user.ID, h.discordOAuthRedirectURL)
-		if stateErr == nil {
-			cu := buildConnectURL(h.discordOAuthClientID, h.discordOAuthRedirectURL, state)
-			connectURL = &cu
+	// Verify the space_member exists.
+	sm, err := h.store.GetSpaceMemberBySpaceAndUser(ctx, spaceID, userID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"code": "not_found", "message": "collaborator not registered in this space"})
+			return
 		}
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": "failed to load space member"})
+		return
 	}
 
 	idemKey := middleware.GetIdempotencyKey(c)
 	if idemKey == "" {
-		idemKey = fmt.Sprintf("invite:%s:%s", spaceID, user.ID)
+		idemKey = fmt.Sprintf("send-invite:%s:%s", spaceID, userID)
 	}
 
 	jobID := uuid.New().String()
 	job, jobErr := h.store.CreateJob(ctx, store.CreateJobParams{
 		TaskID:  idemKey,
-		Kind:    queue.KindInviteCollaborator,
-		Queue:   queue.QueueMembership,
+		Kind:    queue.KindSendInvite,
+		Queue:   queue.QueueNotify,
 		SpaceID: &spaceID,
-		UserID:  &user.ID,
+		UserID:  &userID,
 		Payload: map[string]any{
-			"space_id":   spaceID,
-			"user_id":    user.ID,
-			"invited_by": invitedBy,
+			"space_member_id": sm.ID,
+			"space_id":        spaceID,
+			"user_id":         userID,
+			"merchant_id":     sp.MerchantID,
 		},
 	})
 	if jobErr == nil {
@@ -156,54 +237,31 @@ func (h *Handlers) InviteCollaborator(c *gin.Context) {
 
 	if h.queueClient != nil {
 		_, _ = h.queueClient.Enqueue(
-			queue.KindInviteCollaborator,
-			queue.QueueMembership,
-			queue.InviteCollaboratorPayload{
-				SpaceID:   spaceID,
-				UserID:    user.ID,
-				InvitedBy: invitedBy,
+			queue.KindSendInvite,
+			queue.QueueNotify,
+			queue.SendInvitePayload{
+				SpaceMemberID: sm.ID,
+				SpaceID:       spaceID,
+				UserID:        userID,
+				MerchantID:    sp.MerchantID,
 			},
 			queue.TaskIDOpt(idemKey),
 			queue.UniqueOpt(24*time.Hour),
 		)
 	}
 
-	respBody := map[string]any{
+	c.Header("Location", fmt.Sprintf("/v1/jobs/%s", jobID))
+	c.JSON(http.StatusAccepted, gin.H{
 		"job": map[string]any{
 			"id":          jobID,
-			"kind":        queue.KindInviteCollaborator,
+			"kind":        queue.KindSendInvite,
 			"status":      string(domain.JobStatusPending),
 			"space_id":    spaceID,
-			"user_id":     user.ID,
+			"user_id":     userID,
 			"retry_count": 0,
 			"created_at":  time.Now().UTC().Format(time.RFC3339),
 		},
-		"connect_url": connectURL,
-	}
-
-	c.Header("Location", fmt.Sprintf("/v1/jobs/%s", jobID))
-	c.JSON(http.StatusAccepted, respBody)
-}
-
-// validateInviteInputs runs input hygiene checks on a parsed invite request.
-// Returns a non-empty message when any field fails validation; empty string on success.
-func validateInviteInputs(req *inviteCollaboratorRequest) string {
-	if req.Email != "" {
-		if msg := validateEmailFormat(req.Email); msg != "" {
-			return msg
-		}
-	}
-	if req.DiscordUserID != "" {
-		if !isNumericSnowflake(req.DiscordUserID) {
-			return "discord_user_id must be a numeric snowflake"
-		}
-	}
-	if req.DisplayName != nil {
-		if msg := rejectUnsafeRunes(*req.DisplayName); msg != "" {
-			return "display_name " + msg
-		}
-	}
-	return ""
+	})
 }
 
 // validateEmailFormat performs a basic structural check on an email address.
@@ -217,7 +275,6 @@ func validateEmailFormat(email string) string {
 	if !strings.Contains(parts[1], ".") {
 		return "email is not a valid email address"
 	}
-	// Reject control characters in the email for the same reason as display_name.
 	for _, ch := range email {
 		if ch < 0x20 || ch == 0x7F || unicode.Is(unicode.Cf, ch) || unicode.Is(unicode.Co, ch) {
 			return "email contains disallowed characters"
@@ -240,84 +297,15 @@ func isNumericSnowflake(s string) bool {
 	return true
 }
 
-// resolveOrCreateCollaborator implements the three-path user resolution for InviteCollaborator.
-//
-// Priority:
-//  1. user_id present  — GetUserByID; 404 if absent.
-//  2. discord_user_id  — GetUserByDiscordID; create type=collaborator user if not found.
-//  3. email            — GetUserByEmail; create type=collaborator user if not found.
-//
-// UNIQUE conflict on create (race condition) is resolved by re-fetching the conflicting row.
+// resolveOrCreateByEmailWithName looks up a collaborator by email, creating one if absent.
 // Returns (user, 0, "") on success; (nil, httpStatus, message) on failure.
-func resolveOrCreateCollaborator(
+func resolveOrCreateByEmailWithName(
 	ctx context.Context,
 	s store.Store,
-	req *inviteCollaboratorRequest,
+	emailAddr string,
+	displayName *string,
 ) (*domain.User, int, string) {
-	switch {
-	case req.UserID != "":
-		return resolveByUserID(ctx, s, req.UserID)
-	case req.DiscordUserID != "":
-		return resolveOrCreateByDiscordID(ctx, s, req)
-	default:
-		return resolveOrCreateByEmail(ctx, s, req)
-	}
-}
-
-func resolveByUserID(ctx context.Context, s store.Store, userID string) (*domain.User, int, string) {
-	user, err := s.GetUserByID(ctx, userID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, http.StatusNotFound, "user not found"
-		}
-		return nil, http.StatusInternalServerError, "failed to load user"
-	}
-	return user, 0, ""
-}
-
-func resolveOrCreateByDiscordID(
-	ctx context.Context,
-	s store.Store,
-	req *inviteCollaboratorRequest,
-) (*domain.User, int, string) {
-	user, err := s.GetUserByDiscordID(ctx, req.DiscordUserID)
-	if err == nil {
-		return user, 0, ""
-	}
-	if !errors.Is(err, store.ErrNotFound) {
-		return nil, http.StatusInternalServerError, "failed to look up user by discord_user_id"
-	}
-
-	// User does not exist — create a collaborator row.
-	discordID := req.DiscordUserID
-	params := store.CreateUserParams{
-		Type:          domain.UserTypeCollaborator,
-		DiscordUserID: &discordID,
-		Email:         nilIfEmpty(req.Email),
-		DisplayName:   req.DisplayName,
-	}
-	user, err = s.CreateUser(ctx, params)
-	if err == nil {
-		return user, 0, ""
-	}
-
-	// Race: another request created the same discord_user_id concurrently — re-fetch.
-	if errors.Is(err, store.ErrConflict) {
-		user, err = s.GetUserByDiscordID(ctx, req.DiscordUserID)
-		if err == nil {
-			return user, 0, ""
-		}
-		return nil, http.StatusInternalServerError, "failed to resolve collaborator after conflict"
-	}
-	return nil, http.StatusInternalServerError, "failed to create collaborator"
-}
-
-func resolveOrCreateByEmail(
-	ctx context.Context,
-	s store.Store,
-	req *inviteCollaboratorRequest,
-) (*domain.User, int, string) {
-	user, err := s.GetUserByEmail(ctx, req.Email)
+	user, err := s.GetUserByEmail(ctx, emailAddr)
 	if err == nil {
 		return user, 0, ""
 	}
@@ -325,35 +313,25 @@ func resolveOrCreateByEmail(
 		return nil, http.StatusInternalServerError, "failed to look up user by email"
 	}
 
-	// User does not exist — create a collaborator row.
-	email := req.Email
-	params := store.CreateUserParams{
+	e := emailAddr
+	user, err = s.CreateUser(ctx, store.CreateUserParams{
 		Type:        domain.UserTypeCollaborator,
-		Email:       &email,
-		DisplayName: req.DisplayName,
-	}
-	user, err = s.CreateUser(ctx, params)
+		Email:       &e,
+		DisplayName: displayName,
+	})
 	if err == nil {
 		return user, 0, ""
 	}
 
 	// Race: another request created the same email concurrently — re-fetch.
 	if errors.Is(err, store.ErrConflict) {
-		user, err = s.GetUserByEmail(ctx, req.Email)
+		user, err = s.GetUserByEmail(ctx, emailAddr)
 		if err == nil {
 			return user, 0, ""
 		}
 		return nil, http.StatusInternalServerError, "failed to resolve collaborator after conflict"
 	}
 	return nil, http.StatusInternalServerError, "failed to create collaborator"
-}
-
-// buildConnectURL constructs the Discord OAuth2 authorization URL with CSRF state.
-func buildConnectURL(clientID, redirectURL, state string) string {
-	return fmt.Sprintf(
-		"https://discord.com/api/oauth2/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=identify+guilds.join&state=%s",
-		clientID, redirectURL, state,
-	)
 }
 
 // nilIfEmpty returns nil when s is empty, otherwise a pointer to s.
@@ -364,11 +342,13 @@ func nilIfEmpty(s string) *string {
 	return &s
 }
 
+// rejectUnsafeRunes is declared in spaces.go (shared within the handlers package).
+
 // ─── ExpelCollaborator ────────────────────────────────────────────────────────
 
 // ExpelCollaborator handles DELETE /channels/{id}/collaborators/{userId} (FR-19, AC-5).
 //
-// Control-plane gated. scope=channel (default) revokes overwrite only;
+// Control-plane gated. scope=channel (default) revokes role access;
 // scope=server also removes from guild. Both write an audit entry (AC-5).
 func (h *Handlers) ExpelCollaborator(c *gin.Context) {
 	if h.store == nil {
@@ -454,7 +434,8 @@ func (h *Handlers) ExpelCollaborator(c *gin.Context) {
 		)
 	}
 
-	respBody := map[string]any{
+	c.Header("Location", fmt.Sprintf("/v1/jobs/%s", jobID))
+	c.JSON(http.StatusAccepted, gin.H{
 		"job": map[string]any{
 			"id":          jobID,
 			"kind":        queue.KindExpelCollaborator,
@@ -464,17 +445,14 @@ func (h *Handlers) ExpelCollaborator(c *gin.Context) {
 			"retry_count": 0,
 			"created_at":  time.Now().UTC().Format(time.RFC3339),
 		},
-	}
-
-	c.Header("Location", fmt.Sprintf("/v1/jobs/%s", jobID))
-	c.JSON(http.StatusAccepted, respBody)
+	})
 }
 
 // ─── ListCollaboratorChannels ─────────────────────────────────────────────────
 
 // ListCollaboratorChannels handles GET /collaborators/{userId}/channels (FR-21, AC-7).
 //
-// Control-plane gated. Lists all active spaces a collaborator has access to.
+// Control-plane gated. Lists all active spaces a collaborator has been registered in.
 func (h *Handlers) ListCollaboratorChannels(c *gin.Context) {
 	if h.store == nil {
 		notImplemented(c)

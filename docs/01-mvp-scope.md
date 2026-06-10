@@ -22,20 +22,25 @@ The MVP is the **smallest slice that proves the isolation invariant end-to-end t
 
 `discord-support-hub` is the **mechanism**; the **backoffice** is the **policy/business layer** that drives it (*mechanism, not policy* — §1 of the spec).
 
-- The backoffice is where a staffer performs the human action — "invite this agent", "open a space for this merchant". The hub ships **no human UI** in v1; its control surface is the **API** (FR-11), and the backoffice is its consumer.
+- The backoffice is where a staffer performs the human action — "add this agent", "open a space for this merchant", "invite this collaborator". The hub ships **no human UI** in v1; its control surface is the **API** (FR-11), and the backoffice is its consumer. After the pivot the backoffice also serves as a **read/admin console** (view users per space, expel, assign agent roles).
 - **Three layers of truth, cleanly separated:**
-  - **backoffice** — origin of the operational action (who to invite, when).
-  - **discord-support-hub / Postgres** — authorization source of truth (roster, merchant↔space↔user mappings). The backoffice's action propagates here via the hub API.
-  - **Discord** — projection (roles, permission overwrites) the bot reconciles from Postgres.
-- **Guild entry is always OAuth2 `guilds.join`.** The backoffice presents a one-time "Connect with Discord" step; Discord's *Add Guild Member* endpoint requires a per-user `guilds.join` token, so the bot cannot add anyone without it. This holds for **agents and collaborators alike** — no invite links for anyone (NFR-14).
+  - **backoffice** — origin of the operational action (who to onboard, when).
+  - **discord-support-hub / Postgres** — authorization source of truth (roster, merchant↔space↔user mappings, the collaborator's name+email traceability labels, the per-merchant invite link). The backoffice's action propagates here via the hub API.
+  - **Discord** — projection (the Agent role, one role per merchant, channel allows) the bot reconciles from Postgres.
+- **Access is role-based.** Each merchant owns one Discord role, created automatically by the API on space provision; the merchant's channel allows that role VIEW+SEND. A collaborator acquires the role by joining through the merchant's **native invite-with-role link** — created once by the operator in the Discord client (the REST API cannot attach a role to an invite) and stored against the merchant. The hub emails that link itself. There are no per-user channel overwrites and no OAuth2 onboarding.
 
 **Agent onboarding-by-API, end to end:**
-1. Staffer invites an agent in the **backoffice**.
-2. Backoffice calls the hub API (`POST /agents`) → Postgres records `type=agent` (+ `is_admin` if applicable). This is the authZ source of truth (FR-23).
-3. Agent completes **Connect with Discord** once (OAuth2 `guilds.join`) → hub stores the token at `/oauth/discord/callback`.
-4. Bot adds them to the guild and **assigns the Agent role** → category-level overwrite grants every space at once (FR-6).
+1. Staffer adds an agent in the **backoffice**.
+2. Backoffice calls the hub API (`POST /agents` with the agent's Discord id) → Postgres records `type=agent` (+ `is_admin` if applicable). This is the authZ source of truth (FR-23).
+3. The bot **assigns the Agent role** once the agent is present in the guild → category-level allow grants every space at once (FR-6).
 
-An agent's entire access surface is the single **Agent role** (the "role problem"); a collaborator's is a **per-user overwrite** on their one space (the "overwrite problem").
+**Collaborator onboarding-by-API, end to end:**
+1. Operator creates the merchant's invite-with-role link once in the Discord client and stores it (`PUT /merchants/{id}/invite`).
+2. Agent registers the collaborator by **name + work email** (`POST /channels/{id}/collaborators`) → Postgres records the desired membership and the traceability labels.
+3. Agent triggers `:send-invite` → the hub emails the stored link (our SMTP) with the configurable welcome message.
+4. Collaborator clicks the link → joins the guild → Discord's native invite-with-role assigns the **merchant role** → the merchant's channel appears (and `#bienvenida`, visible to `@everyone`, greets them meanwhile).
+
+An agent's entire access surface is the single **Agent role**; a collaborator's is the **merchant role** they acquire on join.
 
 ---
 
@@ -47,7 +52,7 @@ An agent's entire access surface is the single **Agent role** (the "role problem
 | :-- | :-- | :-- |
 | FR-1 | Provision a private space per merchant via API | **Full** |
 | FR-2 | Channel mode **and** thread mode | **Channel mode only** — thread mode dropped (unnecessary at ~50 merchants; revisit only on a real scale change) |
-| FR-3 | Per-space ACL (deny @everyone, allow Agent at category, per-user allow for Collaborators) | **Full** |
+| FR-3 | Per-space ACL (deny @everyone, allow Agent at category, **allow the merchant role** for Collaborators) | **Full** — role-based, replacing per-user overwrites |
 | FR-4 | Collaborator membership (add/remove from a space) | **Full** |
 | FR-5 | Invisible by default; undiscoverable without an Agent-executed invite | **Full** (the core invariant) |
 | FR-6 | Agents read/write all spaces via category-level role | **Full** |
@@ -64,7 +69,7 @@ An agent's entire access surface is the single **Agent role** (the "role problem
 | FR-19 | Expulsion by an Agent, scope configurable (channel vs server), audited | **Full** |
 | FR-20 | Invite restricted to Agents; Collaborators cannot invite | **Full** (invariant) |
 | FR-21 | "Channels by collaborator" endpoint | **Full** |
-| FR-22 | Provisioning only by API: OAuth2 `guilds.join`, overwrites, no invite links | **Full** (invariant) |
+| FR-22 | Provisioning only by API: merchant role + role-based channel allow created by the API; collaborators onboarded via a stored native invite-with-role link the hub emails | **Full** — see §1.5 (supersedes the OAuth2/no-invite-link model) |
 | FR-23 | Agent roster management (Admin layer); `type`/`is_admin` in store; bot projects + reconciles role | **Full** — driven by the backoffice |
 | FR-24 | Visual agent marking with graceful degradation | **Optional** — configurable nickname suffix applied by the bot; **off by default**. Emoji/color/hoist/role-icon dropped — see §4 |
 
@@ -78,10 +83,10 @@ These are **mandatory** — they are why Discord was chosen over Telegram in the
 | NFR-3 | Idempotency + reconciliation (desired DB state vs real Discord, drift auto-repair) | Retries must not double-provision; drift is inevitable on a SaaS backend |
 | NFR-4 | Fail-closed: ACL apply failure → no access, never world-readable | Direct security invariant |
 | NFR-5 | Multi-tenant isolation as a verifiable, testable invariant | The product's entire value proposition |
-| NFR-6 | Secret handling (bot token + collaborator OAuth2 tokens encrypted; redacted logs) | Storing customer access tokens; non-negotiable |
+| NFR-6 | Secret handling (bot token + SMTP credentials config-by-env; redacted logs) | App-level secrets only — no per-user token store after the OAuth2 drop |
 | NFR-9 | Persistent store of merchant↔space↔user mapping; survives restart; backups | Lose the mapping → lose isolation and the audit trail |
-| NFR-13 | Two-layer authZ resolved against the store; `MANAGE_ROLES` reserved to the bot | Agent role must not be self-assignable |
-| NFR-14 | No-invites invariant; `CREATE_INSTANT_INVITE` reserved to the bot | All access auditable; bypass = isolation break |
+| NFR-13 | Two-layer authZ resolved against the store; `MANAGE_ROLES` reserved to the bot | Agent and merchant roles must not be self-assignable; reconciler strips unrecorded roles |
+| NFR-14 | Controlled-entry invariant: the merchant invite-with-role link is the only collaborator entry path; `MANAGE_ROLES`/`CREATE_INSTANT_INVITE` reserved to the bot | All access auditable and role-gated; manual role grants are treated as drift |
 
 These ship in a **lighter but real** form in v1 (full rigor continues through v1.x):
 
@@ -121,10 +126,11 @@ These ship in a **lighter but real** form in v1 (full rigor continues through v1
 | :-- | :-- | :-- |
 | **MVP FR set** | FR-1,3,4,5,6,7,9,10,11,13,14,16,17,18,19,20,21,22,23 + reduced FR-15; FR-24 reduced to optional suffix | This document |
 | **Capacity target (NFR-1)** | **~50 merchants → channel mode.** Thread mode and multi-guild sharding dropped from scope. | 50 « the 500-channel budget |
-| **Cardinality** | **merchant ↔ space = 1:1** (each merchant has exactly one space; `UNIQUE(merchant_id)`). **collaborator ↔ space = M:N** — a collaborator is a global external user who may be invited to several merchants' spaces; tenant grouping derives from space membership, not a user→merchant FK. | Isolation unchanged: a collaborator sees only spaces they were invited to |
-| **FR-8 persistence** | **Deferred to v2.** v1 manages access only. | Keeps the DB schema small |
-| **Agent identity / onboarding origin** | **backoffice** is the upstream admin surface (manual roster, FR-23). Backoffice → hub API → OAuth2 `guilds.join` entry → bot assigns Agent role. SSO/Workspace binding → v2. | See §1.5; upholds no-invites |
-| **Expulsion cascade default** | **`remove-from-channel` is the default** (revoke the overwrite, keep the person in the guild). `remove-from-server` is explicit opt-in via `?scope=server`. | Least-destructive default; reversible |
+| **Cardinality** | **merchant ↔ space = 1:1** (each merchant has exactly one space; `UNIQUE(merchant_id)`) **and merchant ↔ role = 1:1** (one Discord role per merchant). **collaborator ↔ space = M:N** — a collaborator is a global external user who may be invited to several merchants' spaces; tenant grouping derives from space membership, not a user→merchant FK. | Isolation unchanged: a collaborator holds only the merchant roles they were invited to |
+| **Access / onboarding model** | **Role per merchant + native invite-with-role.** The API auto-creates the merchant role + role-based channel allow on provision; collaborators join via the merchant's stored invite-with-role link, which the hub emails (our SMTP). **This reverses the original "no per-merchant roles" decision** (rejected for the 250-role cap) and **drops OAuth2 `guilds.join`** — OAuth2 needed a public callback + per-user browser authorize the operator will not host. | Viable to ~200 merchants vs the 250-role cap; one manual operator step per merchant (the invite link). See §1.5 and 02-architecture §5.3/§6 |
+| **FR-8 persistence** | **Deferred to v2** (confirmed). v1 manages access only. The M7 console reads metadata (users, audit, directory) and links out to the conversation via an "Open in Discord" deep link; reading message content lands in the v2 mirror. | Keeps the DB schema small; no Message Content Intent in v1 |
+| **Agent identity / onboarding origin** | **backoffice** is the upstream admin surface (manual roster, FR-23). Backoffice → hub API (`POST /agents` with Discord id) → bot assigns Agent role once the agent is in the guild. SSO/Workspace binding → v2. | See §1.5 |
+| **Expulsion cascade default** | **`remove-from-channel` is the default** (remove the merchant role, keep the person in the guild). `remove-from-server` is explicit opt-in via `?scope=server`. | Least-destructive default; reversible |
 | **Visual marking** | **Optional configurable nickname suffix** applied by the bot; **off by default**. No emoji/color/hoist/role-icon. | Minimal, opt-in |
 | **Persistence backend** | PostgreSQL = source of truth; Valkey = cache/coordination only, **never** source of truth | Per §10 |
 | **License** | **Apache-2.0** | Patent grant matters for a B2B/payments-adjacent OSS tool; avoids AGPL ambiguity (mirrors the Valkey-over-Redis reasoning in §10) |
@@ -135,7 +141,7 @@ These ship in a **lighter but real** form in v1 (full rigor continues through v1
 ## 5. Milestones
 
 **M0 — Skeleton** *(enabler)*
-Go module, Gin API, asynq+Valkey wiring, discordgo client, Postgres + migrations, config loader, Docker, CI, health checks. Empty but running. Includes a **test-guild setup guide** (create server, bot application, token, OAuth2 redirect).
+Go module, Gin API, asynq+Valkey wiring, discordgo client, Postgres + migrations, config loader, Docker, CI, health checks. Empty but running. Includes a **test-guild setup guide** (create server, bot application, token, bot permissions, and the per-merchant invite-with-role dialog walkthrough) and SMTP relay configuration.
 
 **M1 — Identity & authZ core** *(FR-9, FR-16, FR-23, NFR-13, NFR-6)*
 Postgres as source of truth: merchants, users, spaces, `type`/`is_admin`. Two-layer authZ middleware resolving against the store. **Backoffice-facing roster API** (`POST/DELETE/GET /agents`). Bot projects + reconciles the Agent role. Secret encryption + log redaction.
@@ -143,25 +149,32 @@ Postgres as source of truth: merchants, users, spaces, `type`/`is_admin`. Two-la
 **M2 — Provisioning vertical slice** *(FR-1, FR-3, FR-5, FR-13, NFR-2, NFR-3, NFR-4)*
 `POST /merchants/{id}/channels` → enqueue → worker creates a **channel** with fail-closed ACL (deny @everyone, allow Agent at category) → persist. The riskiest path first: async + rate limiter + idempotency + per-space locks. **This milestone proves the architecture.**
 
-**M3 — Membership, OAuth2 entry & isolation** *(FR-4, FR-6, FR-17, FR-18, FR-19, FR-20, FR-21, FR-22, NFR-5, NFR-14)*
-Collaborator add/remove via per-user overwrite; OAuth2 `guilds.join` "Connect with Discord" + `/oauth/discord/callback`; no-invites lockdown; directory + per-space members + per-collaborator channels. **Multi-tenant isolation test suite** as a gate.
+**M3 — Membership & isolation** *(FR-4, FR-6, FR-17, FR-18, FR-19, FR-20, FR-21, FR-22, NFR-5, NFR-14)*
+Collaborator membership model; directory + per-space members + per-collaborator channels; controlled-entry lockdown. **Multi-tenant isolation test suite** as a gate.
 
 **M4 — Lifecycle, audit, visibility, marking** *(FR-7, FR-10, FR-11, FR-14, FR-15-static, FR-24-optional)*
-Space lifecycle (active/resolved/archived/reopen); audit log; list-all; static help-desk presence (topic+pin); optional configurable nickname-suffix marking.
+Space lifecycle (active/resolved/archived/reopen); audit log; list-all; static help-desk presence (topic+pin) + the `#bienvenida` welcome channel; optional configurable nickname-suffix marking.
 
 **M5 — OSS hardening** *(NFR-7, NFR-10, NFR-16)*
 Integration tests against a test guild, structured logs + metrics + health, Docker image, README/CHANGELOG/license, first tagged release `v0.1.0`.
 
-> **v1 = M0 → M5.** Then v1.1 picks up sticky-message/nudge visibility (FR-15 dynamic), slash commands, and full OTel tracing. Thread mode and role-icon are **dropped** at current scale, not merely deferred.
+**M6 — Role-per-merchant provisioning + invite storage + email send** *(FR-3, FR-4, FR-22, NFR-5, NFR-6, NFR-14)*
+The pivot core. Provision auto-creates the merchant role (`GuildRoleCreate`) + role-based channel allow; store the per-merchant invite-with-role link (`PUT /merchants/{id}/invite`); register a collaborator by name+email (`POST /channels/{id}/collaborators`); send the stored link via the SMTP `notify` queue (`:send-invite`); reconciler diffs role membership. Removes the OAuth2 callback, `oauth_tokens`, AES-GCM token store, and per-user collaborator overwrites.
+
+**M7 — Read/admin console** *(FR-10, FR-17, FR-18, FR-19, FR-23)*
+Backoffice-facing read surface: view users per space (directory/members — exists), an **"Open in Discord" deep link** per space/channel (`https://discord.com/channels/{guildId}/{channelId}`) to jump to the conversation, expel (`scope=server` — exists), assign agent roles (roster + projection — exists). **Reading message content in the console is deferred to the v2 FR-8 mirror** — metadata + deep-link only, so no privileged Message Content Intent is needed.
+
+> **v1 = M0 → M7.** M6 supersedes the OAuth2 collaborator-onboarding parts of M3; the rest of M3 (isolation suite, directory) stands. Then v1.1 picks up sticky-message/nudge visibility (FR-15 dynamic), slash commands, and full OTel tracing. Thread mode and role-icon are **dropped** at current scale, not merely deferred.
 
 ---
 
 ## 6. Still needs an operator decision
 
-Resolved above: capacity (~50 → channel mode), cardinality (merchant↔space 1:1, collaborator↔space M:N), agent marking (optional configurable suffix), agent onboarding origin (backoffice → hub API → OAuth2 entry), license, and project name. Remaining:
+Resolved above: capacity (~50 → channel mode), cardinality (merchant↔space 1:1, merchant↔role 1:1, collaborator↔space M:N), access/onboarding model (role-per-merchant + native invite-with-role, OAuth2 dropped), agent marking (optional configurable suffix), agent onboarding origin (backoffice → hub API), **console message-read (resolved: deferred to the v2 FR-8 mirror — the M7 console is metadata + an "Open in Discord" deep link, no Message Content Intent)**, license, and project name. Remaining:
 
-1. **Test guild + bot application** — a throwaway Discord server plus a bot application/token, needed to run integration tests (NFR-16) and real provisioning. This is an **operational prerequisite, not a design decision**; the M0 setup guide will walk through creating one if you don't already have it. *Needed before M2 runs for real.*
-2. **POC frontend session mechanism** — hub-minted (`/auth/session`) vs delegated to the backoffice's auth. The API reserves the `session` principal seam either way; decide before the POC frontend phase.
+1. **Test guild + bot application** — a throwaway Discord server plus a bot application/token, needed to run integration tests (NFR-16) and real provisioning. This is an **operational prerequisite, not a design decision**; the M0 setup guide covers creation, including the per-merchant invite-with-role dialog. *Needed before M2/M6 runs for real.*
+2. **SMTP relay** — host/port/credentials/from-address for sending invite emails (config-by-env). An **operational prerequisite** for M6's `:send-invite`. *Needed before M6 runs for real.*
+3. **POC frontend session mechanism** — hub-minted (`/auth/session`) vs delegated to the backoffice's auth. The API reserves the `session` principal seam either way; decide before the POC frontend phase.
 
 ---
 

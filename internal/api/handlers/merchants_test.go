@@ -699,6 +699,222 @@ func TestProvisionSpace_AbsentUUIDMerchantID_Returns404(t *testing.T) {
 	}
 }
 
+// ─── AC-M6-3: PUT /merchants/{merchantId}/invite ──────────────────────────────
+
+// setInviteMerchantFakeStore extends merchantFakeStore with a real SetMerchantInviteLink
+// implementation so AC-M6-3 tests can exercise the full handler path.
+type setInviteMerchantFakeStore struct {
+	merchantFakeStore
+	setInviteLinkErr error
+}
+
+func newSetInviteMerchantFakeStore() *setInviteMerchantFakeStore {
+	return &setInviteMerchantFakeStore{
+		merchantFakeStore: *newMerchantFakeStore(),
+	}
+}
+
+func (f *setInviteMerchantFakeStore) SetMerchantInviteLink(
+	_ context.Context, id, link string,
+) (*domain.Merchant, error) {
+	if f.setInviteLinkErr != nil {
+		return nil, f.setInviteLinkErr
+	}
+	m, ok := f.merchants[id]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	now := time.Now()
+	m.InviteLink = &link
+	m.InviteLinkSetAt = &now
+	return m, nil
+}
+
+// buildInviteRouter builds a Gin router wired to PUT /merchants/:merchantId/invite.
+func buildInviteRouter(s store.Store, principal *authz.Principal) *gin.Engine {
+	r := gin.New()
+	r.Use(middleware.Recovery())
+	r.Use(func(c *gin.Context) {
+		if principal != nil {
+			c.Set("principal", principal)
+		}
+		c.Next()
+	})
+	h := handlers.NewHandlers(handlers.Config{
+		Store: s,
+		Cache: cache.NoopCache{},
+	})
+	r.PUT("/v1/merchants/:merchantId/invite", h.SetMerchantInviteLink)
+	return r
+}
+
+const validMerchantID = "aaaaaaaa-0000-0000-0000-000000000001"
+
+func seedMerchantForInvite(s *setInviteMerchantFakeStore) {
+	s.addMerchant(&domain.Merchant{
+		ID:          validMerchantID,
+		ExternalRef: "ext-invite-001",
+		Name:        "Invite Corp",
+		IsActive:    true,
+		CreatedAt:   time.Now(),
+	})
+}
+
+// TestSetMerchantInviteLink_ValidDiscordGG_Returns200 verifies that a discord.gg invite
+// URL is accepted and stored (AC-M6-3 happy path).
+func TestSetMerchantInviteLink_ValidDiscordGG_Returns200(t *testing.T) {
+	s := newSetInviteMerchantFakeStore()
+	seedMerchantForInvite(s)
+	router := buildInviteRouter(s, merchantControlPlanePrincipal())
+
+	w := putJSON(router, "/v1/merchants/"+validMerchantID+"/invite",
+		map[string]any{"invite_link": "https://discord.gg/abc123"}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200 for valid discord.gg URL, got %d: %s", w.Code, w.Body)
+	}
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["invite_link"] != "https://discord.gg/abc123" {
+		t.Errorf("want invite_link echoed in response, got %v", resp["invite_link"])
+	}
+}
+
+// TestSetMerchantInviteLink_ValidDiscordComInvite_Returns200 verifies that a
+// discord.com/invite URL is accepted (AC-M6-3).
+func TestSetMerchantInviteLink_ValidDiscordComInvite_Returns200(t *testing.T) {
+	s := newSetInviteMerchantFakeStore()
+	seedMerchantForInvite(s)
+	router := buildInviteRouter(s, merchantControlPlanePrincipal())
+
+	w := putJSON(router, "/v1/merchants/"+validMerchantID+"/invite",
+		map[string]any{"invite_link": "https://discord.com/invite/XYZ-999"}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200 for valid discord.com/invite URL, got %d: %s", w.Code, w.Body)
+	}
+}
+
+// TestSetMerchantInviteLink_URLValidation is a table-driven test that exercises the
+// acceptance/rejection of invite_link values (AC-M6-3).
+func TestSetMerchantInviteLink_URLValidation(t *testing.T) {
+	cases := []struct {
+		name      string
+		url       string
+		wantCode  int
+	}{
+		// Accepted
+		{"discord.gg short code", "https://discord.gg/abc123", http.StatusOK},
+		{"discord.gg hyphenated code", "https://discord.gg/abc-def-123", http.StatusOK},
+		{"discord.com/invite code", "https://discord.com/invite/xYZ99", http.StatusOK},
+
+		// Rejected — HTTP scheme
+		{"http discord.gg", "http://discord.gg/abc123", http.StatusBadRequest},
+		{"http discord.com/invite", "http://discord.com/invite/abc", http.StatusBadRequest},
+
+		// Rejected — wrong domain
+		{"non-discord HTTPS", "https://evil.com/invite/abc123", http.StatusBadRequest},
+		{"discord subdomain", "https://cdn.discord.gg/abc123", http.StatusBadRequest},
+
+		// Rejected — empty code
+		{"discord.gg no code", "https://discord.gg/", http.StatusBadRequest},
+		{"discord.com/invite no code", "https://discord.com/invite/", http.StatusBadRequest},
+
+		// Rejected — empty value
+		{"empty string", "", http.StatusBadRequest},
+
+		// Rejected — invalid chars in code
+		{"code with slash", "https://discord.gg/abc/def", http.StatusBadRequest},
+		{"code with question mark", "https://discord.gg/abc?x=1", http.StatusBadRequest},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSetInviteMerchantFakeStore()
+			seedMerchantForInvite(s)
+			router := buildInviteRouter(s, merchantControlPlanePrincipal())
+
+			w := putJSON(router, "/v1/merchants/"+validMerchantID+"/invite",
+				map[string]any{"invite_link": tc.url}, nil)
+
+			if w.Code != tc.wantCode {
+				t.Errorf("URL %q: want %d, got %d; body: %s", tc.url, tc.wantCode, w.Code, w.Body)
+			}
+			if tc.wantCode == http.StatusBadRequest {
+				assertValidationError(t, w.Body.Bytes())
+			}
+		})
+	}
+}
+
+// TestSetMerchantInviteLink_MerchantNotFound_Returns404 verifies 404 for a UUID
+// that matches no merchant row (AC-M6-3).
+func TestSetMerchantInviteLink_MerchantNotFound_Returns404(t *testing.T) {
+	s := newSetInviteMerchantFakeStore()
+	// No merchant seeded.
+	router := buildInviteRouter(s, merchantControlPlanePrincipal())
+
+	w := putJSON(router, "/v1/merchants/"+validMerchantID+"/invite",
+		map[string]any{"invite_link": "https://discord.gg/abc123"}, nil)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("want 404 for absent merchant, got %d: %s", w.Code, w.Body)
+	}
+}
+
+// TestSetMerchantInviteLink_NonUUIDMerchantID_Returns404 verifies 404 for a
+// non-UUID path segment (AC-M6-3, same as other merchant endpoints).
+func TestSetMerchantInviteLink_NonUUIDMerchantID_Returns404(t *testing.T) {
+	s := newSetInviteMerchantFakeStore()
+	router := buildInviteRouter(s, merchantControlPlanePrincipal())
+
+	w := putJSON(router, "/v1/merchants/not-a-uuid/invite",
+		map[string]any{"invite_link": "https://discord.gg/abc123"}, nil)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("want 404 for non-UUID merchant id, got %d: %s", w.Code, w.Body)
+	}
+}
+
+// TestSetMerchantInviteLink_NonControlPlane_Returns403 verifies Layer B authZ (AC-M6-3).
+func TestSetMerchantInviteLink_NonControlPlane_Returns403(t *testing.T) {
+	s := newSetInviteMerchantFakeStore()
+	seedMerchantForInvite(s)
+	router := buildInviteRouter(s, merchantNonControlPlanePrincipal())
+
+	w := putJSON(router, "/v1/merchants/"+validMerchantID+"/invite",
+		map[string]any{"invite_link": "https://discord.gg/abc123"}, nil)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("want 403 for non-control-plane principal, got %d", w.Code)
+	}
+}
+
+// TestSetMerchantInviteLink_ResponseIncludesInviteLinkSetAt verifies that the
+// response includes invite_link_set_at when the store sets a timestamp (AC-M6-3).
+func TestSetMerchantInviteLink_ResponseIncludesInviteLinkSetAt(t *testing.T) {
+	s := newSetInviteMerchantFakeStore()
+	seedMerchantForInvite(s)
+	router := buildInviteRouter(s, merchantControlPlanePrincipal())
+
+	w := putJSON(router, "/v1/merchants/"+validMerchantID+"/invite",
+		map[string]any{"invite_link": "https://discord.gg/timestamp-test"}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body)
+	}
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["invite_link_set_at"] == nil {
+		t.Error("AC-M6-3: want invite_link_set_at in response when link is set")
+	}
+}
+
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
 func assertValidationError(t *testing.T, body []byte) {

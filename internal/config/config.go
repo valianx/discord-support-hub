@@ -3,7 +3,6 @@
 package config
 
 import (
-	"encoding/base64"
 	"fmt"
 	"os"
 	"strconv"
@@ -30,21 +29,8 @@ type Config struct {
 	DiscordAgentRoleID string // required; the Agent role all agents receive
 	DiscordCategoryID  string // default category for new channels
 
-	// Discord OAuth2 settings.
-	DiscordOAuthClientID     string
-	DiscordOAuthClientSecret string // NFR-6: secret from env only
-	DiscordOAuthRedirectURL  string
-
-	// M3: HMAC secret for single-use CSRF state tokens (AC-3).
-	// Must be at least 32 bytes of entropy encoded as hexadecimal (64 hex chars = 32 bytes).
-	OAuthHMACSecret string // from OAUTH_HMAC_SECRET; optional but required for OAuth2 callback
-
 	// CORS: comma-separated list of allowed origins (never "*" with credentials).
 	CORSAllowedOrigins []string
-
-	// AES-256-GCM encryption key for OAuth2 tokens at rest (NFR-6).
-	// Must be exactly 32 bytes when base64-decoded.
-	EncryptionKey string // required for OAuth2 token storage
 
 	// Agent nickname suffix (FR-24): optional configurable suffix, off by default.
 	// Empty string = feature disabled.
@@ -60,6 +46,20 @@ type Config struct {
 	// (M5, AC-5). Uses cron syntax; default is every 5 minutes ("*/5 * * * *").
 	// Set to "" to disable the scheduled sweep (useful for testing).
 	ReconcileSweepCron string // default "*/5 * * * *"
+
+	// SMTP relay settings for the notify queue (AC-M6-5, AC-M6-6).
+	// All fields are config-by-env; credentials are never persisted or logged.
+	// Validation occurs when a send is first attempted (not at boot).
+	SMTPHost     string // SMTP_HOST; e.g. "smtp.mailgun.org"
+	SMTPPort     int    // SMTP_PORT; default 587
+	SMTPUsername string // SMTP_USERNAME
+	SMTPPassword string // SMTP_PASSWORD — never logged
+	SMTPFrom     string // SMTP_FROM; e.g. "support@example.com"
+
+	// WelcomeMessage is the configurable text posted to the #bienvenida channel (AC-M6-7).
+	// No hard-coded brand. Falls back to a generic default when empty.
+	WelcomeMessage     string // WELCOME_MESSAGE
+	WelcomeChannelName string // WELCOME_CHANNEL_NAME; default "bienvenida"
 }
 
 // Load reads all settings from environment variables and applies defaults.
@@ -67,25 +67,31 @@ type Config struct {
 // Callers that require specific values (e.g. DiscordBotToken) should validate after loading.
 func Load() (*Config, error) {
 	cfg := &Config{
-		HTTPAddr:                 getEnv("HTTP_ADDR", ":8080"),
-		PostgresDSN:              getEnv("POSTGRES_DSN", ""),
-		ValkeyAddr:               getEnv("VALKEY_ADDR", "localhost:6379"),
-		ValkeyPassword:           getEnv("VALKEY_PASSWORD", ""),
-		DiscordBotToken:          getEnv("DISCORD_BOT_TOKEN", ""),
-		DiscordGuildID:           getEnv("DISCORD_GUILD_ID", ""),
-		DiscordAgentRoleID:       getEnv("DISCORD_AGENT_ROLE_ID", ""),
-		DiscordCategoryID:        getEnv("DISCORD_CATEGORY_ID", ""),
-		DiscordOAuthClientID:     getEnv("DISCORD_OAUTH_CLIENT_ID", ""),
-		DiscordOAuthClientSecret: getEnv("DISCORD_OAUTH_CLIENT_SECRET", ""),
-		DiscordOAuthRedirectURL:  getEnv("DISCORD_OAUTH_REDIRECT_URL", ""),
-		OAuthHMACSecret:          getEnv("OAUTH_HMAC_SECRET", ""),
-		EncryptionKey:            getEnv("ENCRYPTION_KEY", ""),
-		AgentNicknameSuffix:      getEnv("AGENT_NICKNAME_SUFFIX", ""),
-		LogLevel:                 getEnv("LOG_LEVEL", "info"),
-		ReconcileSweepCron:       getEnv("RECONCILE_SWEEP_CRON", "*/5 * * * *"),
+		HTTPAddr:           getEnv("HTTP_ADDR", ":8080"),
+		PostgresDSN:        getEnv("POSTGRES_DSN", ""),
+		ValkeyAddr:         getEnv("VALKEY_ADDR", "localhost:6379"),
+		ValkeyPassword:     getEnv("VALKEY_PASSWORD", ""),
+		DiscordBotToken:    getEnv("DISCORD_BOT_TOKEN", ""),
+		DiscordGuildID:     getEnv("DISCORD_GUILD_ID", ""),
+		DiscordAgentRoleID: getEnv("DISCORD_AGENT_ROLE_ID", ""),
+		DiscordCategoryID:  getEnv("DISCORD_CATEGORY_ID", ""),
+		AgentNicknameSuffix: getEnv("AGENT_NICKNAME_SUFFIX", ""),
+		LogLevel:            getEnv("LOG_LEVEL", "info"),
+		ReconcileSweepCron:  getEnv("RECONCILE_SWEEP_CRON", "*/5 * * * *"),
+		SMTPHost:            getEnv("SMTP_HOST", ""),
+		SMTPUsername:        getEnv("SMTP_USERNAME", ""),
+		SMTPPassword:        getEnv("SMTP_PASSWORD", ""),
+		SMTPFrom:            getEnv("SMTP_FROM", ""),
+		WelcomeMessage:      getEnv("WELCOME_MESSAGE", ""),
+		WelcomeChannelName:  getEnv("WELCOME_CHANNEL_NAME", "bienvenida"),
 	}
 
 	var err error
+
+	cfg.SMTPPort, err = getEnvInt("SMTP_PORT", 587)
+	if err != nil {
+		return nil, fmt.Errorf("config: SMTP_PORT: %w", err)
+	}
 
 	cfg.ValkeyDB, err = getEnvInt("VALKEY_DB", 0)
 	if err != nil {
@@ -137,31 +143,6 @@ func (c *Config) RequireAgentRoleID() error {
 	if c.DiscordGuildID != "" && c.DiscordAgentRoleID == c.DiscordGuildID {
 		return fmt.Errorf("config: DISCORD_AGENT_ROLE_ID must not equal DISCORD_GUILD_ID — " +
 			"the guild id is the @everyone role; using it would make every channel world-readable (NFR-5)")
-	}
-	return nil
-}
-
-// RequireEncryptionKey returns an error when the AES-256-GCM key is absent.
-func (c *Config) RequireEncryptionKey() error {
-	if c.EncryptionKey == "" {
-		return fmt.Errorf("config: ENCRYPTION_KEY is required but not set")
-	}
-	return nil
-}
-
-// ValidateEncryptionKey returns an error when ENCRYPTION_KEY is absent or does not
-// decode to exactly 32 bytes (AES-256). Call this at startup before first use so
-// misconfiguration fails loudly rather than on the first encrypt/decrypt call (NFR-6).
-func (c *Config) ValidateEncryptionKey() error {
-	if c.EncryptionKey == "" {
-		return fmt.Errorf("config: ENCRYPTION_KEY is required but not set")
-	}
-	decoded, err := base64.StdEncoding.DecodeString(c.EncryptionKey)
-	if err != nil {
-		return fmt.Errorf("config: ENCRYPTION_KEY is not valid base64: %w", err)
-	}
-	if len(decoded) != 32 {
-		return fmt.Errorf("config: ENCRYPTION_KEY must decode to exactly 32 bytes (AES-256), got %d", len(decoded))
 	}
 	return nil
 }

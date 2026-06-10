@@ -60,14 +60,8 @@ func (f *fakeDiscordClient) SetChannelPermissionDeny(_ context.Context, _, _ str
 	return nil
 }
 
-// M3 discord.Client methods — not exercised by project_agent_role tests.
-func (f *fakeDiscordClient) SetCollaboratorOverwrite(_ context.Context, _, _ string) error {
-	return nil
-}
+// M3/M6 discord.Client methods — not exercised by project_agent_role tests.
 func (f *fakeDiscordClient) DeleteCollaboratorOverwrite(_ context.Context, _, _ string) error {
-	return nil
-}
-func (f *fakeDiscordClient) AddGuildMember(_ context.Context, _, _, _ string) error {
 	return nil
 }
 func (f *fakeDiscordClient) RemoveGuildMember(_ context.Context, _, _ string) error {
@@ -75,6 +69,18 @@ func (f *fakeDiscordClient) RemoveGuildMember(_ context.Context, _, _ string) er
 }
 func (f *fakeDiscordClient) GetChannelOverwrites(_ context.Context, _ string) ([]*discordgo.PermissionOverwrite, error) {
 	return nil, nil
+}
+func (f *fakeDiscordClient) CreateMerchantRole(_ context.Context, _, _ string) (string, error) {
+	return "role-123", nil
+}
+func (f *fakeDiscordClient) SetRoleChannelAllow(_ context.Context, _, _ string) error { return nil }
+func (f *fakeDiscordClient) AssignMerchantRole(_ context.Context, _, _, _ string) error { return nil }
+func (f *fakeDiscordClient) RemoveMerchantRole(_ context.Context, _, _, _ string) error { return nil }
+func (f *fakeDiscordClient) GetGuildMembersByRole(_ context.Context, _, _ string) ([]string, error) {
+	return nil, nil
+}
+func (f *fakeDiscordClient) EnsureWelcomeChannel(_ context.Context, _, _, _, _ string) (string, error) {
+	return "chan-123", nil
 }
 
 // M4 discord.Client methods — not exercised by project_agent_role tests.
@@ -160,12 +166,6 @@ func (f *workerFakeStore) RevokeAPIKey(_ context.Context, _ string) error { pani
 func (f *workerFakeStore) TouchAPIKeyLastUsed(_ context.Context, _ string) error {
 	panic("TouchAPIKeyLastUsed")
 }
-func (f *workerFakeStore) UpsertOAuthToken(_ context.Context, _ store.UpsertOAuthTokenParams) (*domain.OAuthToken, error) {
-	panic("UpsertOAuthToken")
-}
-func (f *workerFakeStore) GetOAuthTokenByUserID(_ context.Context, _ string) (*domain.OAuthToken, error) {
-	panic("GetOAuthTokenByUserID")
-}
 func (f *workerFakeStore) CreateSpace(_ context.Context, _ store.CreateSpaceParams) (*domain.Space, error) {
 	panic("CreateSpace")
 }
@@ -225,8 +225,8 @@ func (f *workerFakeStore) CreateSpaceMember(_ context.Context, _ store.CreateSpa
 func (f *workerFakeStore) GetSpaceMemberBySpaceAndUser(_ context.Context, _, _ string) (*domain.SpaceMember, error) {
 	panic("GetSpaceMemberBySpaceAndUser")
 }
-func (f *workerFakeStore) SetSpaceMemberOverwriteApplied(_ context.Context, _ string) (*domain.SpaceMember, error) {
-	panic("SetSpaceMemberOverwriteApplied")
+func (f *workerFakeStore) StampSpaceMemberInviteSent(_ context.Context, _ string) (*domain.SpaceMember, error) {
+	panic("StampSpaceMemberInviteSent")
 }
 func (f *workerFakeStore) RevokeSpaceMember(_ context.Context, _ string) (*domain.SpaceMember, error) {
 	panic("RevokeSpaceMember")
@@ -268,6 +268,14 @@ func (f *workerFakeStore) GetJobBySpaceIDAndKind(_ context.Context, _, _ string)
 // Worker tests do not exercise the full-guild reconcile path.
 func (f *workerFakeStore) ListActiveProvisionedSpaces(_ context.Context) ([]*domain.Space, error) {
 	panic("ListActiveProvisionedSpaces")
+}
+
+// M6 store methods — not exercised by project_agent_role tests.
+func (f *workerFakeStore) SetMerchantInviteLink(_ context.Context, _ string, _ string) (*domain.Merchant, error) {
+	panic("SetMerchantInviteLink")
+}
+func (f *workerFakeStore) UpdateSpaceMerchantRoleID(_ context.Context, _, _ string) (*domain.Space, error) {
+	panic("UpdateSpaceMerchantRoleID")
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

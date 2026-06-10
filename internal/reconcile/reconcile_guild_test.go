@@ -1,12 +1,19 @@
-// Package reconcile_test — reconcile_guild_test.go verifies the scheduled full-guild sweep (M5, AC-5).
+// Package reconcile_test — reconcile_guild_test.go verifies the scheduled full-guild sweep
+// and per-space reconcile logic (M5/M6, AC-5, AC-M6-8).
+//
+// M6 pivot: reconciliation is now role-based, not per-user-overwrite-based.
+// The Engine diffs merchant-role membership in Discord against the Postgres desired set.
 //
 // Tests are hermetic: no real Postgres or Discord connections. All dependencies are fakes.
 // The full-guild sweep must:
 //   - Enumerate all active provisioned spaces from the store.
 //   - Call ReconcileSpace for each one.
-//   - Revoke unbacked Discord overwrites (Postgres wins, NFR-5).
+//   - Remove stale role holders (real holds role but not in Postgres).
+//   - Assign missing roles (in Postgres but not holding role).
 //   - Handle empty guilds (no spaces) gracefully.
 //   - Report per-space errors without aborting the remaining spaces.
+//   - Circuit breaker: abort space reconcile with zero role changes if desired set is empty
+//     but Discord has role holders (SEC-M5-001, applied to role model).
 package reconcile_test
 
 import (
@@ -15,7 +22,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
 	"github.com/valianx/discord-support-hub/internal/domain"
 	"github.com/valianx/discord-support-hub/internal/reconcile"
 	"github.com/valianx/discord-support-hub/internal/store"
@@ -74,71 +80,62 @@ func (s *guildStore) InsertAuditEntry(_ context.Context, _ store.InsertAuditEntr
 
 func (s *guildStore) UpdateSpaceReconciledAt(_ context.Context, _ string) error { return nil }
 
-func (s *guildStore) SetSpaceMemberOverwriteApplied(_ context.Context, id string) (*domain.SpaceMember, error) {
-	for _, members := range s.membersBySpaceID {
-		for _, sm := range members {
-			if sm.ID == id {
-				sm.OverwriteApplied = true
-				return sm, nil
-			}
-		}
-	}
-	return nil, store.ErrNotFound
-}
-
-// guildDiscord is a simple Discord fake tracking overwrites and revokes.
+// guildDiscord is a role-based Discord fake (M6 model).
+// Tracks which members hold the merchant role, and counts assign/remove calls.
 type guildDiscord struct {
-	overwrites    map[string][]*discordgo.PermissionOverwrite // channelID → overwrites
-	revokeCount   int
-	applyCount    int
-	listCallCount int
+	roleHolders map[string][]string // guildID+roleID → discordUserIDs
+	assignCount int
+	removeCount int
 }
 
 func newGuildDiscord() *guildDiscord {
-	return &guildDiscord{overwrites: make(map[string][]*discordgo.PermissionOverwrite)}
+	return &guildDiscord{roleHolders: make(map[string][]string)}
 }
 
-func (d *guildDiscord) addOverwrite(channelID, discordUserID string) {
-	d.overwrites[channelID] = append(d.overwrites[channelID], &discordgo.PermissionOverwrite{
-		ID:   discordUserID,
-		Type: discordgo.PermissionOverwriteTypeMember,
-	})
+func (d *guildDiscord) roleKey(guildID, roleID string) string { return guildID + ":" + roleID }
+
+func (d *guildDiscord) addRoleHolder(guildID, roleID, discordUserID string) {
+	k := d.roleKey(guildID, roleID)
+	d.roleHolders[k] = append(d.roleHolders[k], discordUserID)
 }
 
-func (d *guildDiscord) GetChannelOverwrites(_ context.Context, channelID string) ([]*discordgo.PermissionOverwrite, error) {
-	d.listCallCount++
-	return d.overwrites[channelID], nil
+func (d *guildDiscord) GetGuildMembersByRole(_ context.Context, guildID, roleID string) ([]string, error) {
+	return d.roleHolders[d.roleKey(guildID, roleID)], nil
 }
 
-func (d *guildDiscord) SetCollaboratorOverwrite(_ context.Context, channelID, discordUserID string) error {
-	d.applyCount++
-	d.overwrites[channelID] = append(d.overwrites[channelID], &discordgo.PermissionOverwrite{
-		ID: discordUserID, Type: discordgo.PermissionOverwriteTypeMember,
-	})
+func (d *guildDiscord) AssignMerchantRole(_ context.Context, guildID, discordUserID, roleID string) error {
+	d.assignCount++
+	k := d.roleKey(guildID, roleID)
+	d.roleHolders[k] = append(d.roleHolders[k], discordUserID)
 	return nil
 }
 
-func (d *guildDiscord) DeleteCollaboratorOverwrite(_ context.Context, channelID, discordUserID string) error {
-	d.revokeCount++
-	existing := d.overwrites[channelID]
-	filtered := existing[:0]
-	for _, ow := range existing {
-		if ow.ID != discordUserID {
-			filtered = append(filtered, ow)
+func (d *guildDiscord) RemoveMerchantRole(_ context.Context, guildID, discordUserID, roleID string) error {
+	d.removeCount++
+	k := d.roleKey(guildID, roleID)
+	holders := d.roleHolders[k]
+	filtered := holders[:0]
+	for _, uid := range holders {
+		if uid != discordUserID {
+			filtered = append(filtered, uid)
 		}
 	}
-	d.overwrites[channelID] = filtered
+	d.roleHolders[k] = filtered
 	return nil
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+const testGuildID = "guild-test"
+
 func activeProvisionedSpace(id, channelID string) *domain.Space {
 	ch := channelID
+	roleID := "role-" + id
 	return &domain.Space{
 		ID:               id,
 		MerchantID:       "merchant-" + id,
 		DiscordChannelID: &ch,
+		MerchantRoleID:   &roleID,
 		ACLState:         domain.ACLStateApplied,
 		LifecycleState:   domain.SpaceLifecycleActive,
 		CreatedAt:        time.Now(),
@@ -159,7 +156,8 @@ func guildCollaborator(userID, discordID string) *domain.User {
 func guildSpaceMember(id, spaceID, userID string) *domain.SpaceMember {
 	return &domain.SpaceMember{
 		ID: id, SpaceID: spaceID, UserID: userID,
-		Role: domain.SpaceMemberRoleCollaborator, OverwriteApplied: true, CreatedAt: time.Now(),
+		Role:      domain.SpaceMemberRoleCollaborator,
+		CreatedAt: time.Now(),
 	}
 }
 
@@ -170,67 +168,103 @@ func TestReconcileGuild_EmptyGuild(t *testing.T) {
 	t.Parallel()
 	s := newGuildStore()
 	d := newGuildDiscord()
-	engine := reconcile.NewEngine(s, d)
+	engine := reconcile.NewEngine(s, d, testGuildID)
 
-	if err := engine.ReconcileGuild(context.Background(), "guild-empty"); err != nil {
+	if err := engine.ReconcileGuild(context.Background(), testGuildID); err != nil {
 		t.Fatalf("ReconcileGuild on empty guild: %v", err)
 	}
-	if d.listCallCount != 0 {
-		t.Errorf("expected 0 Discord calls on empty guild, got %d", d.listCallCount)
+	if d.assignCount != 0 || d.removeCount != 0 {
+		t.Errorf("expected 0 Discord calls on empty guild, got assign=%d remove=%d",
+			d.assignCount, d.removeCount)
 	}
 }
 
-// TestReconcileGuild_AllBackedOverwrites verifies the sweep makes no revokes when
-// all Discord overwrites are backed by space_members rows.
-func TestReconcileGuild_AllBackedOverwrites(t *testing.T) {
+// TestReconcileGuild_AllSynced verifies the sweep makes no changes when
+// all Discord role holders match the Postgres desired set.
+func TestReconcileGuild_AllSynced(t *testing.T) {
 	t.Parallel()
 	s := newGuildStore()
 	d := newGuildDiscord()
 
-	// Two spaces, each with one properly-backed collaborator.
-	s.addSpace(activeProvisionedSpace("sp1", "chan1"))
-	s.addSpace(activeProvisionedSpace("sp2", "chan2"))
+	sp1 := activeProvisionedSpace("sp1", "chan1")
+	sp2 := activeProvisionedSpace("sp2", "chan2")
+	s.addSpace(sp1)
+	s.addSpace(sp2)
 
 	s.addUser(guildCollaborator("u1", "du1"))
 	s.addUser(guildCollaborator("u2", "du2"))
 	s.addMember(guildSpaceMember("sm1", "sp1", "u1"))
 	s.addMember(guildSpaceMember("sm2", "sp2", "u2"))
-	d.addOverwrite("chan1", "du1")
-	d.addOverwrite("chan2", "du2")
+	// Desired set and real state are in sync.
+	d.addRoleHolder(testGuildID, *sp1.MerchantRoleID, "du1")
+	d.addRoleHolder(testGuildID, *sp2.MerchantRoleID, "du2")
 
-	engine := reconcile.NewEngine(s, d)
-	if err := engine.ReconcileGuild(context.Background(), "guild-ok"); err != nil {
+	engine := reconcile.NewEngine(s, d, testGuildID)
+	if err := engine.ReconcileGuild(context.Background(), testGuildID); err != nil {
 		t.Fatalf("ReconcileGuild: %v", err)
 	}
 
-	if d.revokeCount != 0 {
-		t.Errorf("expected 0 revokes, got %d", d.revokeCount)
+	if d.assignCount != 0 || d.removeCount != 0 {
+		t.Errorf("expected 0 role changes when synced, got assign=%d remove=%d",
+			d.assignCount, d.removeCount)
 	}
 }
 
-// TestReconcileGuild_RevokeUnbackedOverwrites verifies the sweep revokes Discord overwrites
-// that have no backing space_members row across all spaces (Postgres always wins, AC-5).
-func TestReconcileGuild_RevokeUnbackedOverwrites(t *testing.T) {
+// TestReconcileGuild_RemovesStaleRoleHolder verifies the sweep removes a Discord role
+// holder that has no backing space_members row (Postgres wins, AC-M6-8).
+func TestReconcileGuild_RemovesStaleRoleHolder(t *testing.T) {
 	t.Parallel()
 	s := newGuildStore()
 	d := newGuildDiscord()
 
-	// Space 1: one backed overwrite. Space 2: one unbacked overwrite.
-	s.addSpace(activeProvisionedSpace("sp1", "chan1"))
-	s.addSpace(activeProvisionedSpace("sp2", "chan2"))
+	sp := activeProvisionedSpace("sp1", "chan1")
+	s.addSpace(sp)
 
+	// Backed member.
 	s.addUser(guildCollaborator("u1", "du1"))
 	s.addMember(guildSpaceMember("sm1", "sp1", "u1"))
-	d.addOverwrite("chan1", "du1")         // backed — must NOT be revoked
-	d.addOverwrite("chan2", "orphan-user") // unbacked — must be revoked
+	d.addRoleHolder(testGuildID, *sp.MerchantRoleID, "du1")
+	// Stale role holder — not in Postgres.
+	d.addRoleHolder(testGuildID, *sp.MerchantRoleID, "du-stale")
 
-	engine := reconcile.NewEngine(s, d)
-	if err := engine.ReconcileGuild(context.Background(), "guild-drift"); err != nil {
+	engine := reconcile.NewEngine(s, d, testGuildID)
+	if err := engine.ReconcileGuild(context.Background(), testGuildID); err != nil {
 		t.Fatalf("ReconcileGuild: %v", err)
 	}
 
-	if d.revokeCount != 1 {
-		t.Errorf("expected 1 revoke (unbacked overwrite), got %d", d.revokeCount)
+	if d.removeCount != 1 {
+		t.Errorf("expected 1 role removal for stale holder, got %d", d.removeCount)
+	}
+	if d.assignCount != 0 {
+		t.Errorf("expected 0 role assignments, got %d", d.assignCount)
+	}
+}
+
+// TestReconcileGuild_AssignsMissingRole verifies that a space_members row holder who
+// is missing the merchant role in Discord gets it assigned (AC-M6-8).
+func TestReconcileGuild_AssignsMissingRole(t *testing.T) {
+	t.Parallel()
+	s := newGuildStore()
+	d := newGuildDiscord()
+
+	sp := activeProvisionedSpace("sp1", "chan1")
+	s.addSpace(sp)
+
+	// Member is in Postgres but NOT holding the role in Discord.
+	s.addUser(guildCollaborator("u1", "du1"))
+	s.addMember(guildSpaceMember("sm1", "sp1", "u1"))
+	// Do not add du1 to roleHolders — triggers repair.
+
+	engine := reconcile.NewEngine(s, d, testGuildID)
+	if err := engine.ReconcileGuild(context.Background(), testGuildID); err != nil {
+		t.Fatalf("ReconcileGuild: %v", err)
+	}
+
+	if d.assignCount != 1 {
+		t.Errorf("expected 1 role assignment for missing role, got %d", d.assignCount)
+	}
+	if d.removeCount != 0 {
+		t.Errorf("expected 0 role removals, got %d", d.removeCount)
 	}
 }
 
@@ -239,31 +273,60 @@ func TestReconcileGuild_RevokeUnbackedOverwrites(t *testing.T) {
 func TestReconcileGuild_ContinuesOnSpaceError(t *testing.T) {
 	t.Parallel()
 
-	// Use a store that returns an error for GetSpaceByID on a specific space.
 	errStore := &erroringStore{
 		guildStore:   newGuildStore(),
 		errorSpaceID: "sp-fail",
 	}
 	d := newGuildDiscord()
 
-	errStore.addSpace(activeProvisionedSpace("sp-fail", "chan-fail"))
-	errStore.addSpace(activeProvisionedSpace("sp-ok", "chan-ok"))
-	d.addOverwrite("chan-ok", "unbacked-ok") // unbacked — should be revoked even though sp-fail errors
+	spFail := activeProvisionedSpace("sp-fail", "chan-fail")
+	spOK := activeProvisionedSpace("sp-ok", "chan-ok")
+	errStore.addSpace(spFail)
+	errStore.addSpace(spOK)
+	// sp-ok has a stale role holder that should be removed.
+	d.addRoleHolder(testGuildID, *spOK.MerchantRoleID, "du-stale")
 
-	engine := reconcile.NewEngine(errStore, d)
-	// ReconcileGuild should return an error (sp-fail failed) but still process sp-ok.
-	err := engine.ReconcileGuild(context.Background(), "guild-partial")
+	engine := reconcile.NewEngine(errStore, d, testGuildID)
+	err := engine.ReconcileGuild(context.Background(), testGuildID)
 	if err == nil {
 		t.Fatal("expected error from ReconcileGuild when a space fails, got nil")
 	}
-	if d.revokeCount != 1 {
-		t.Errorf("expected 1 revoke from sp-ok despite sp-fail error, got %d revokes", d.revokeCount)
+	// sp-ok should still have been reconciled (du-stale removed).
+	if d.removeCount != 1 {
+		t.Errorf("expected 1 removal from sp-ok despite sp-fail error, got %d", d.removeCount)
+	}
+}
+
+// TestReconcileSpace_NoMerchantRoleID_Skips verifies that a space without a merchant_role_id
+// is skipped (M6: spaces not yet provisioned with a role are not role-reconciled).
+func TestReconcileSpace_NoMerchantRoleID_Skips(t *testing.T) {
+	t.Parallel()
+	s := newGuildStore()
+	d := newGuildDiscord()
+
+	ch := "chan-norole"
+	sp := &domain.Space{
+		ID:               "sp-norole",
+		MerchantID:       "m1",
+		DiscordChannelID: &ch,
+		MerchantRoleID:   nil, // not yet assigned
+		ACLState:         domain.ACLStateApplied,
+		LifecycleState:   domain.SpaceLifecycleActive,
+		CreatedAt:        time.Now(),
+	}
+	s.addSpace(sp)
+
+	engine := reconcile.NewEngine(s, d, testGuildID)
+	if err := engine.ReconcileSpace(context.Background(), "sp-norole"); err != nil {
+		t.Fatalf("ReconcileSpace on no-role space should not error: %v", err)
+	}
+	if d.assignCount != 0 || d.removeCount != 0 {
+		t.Errorf("expected 0 Discord calls for no-role space")
 	}
 }
 
 // ─── Error-injecting store ────────────────────────────────────────────────────
 
-// erroringStore wraps guildStore and injects a GetSpaceByID error for a specific space.
 type erroringStore struct {
 	*guildStore
 	errorSpaceID string
@@ -278,14 +341,44 @@ func (s *erroringStore) GetSpaceByID(ctx context.Context, id string) (*domain.Sp
 	return s.guildStore.GetSpaceByID(ctx, id)
 }
 
-// ─── SEC-M5-001 safety tests (the dangerous path) ────────────────────────────
+// ─── SEC-M5-001 safety tests (circuit breaker) ───────────────────────────────
 
-// transientUserStore wraps guildStore and injects a non-NotFound error for GetUserByID
-// on a specific user id. Used to simulate a Postgres connection blip during desired-set
-// construction (SEC-M5-001: transient error must abort the space reconcile with zero revokes).
+// TestReconcileSpace_TransientStoreError_ZeroRoleChanges verifies that a transient store
+// error during desired-set construction aborts the reconcile with zero role changes
+// (SEC-M5-001: circuit breaker preserved in M6 role model).
+func TestReconcileSpace_TransientStoreError_ZeroRoleChanges(t *testing.T) {
+	t.Parallel()
+
+	s := &transientUserStore{
+		guildStore:      newGuildStore(),
+		transientUserID: "u-transient",
+	}
+
+	const spaceID = "sp-transient"
+	sp := activeProvisionedSpace(spaceID, "chan-transient")
+	s.addSpace(sp)
+	// Member whose GetUserByID call will return a transient error.
+	s.addMember(guildSpaceMember("sm-transient", spaceID, "u-transient"))
+	s.addUser(guildCollaborator("u-transient", "du-transient"))
+
+	d := newGuildDiscord()
+	// Discord has a stale role holder — must NOT be removed on a transient error.
+	d.addRoleHolder(testGuildID, *sp.MerchantRoleID, "du-transient")
+
+	engine := reconcile.NewEngine(s, d, testGuildID)
+	err := engine.ReconcileSpace(context.Background(), spaceID)
+
+	if err == nil {
+		t.Fatal("SEC-M5-001: expected error when GetUserByID returns transient error, got nil")
+	}
+	if d.removeCount != 0 {
+		t.Errorf("SEC-M5-001: expected 0 role removals on transient store error, got %d", d.removeCount)
+	}
+}
+
 type transientUserStore struct {
 	*guildStore
-	transientUserID string // GetUserByID returns errTransient for this user id
+	transientUserID string
 }
 
 var errTransient = errors.New("store: connection pool exhausted (simulated transient error)")
@@ -297,146 +390,73 @@ func (s *transientUserStore) GetUserByID(ctx context.Context, id string) (*domai
 	return s.guildStore.GetUserByID(ctx, id)
 }
 
-// TestReconcileSpace_TransientStoreError_ZeroRevocations is the headline dangerous-path test
-// for SEC-M5-001.
-//
-// Scenario: a space has one member. GetUserByID returns a transient (non-NotFound) error
-// while building the desired set. The reconciler MUST:
-//   - Return a non-nil error so asynq retries later.
-//   - Execute ZERO Discord revocations (the desired set must not be treated as empty).
-func TestReconcileSpace_TransientStoreError_ZeroRevocations(t *testing.T) {
-	t.Parallel()
-
-	s := &transientUserStore{
-		guildStore:      newGuildStore(),
-		transientUserID: "u-transient",
-	}
-
-	const (
-		spaceID    = "sp-transient"
-		channelID  = "chan-transient"
-		discordUID = "du-transient"
-	)
-
-	sp := activeProvisionedSpace(spaceID, channelID)
-	s.addSpace(sp)
-	// One member whose GetUserByID call will return a transient error.
-	s.addMember(guildSpaceMember("sm-transient", spaceID, "u-transient"))
-	// The user row exists in the base store but is intercepted by transientUserStore.
-	s.addUser(guildCollaborator("u-transient", discordUID))
-
-	d := newGuildDiscord()
-	// The channel has one overwrite matching this user — must NOT be revoked.
-	d.addOverwrite(channelID, discordUID)
-
-	engine := reconcile.NewEngine(s, d)
-	err := engine.ReconcileSpace(context.Background(), spaceID)
-
-	// (1) Must return a non-nil retryable error — not silent success.
-	if err == nil {
-		t.Fatal("SEC-M5-001 VIOLATED: expected error when GetUserByID returns transient error, got nil")
-	}
-
-	// (2) CRITICAL: zero Discord revocations — the desired set must not have been treated
-	// as empty and then used to revoke the legitimate member's overwrite.
-	if d.revokeCount != 0 {
-		t.Errorf("SEC-M5-001 VIOLATED: expected 0 revocations on transient GetUserByID error, got %d; "+
-			"a transient error MUST abort the reconcile without revoking (mass-revocation risk)",
-			d.revokeCount)
-	}
-}
-
-// TestReconcileSpace_ErrNotFound_MemberRevoked verifies that a genuine store.ErrNotFound
-// (member's user row deleted) causes the member to be omitted from the desired set and
-// their Discord overwrite to be revoked (legitimate revoke behavior — preserved).
-func TestReconcileSpace_ErrNotFound_MemberRevoked(t *testing.T) {
+// TestReconcileSpace_ErrNotFound_MemberOmitted verifies that a genuine store.ErrNotFound
+// for a member's user row causes the member to be omitted from the desired set (legitimate).
+// The member's role is removed because they're no longer in the desired set.
+func TestReconcileSpace_ErrNotFound_MemberOmitted(t *testing.T) {
 	t.Parallel()
 
 	s := newGuildStore()
 
-	const (
-		spaceID    = "sp-notfound"
-		channelID  = "chan-notfound"
-		discordUID = "du-notfound"
-	)
-
-	sp := activeProvisionedSpace(spaceID, channelID)
+	const spaceID = "sp-notfound"
+	sp := activeProvisionedSpace(spaceID, "chan-notfound")
 	s.addSpace(sp)
 	// Member row exists but user row does NOT — simulates a deleted user.
 	s.addMember(guildSpaceMember("sm-nf", spaceID, "u-deleted"))
-	// Intentionally do NOT call s.addUser("u-deleted") — GetUserByID will return ErrNotFound.
+	// Intentionally do NOT call s.addUser — GetUserByID will return ErrNotFound.
 
-	d := newGuildDiscord()
-	// Discord has an overwrite for the deleted user — it must be revoked.
-	d.addOverwrite(channelID, discordUID)
-	// The space also has a backed member (u2) to confirm unbacked-only revocations.
+	// Healthy member.
 	s.addUser(guildCollaborator("u-ok", "du-ok"))
 	s.addMember(guildSpaceMember("sm-ok", spaceID, "u-ok"))
-	d.addOverwrite(channelID, "du-ok") // backed — must NOT be revoked
 
-	engine := reconcile.NewEngine(s, d)
+	d := newGuildDiscord()
+	d.addRoleHolder(testGuildID, *sp.MerchantRoleID, "du-ok")
+	// du-deleted still holds the role but is not in the desired set — should be removed.
+	d.addRoleHolder(testGuildID, *sp.MerchantRoleID, "du-deleted")
+
+	engine := reconcile.NewEngine(s, d, testGuildID)
 	err := engine.ReconcileSpace(context.Background(), spaceID)
 
-	// No error expected — ErrNotFound is handled gracefully (member genuinely gone).
 	if err != nil {
 		t.Fatalf("unexpected error for ErrNotFound member: %v", err)
 	}
-
-	// The unbacked overwrite (du-notfound) must be revoked; the backed one (du-ok) must not.
-	if d.revokeCount != 1 {
-		t.Errorf("expected exactly 1 revoke for the ErrNotFound member's overwrite, got %d", d.revokeCount)
+	// du-deleted: role removed (not in desired set). du-ok: no change.
+	if d.removeCount != 1 {
+		t.Errorf("expected 1 role removal for deleted user, got %d", d.removeCount)
 	}
-	// Apply count: 0 (du-ok already has an overwrite).
-	if d.applyCount != 0 {
-		t.Errorf("expected 0 re-applies (du-ok overwrite already in place), got %d", d.applyCount)
+	if d.assignCount != 0 {
+		t.Errorf("expected 0 role assignments, got %d", d.assignCount)
 	}
 }
 
-// TestReconcileSpace_CircuitBreaker_EmptyDesiredSet verifies that when the desired set
-// comes back completely empty while Discord has member overwrites, the circuit breaker
-// aborts the reconcile with an error instead of revoking every overwrite (SEC-M5-001).
-//
-// This scenario can arise from a misconfigured store, a race during member deletion,
-// or any partial-read scenario where the desired set looks empty but the legitimate
-// members are still active. The circuit breaker is the last line of defense.
+// TestReconcileSpace_CircuitBreaker_EmptyDesiredSet verifies that the circuit breaker fires
+// when the desired set is empty but Discord has role holders (SEC-M5-001 preserved in M6).
 func TestReconcileSpace_CircuitBreaker_EmptyDesiredSet(t *testing.T) {
 	t.Parallel()
 
-	// Use a store that has a space with a member but GetUserByID always returns
-	// ErrNotFound — forcing an empty desired set while Discord has overwrites.
 	s := &alwaysNotFoundUserStore{guildStore: newGuildStore()}
 
-	const (
-		spaceID   = "sp-cb"
-		channelID = "chan-cb"
-	)
-
-	sp := activeProvisionedSpace(spaceID, channelID)
+	const spaceID = "sp-cb"
+	sp := activeProvisionedSpace(spaceID, "chan-cb")
 	s.addSpace(sp)
 	s.addMember(guildSpaceMember("sm-cb", spaceID, "u-cb"))
-	// The user row is deliberately absent — alwaysNotFoundUserStore returns ErrNotFound.
+	// User row deliberately absent — alwaysNotFoundUserStore returns ErrNotFound.
 
 	d := newGuildDiscord()
-	// Discord has overwrites for two members — circuit breaker must prevent revoking them.
-	d.addOverwrite(channelID, "du-cb-1")
-	d.addOverwrite(channelID, "du-cb-2")
+	d.addRoleHolder(testGuildID, *sp.MerchantRoleID, "du-cb-1")
+	d.addRoleHolder(testGuildID, *sp.MerchantRoleID, "du-cb-2")
 
-	engine := reconcile.NewEngine(s, d)
+	engine := reconcile.NewEngine(s, d, testGuildID)
 	err := engine.ReconcileSpace(context.Background(), spaceID)
 
-	// Circuit breaker must fire: desired set empty, Discord has 2 overwrites.
 	if err == nil {
-		t.Fatal("SEC-M5-001 circuit breaker VIOLATED: expected error when desired set is empty but Discord has overwrites, got nil")
+		t.Fatal("SEC-M5-001 circuit breaker: expected error when desired set is empty but Discord has role holders")
 	}
-
-	// Zero revocations — no mass-revoke.
-	if d.revokeCount != 0 {
-		t.Errorf("SEC-M5-001 circuit breaker VIOLATED: expected 0 revocations, got %d", d.revokeCount)
+	if d.removeCount != 0 {
+		t.Errorf("SEC-M5-001 circuit breaker: expected 0 role removals, got %d", d.removeCount)
 	}
 }
 
-// alwaysNotFoundUserStore forces GetUserByID → ErrNotFound for every call, producing
-// an empty desired set even when space_members rows exist.
 type alwaysNotFoundUserStore struct{ *guildStore }
 
 func (s *alwaysNotFoundUserStore) GetUserByID(_ context.Context, _ string) (*domain.User, error) {

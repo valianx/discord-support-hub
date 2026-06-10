@@ -13,9 +13,10 @@ import (
 // Queue names match the topology defined in docs/02-architecture.md §3.4.
 const (
 	QueueProvision  = "provision"  // high priority: space creation, ACL apply
-	QueueMembership = "membership" // high priority: overwrite add/remove, role assign, guild add
+	QueueMembership = "membership" // high priority: role assign/remove
 	QueueReconcile  = "reconcile"  // low  priority: drift detection + repair
 	QueueMarking    = "marking"    // low  priority: optional nickname suffix (M4)
+	QueueNotify     = "notify"     // default priority: invite emails (AC-M6-5, AC-M6-6)
 )
 
 // Task kind constants used as asynq task type strings.
@@ -30,6 +31,7 @@ const (
 	KindReconcileSpace      = "reconcile:space"
 	KindSyncWelcome         = "space:sync_welcome"
 	KindApplyNicknameSuffix = "marking:apply_nickname_suffix"
+	KindSendInvite          = "notify:send_invite" // AC-M6-5: send invite email via notify queue
 )
 
 // ProvisionSpacePayload is the task payload for KindProvisionSpace.
@@ -83,6 +85,16 @@ type ApplyNicknameSuffixPayload struct {
 	UserID  string `json:"user_id"`
 	GuildID string `json:"guild_id"`
 	Suffix  string `json:"suffix"`
+}
+
+// SendInvitePayload is the task payload for KindSendInvite (AC-M6-5).
+// The worker loads the merchant invite link, fetches the user email, sends the SMTP email,
+// and stamps space_members.invite_sent_at on success.
+type SendInvitePayload struct {
+	SpaceMemberID string `json:"space_member_id"` // space_members.id (for StampSpaceMemberInviteSent)
+	SpaceID       string `json:"space_id"`
+	UserID        string `json:"user_id"`
+	MerchantID    string `json:"merchant_id"`
 }
 
 // Client wraps the asynq client and provides type-safe task builders.

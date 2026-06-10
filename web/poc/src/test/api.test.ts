@@ -9,7 +9,6 @@ import {
 
 const config: ApiConfig = {
   baseUrl: 'http://localhost:8080',
-  apiKey: 'test-key-abc123',
 }
 
 describe('API client — Authorization header', () => {
@@ -17,7 +16,7 @@ describe('API client — Authorization header', () => {
     vi.restoreAllMocks()
   })
 
-  it('sends Bearer token in every request', async () => {
+  it('does NOT send an Authorization header (proxy injects it server-side)', async () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -29,9 +28,7 @@ describe('API client — Authorization header', () => {
 
     expect(mockFetch).toHaveBeenCalledOnce()
     const [, options] = mockFetch.mock.calls[0] as [string, RequestInit]
-    expect((options.headers as Record<string, string>)['Authorization']).toBe(
-      `Bearer ${config.apiKey}`
-    )
+    expect((options.headers as Record<string, string>)['Authorization']).toBeUndefined()
   })
 
   it('includes Content-Type for mutating requests', async () => {

@@ -68,7 +68,7 @@ export function ProvisionSpaceDialog({ apiConfig, onProvisioned, merchants: prop
     : fetchedMerchants
 
   async function fetchMerchants() {
-    if (!apiConfig.apiKey || hasFetched.current) return
+    if (hasFetched.current) return
     setMerchantsLoading(true)
     try {
       const result = await listMerchants(apiConfig, { is_active: true })
@@ -78,7 +78,7 @@ export function ProvisionSpaceDialog({ apiConfig, onProvisioned, merchants: prop
       const message =
         err instanceof ApiError
           ? `[${err.code}] ${err.message}`
-          : 'Could not load merchants — check your API key and hub URL.'
+          : 'Could not load merchants.'
       toast.error('Failed to load merchants', { description: message })
       // Operator can still fall back to the manual UUID field.
     } finally {

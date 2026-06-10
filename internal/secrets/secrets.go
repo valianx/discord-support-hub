@@ -118,6 +118,8 @@ var secretFields = []string{
 	"access_token",
 	"refresh_token",
 	"bot_token",
+	"password", // covers smtp_password, valkey_password, etc. (SEC-M6-003)
+	"secret",   // covers *_secret, client_secret, etc. (SEC-M6-003)
 }
 
 const redacted = "***REDACTED***"

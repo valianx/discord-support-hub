@@ -124,6 +124,55 @@ func TestRedactLogAttr_SecretKeys(t *testing.T) {
 	}
 }
 
+// TestRedactLogAttr_PasswordAndSecretKeys verifies that keys containing "password"
+// or "secret" are redacted (SEC-M6-003). The Contains-based match means compound
+// names like smtp_password, valkey_password, and client_secret are all covered.
+func TestRedactLogAttr_PasswordAndSecretKeys(t *testing.T) {
+	cases := []struct {
+		key   string
+		value any
+	}{
+		{"password", "plaintext-password"},
+		{"smtp_password", "smtp-relay-password"},
+		{"valkey_password", "valkey-password"},
+		{"PASSWORD", "uppercase-password"},       // case-insensitive
+		{"secret", "bare-secret-value"},
+		{"client_secret", "oauth-client-secret"},
+		{"webhook_secret", "hmac-secret-bytes"},
+		{"APP_SECRET", "uppercase-secret"},        // case-insensitive
+	}
+
+	for _, tc := range cases {
+		got := secrets.RedactLogAttr(tc.key, tc.value)
+		if got == tc.value {
+			t.Errorf("RedactLogAttr(%q): expected redaction but got original value %q", tc.key, tc.value)
+		}
+	}
+}
+
+// TestRedactMap_PasswordAndSecretKeys verifies that RedactMap scrubs password/secret
+// keys from a map payload (SEC-M6-003).
+func TestRedactMap_PasswordAndSecretKeys(t *testing.T) {
+	secretValue := "must-not-appear-in-output"
+	input := map[string]any{
+		"smtp_password":  secretValue,
+		"client_secret":  secretValue,
+		"webhook_secret": secretValue,
+		"user_id":        "non-secret-id",
+	}
+
+	output := secrets.RedactMap(input)
+
+	for k, v := range output {
+		if v == secretValue {
+			t.Errorf("RedactMap: secret value leaked under key %q", k)
+		}
+	}
+	if output["user_id"] != "non-secret-id" {
+		t.Errorf("RedactMap: non-secret user_id was altered")
+	}
+}
+
 // TestRedactLogAttr_NonSecretKeys verifies that normal keys pass through unchanged.
 func TestRedactLogAttr_NonSecretKeys(t *testing.T) {
 	cases := []struct {

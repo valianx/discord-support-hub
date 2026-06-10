@@ -127,12 +127,6 @@ func (f *agentFakeStore) RevokeAPIKey(_ context.Context, _ string) error { panic
 func (f *agentFakeStore) TouchAPIKeyLastUsed(_ context.Context, _ string) error {
 	panic("TouchAPIKeyLastUsed")
 }
-func (f *agentFakeStore) UpsertOAuthToken(_ context.Context, _ store.UpsertOAuthTokenParams) (*domain.OAuthToken, error) {
-	panic("UpsertOAuthToken")
-}
-func (f *agentFakeStore) GetOAuthTokenByUserID(_ context.Context, _ string) (*domain.OAuthToken, error) {
-	panic("GetOAuthTokenByUserID")
-}
 func (f *agentFakeStore) CreateSpace(_ context.Context, _ store.CreateSpaceParams) (*domain.Space, error) {
 	panic("CreateSpace")
 }
@@ -192,8 +186,8 @@ func (f *agentFakeStore) CreateSpaceMember(_ context.Context, _ store.CreateSpac
 func (f *agentFakeStore) GetSpaceMemberBySpaceAndUser(_ context.Context, _, _ string) (*domain.SpaceMember, error) {
 	panic("GetSpaceMemberBySpaceAndUser")
 }
-func (f *agentFakeStore) SetSpaceMemberOverwriteApplied(_ context.Context, _ string) (*domain.SpaceMember, error) {
-	panic("SetSpaceMemberOverwriteApplied")
+func (f *agentFakeStore) StampSpaceMemberInviteSent(_ context.Context, _ string) (*domain.SpaceMember, error) {
+	panic("StampSpaceMemberInviteSent")
 }
 func (f *agentFakeStore) RevokeSpaceMember(_ context.Context, _ string) (*domain.SpaceMember, error) {
 	panic("RevokeSpaceMember")
@@ -237,6 +231,14 @@ func (f *agentFakeStore) ListActiveProvisionedSpaces(_ context.Context) ([]*doma
 	panic("ListActiveProvisionedSpaces")
 }
 
+// M6 store methods — not exercised by agent handler tests.
+func (f *agentFakeStore) SetMerchantInviteLink(_ context.Context, _ string, _ string) (*domain.Merchant, error) {
+	panic("SetMerchantInviteLink")
+}
+func (f *agentFakeStore) UpdateSpaceMerchantRoleID(_ context.Context, _, _ string) (*domain.Space, error) {
+	panic("UpdateSpaceMerchantRoleID")
+}
+
 // ─── Router helpers ───────────────────────────────────────────────────────────
 
 // buildAgentRouter builds a minimal Gin engine for agent endpoint tests.
@@ -254,9 +256,7 @@ func buildAgentRouter(s store.Store, principal *authz.Principal) *gin.Engine {
 	})
 
 	h := handlers.NewHandlers(handlers.Config{
-		Store:                   s,
-		DiscordOAuthClientID:    "test-client-id",
-		DiscordOAuthRedirectURL: "https://hub.example.com/v1/oauth/discord/callback",
+		Store: s,
 	})
 
 	r.GET("/agents", h.ListAgents)
@@ -363,10 +363,11 @@ func TestListAgents_NilPrincipal_Returns403(t *testing.T) {
 
 // ─── AC-2: POST /agents ───────────────────────────────────────────────────────
 
-// TestAddAgent_BackofficeKey_Returns201WithConnectURL verifies that a backoffice-scoped
+// TestAddAgent_BackofficeKey_Returns201 verifies that a backoffice-scoped
 // service key (the canonical production caller) can create an agent and receives 201
-// with a connect_url (§5.2). Authority comes from api_keys.scope, not is_admin.
-func TestAddAgent_BackofficeKey_Returns201WithConnectURL(t *testing.T) {
+// (§5.2). Authority comes from api_keys.scope, not is_admin.
+// M6: connect_url removed (OAuth2 removed, AC-M6-9). Agents join via invite link.
+func TestAddAgent_BackofficeKey_Returns201(t *testing.T) {
 	s := newAgentFakeStore()
 	r := buildAgentRouter(s, backofficePrincipal())
 
@@ -385,13 +386,14 @@ func TestAddAgent_BackofficeKey_Returns201WithConnectURL(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if resp["connect_url"] == nil || resp["connect_url"] == "" {
-		t.Error("response must include a non-empty 'connect_url'")
+	if resp["id"] == nil {
+		t.Error("response must include 'id'")
 	}
 }
 
-// TestAddAgent_Admin_Returns201WithConnectURL verifies Admin creates agent and gets connect_url (AC-2).
-func TestAddAgent_Admin_Returns201WithConnectURL(t *testing.T) {
+// TestAddAgent_Admin_Returns201 verifies Admin creates agent and gets 201 (AC-2).
+// M6: connect_url removed (OAuth2 removed, AC-M6-9).
+func TestAddAgent_Admin_Returns201(t *testing.T) {
 	s := newAgentFakeStore()
 	r := buildAgentRouter(s, adminPrincipal())
 
@@ -411,9 +413,6 @@ func TestAddAgent_Admin_Returns201WithConnectURL(t *testing.T) {
 	}
 	if resp["id"] == nil {
 		t.Error("response must include 'id'")
-	}
-	if resp["connect_url"] == nil || resp["connect_url"] == "" {
-		t.Error("response must include a non-empty 'connect_url'")
 	}
 	if resp["type"] != "agent" {
 		t.Errorf("want type=agent, got %v", resp["type"])

@@ -54,10 +54,11 @@ Se evaluaron varias alternativas (helpdesks tipo Freshdesk/Chatwoot, Slack Conne
 
 ### 4.3 ACL de los espacios
 
-- Todo espacio nace **invisible**: deny `@everyone` → `VIEW_CHANNEL`.
+- Todo espacio nace **invisible**: deny `@everyone` → `VIEW_CHANNEL`. Invariante no negociable.
 - El rol **Agente** lleva allow `VIEW_CHANNEL` a nivel **categoría** → los agentes ven todos los espacios con un solo overwrite por categoría.
-- Los **Colaboradores** acceden por **permission overwrite por usuario** sobre su espacio.
-- **No se usan roles por merchant.** Discord limita a 250 roles por servidor; un rol por merchant choca con ese techo y con los rate limits. La agrupación por merchant vive en la base de datos, no en roles de Discord.
+- Los **Colaboradores** acceden por **un rol por merchant**: cada merchant tiene un rol de Discord (creado por la API al aprovisionar, `GuildRoleCreate`), y el canal del merchant lleva allow `VIEW_CHANNEL`+`SEND_MESSAGES` para ese rol. El colaborador adquiere el rol al unirse mediante el enlace de invitación-con-rol del merchant (ver §5).
+- **Techo conocido — 250 roles por servidor.** Un rol por merchant es viable hasta ~200 merchants; más allá rompe y requeriría volver a overwrites por usuario o sharding multi-guild. Se documenta como límite explícito.
+- **Nota de reversión:** una versión previa de este documento rechazaba "roles por merchant" por el techo de 250 y resolvía el acceso de colaboradores con overwrites por usuario sobre OAuth2 `guilds.join`. Se invirtió esa decisión: OAuth2 exigía un callback público y un paso de autorización por navegador por usuario que el operador no puede alojar. La invitación-con-rol nativa elimina ambos, a costa de un rol por merchant.
 
 ### 4.4 Canal vs thread (escala)
 
@@ -74,14 +75,20 @@ Se evaluaron varias alternativas (helpdesks tipo Freshdesk/Chatwoot, Slack Conne
 
 ---
 
-## 5. Onboarding y acceso (solo por API, sin invites de Discord)
+## 5. Onboarding y acceso (rol por merchant + invitación-con-rol nativa)
 
 Dos capas distintas:
 
-- **Acceso a canales:** siempre es *permission overwrite* (no existe "invite" a nivel canal). Ya es 100% por API.
-- **Entrada al servidor:** se hace vía **OAuth2 con scope `guilds.join`** — el colaborador hace un "Connect with Discord" una sola vez, el backend guarda su access token y el servicio lo agrega al guild por API. **Sin invite links.**
+- **Acceso a canales:** el canal del merchant lleva allow para el **rol del merchant** (creado por la API al aprovisionar). El colaborador obtiene acceso al adquirir ese rol. 100% gobernado por la API y por la base de datos (fuente de verdad).
+- **Entrada al servidor y asignación de rol:** vía un **enlace de invitación-con-rol nativo de Discord**, atado al rol del merchant. Discord asigna el rol automáticamente al unirse. El enlace se crea **una sola vez, a mano, en el cliente de Discord** (diálogo "Roles (opcional)"), porque la API REST del bot **no puede** atar un rol a un invite creado por API (el campo `roles` se ignora silenciosamente — verificado en vivo). El hub guarda ese enlace por merchant y **lo envía por email él mismo** (SMTP propio + mensaje configurable); Discord no envía el email.
 
-Para que el bot pueda usar el endpoint *Add Guild Member* necesita el permiso `CREATE_INSTANT_INVITE`. Se resuelve dejando ese permiso **solo en el bot**: deny para `@everyone`, Agentes y Colaboradores. Así ningún humano puede generar invites, pero el bot sí puede aprovisionar.
+Trazabilidad: el backoffice registra **nombre + email de trabajo** del colaborador y los guarda en Postgres. Son etiquetas propias, nunca una primitiva de Discord (los permisos de Discord se indexan por user-id o rol, **nunca por email**; no se puede buscar un usuario de Discord por email).
+
+Se rechaza explícitamente un listener de gateway / Server Members Intent para auto-asignar el rol al unirse: el worker queda **solo-REST**. La asignación de rol la resuelve Discord de forma nativa con el invite-con-rol.
+
+Para que el bot administre roles y aprovisione, `MANAGE_ROLES` y `CREATE_INSTANT_INVITE` quedan **solo en el bot** (deny para `@everyone`, Agentes y Colaboradores): ningún humano asigna roles ni genera invites por su cuenta, y toda concesión manual en el cliente se trata como drift y se revierte en la reconciliación.
+
+Un canal `#bienvenida` visible para `@everyone`, con un mensaje de bienvenida configurable, da un lugar al que llega el colaborador antes de que aparezca su canal con rol.
 
 ---
 
@@ -91,7 +98,7 @@ Para que el bot pueda usar el endpoint *Add Guild Member* necesita el permiso `C
 | :-- | :-- |
 | FR-1 | Aprovisionar un espacio privado por merchant vía API (naming y categoría configurables). |
 | FR-2 | Soportar modo **canal** y modo **thread privado**, seleccionable por configuración. |
-| FR-3 | Aplicar ACL por espacio: deny `@everyone`, allow rol Agente (categoría), allow por usuario para Colaboradores. N colaboradores por espacio. |
+| FR-3 | Aplicar ACL por espacio: deny `@everyone`, allow rol Agente (categoría), **allow del rol del merchant** para Colaboradores. N colaboradores por espacio. |
 | FR-4 | Gestionar membresía de colaboradores: agregar/quitar usuarios de un espacio. |
 | FR-5 | Garantizar invisibilidad por defecto: un espacio solo es accesible tras una invitación ejecutada por un Agente; no se puede descubrir sin invitación. |
 | FR-6 | Acceso de Agentes de lectura/escritura a todos los espacios (vía rol a nivel categoría). |
@@ -110,7 +117,7 @@ Para que el bot pueda usar el endpoint *Add Guild Member* necesita el permiso `C
 | FR-19 | Expulsión por un Agente, con alcance configurable: remove-from-channel (revoca overwrite) o remove-from-server (saca del guild). Acción auditada. |
 | FR-20 | Invitación restringida: solo Agentes pueden invitar/dar acceso; los Colaboradores no pueden invitar a nadie. |
 | FR-21 | Endpoint "canales por colaborador": retorna los espacios a los que un colaborador tiene acceso (con merchant, rol y estado). |
-| FR-22 | Provisioning solo por API: alta al servidor vía OAuth2 `guilds.join`; acceso por overwrites; sin invite links. |
+| FR-22 | Provisioning solo por API: la API crea el rol del merchant y el allow del canal; el colaborador entra y obtiene el rol mediante el enlace de invitación-con-rol del merchant (guardado y enviado por email por el hub). Ver §5. |
 | FR-23 | Gestión y marcado de Agentes: alta/baja por la capa Admin; `type` (agent/collaborator) e `is_admin` en el store como fuente de verdad; el bot proyecta y reconcilia el rol Agente. |
 | FR-24 | Marcado visual del Agente configurable (role icon, color, hoist y/o prefijo de apodo) con degradación elegante según capacidades del servidor (p. ej. ausencia de Boost L2). |
 
@@ -125,7 +132,7 @@ Para que el bot pueda usar el endpoint *Add Guild Member* necesita el permiso `C
 | NFR-3 | **Idempotencia y reconciliación:** operaciones idempotentes (reintentar no duplica); reconciliación estado deseado (DB) vs real (Discord) con auto-reparación de drift. |
 | NFR-4 | **Fail-closed:** si falla aplicar la ACL, el espacio queda sin acceso por defecto, jamás world-readable. |
 | NFR-5 | **Aislamiento multi-tenant:** la separación entre clientes es un invariante de seguridad, verificable y testeable. |
-| NFR-6 | **Manejo de secretos:** bot token y access tokens OAuth2 de colaboradores cifrados; redacción de secretos en logs. |
+| NFR-6 | **Manejo de secretos:** bot token y credenciales SMTP por config/env (nunca persistidos); redacción de secretos en logs. No hay tokens OAuth2 por usuario (el modelo de invitación-con-rol no maneja credenciales de Discord). El email del colaborador es PII (ver NFR-12). |
 | NFR-7 | **Observabilidad:** logging estructurado, métricas (latencia de aprovisionamiento, espacios activos, rate-limit hits, errores), tracing OpenTelemetry (W3C), health checks. |
 | NFR-8 | **Extensibilidad:** storage backend pluggable, estrategia de aprovisionamiento configurable, hooks/webhooks de eventos; lógica de negocio en userland. |
 | NFR-9 | **Estado y recuperación:** store persistente del mapeo merchant↔espacio↔usuarios para sobrevivir reinicios; backups; sin pérdida de mapeo. |
@@ -152,9 +159,15 @@ Contratos detallados (request/response, códigos) se definen después.
 - `POST /channels/{id}/lifecycle` — open/resolve/archive/reopen (FR-7)
 - `POST /channels/{id}/welcome:sync` — mensaje/sticky de help desk (FR-15)
 
+**Merchants**
+
+- `POST /merchants` · `GET /merchants` · `GET /merchants/{merchantId}` — alta y consulta
+- `PUT /merchants/{merchantId}/invite` — guardar el enlace de invitación-con-rol del merchant
+
 **Colaboradores**
 
-- `POST /channels/{id}/collaborators` — invitar (overwrite + OAuth2 join si aplica)
+- `POST /channels/{id}/collaborators` — registrar (nombre + email; sin efecto en Discord)
+- `POST /channels/{id}/collaborators/{userId}:send-invite` — enviar el enlace por email (SMTP)
 - `DELETE /channels/{id}/collaborators/{userId}?scope=channel|server` — expulsar (FR-19)
 - `GET /collaborators/{userId}/channels` — canales del colaborador (FR-21)
 
@@ -166,9 +179,8 @@ Contratos detallados (request/response, códigos) se definen después.
 
 - `GET /directory` — espacios × usuarios × rol (FR-18)
 - `GET /audit` — log de acciones (FR-14)
-- `GET /oauth/discord/callback` — "Connect with Discord" del colaborador (FR-22)
 
-Las operaciones mutantes encolan jobs; los GET leen de cache. Toda la superficie resuelve AuthZ contra el store.
+Las operaciones mutantes con efecto en Discord o email encolan jobs; los GET y los registros sin efecto inmediato (alta de colaborador, guardar invite) responden sincrónicamente. Toda la superficie resuelve AuthZ contra el store.
 
 ---
 

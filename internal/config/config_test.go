@@ -107,6 +107,93 @@ func TestRequireAgentRoleID(t *testing.T) {
 	})
 }
 
+// ─── AC-M6-9: OAuth2 removed — config loads without OAuth env vars ───────────
+
+// TestLoad_NoOAuthFieldsRequired verifies that config.Load() succeeds without any
+// of the former OAuth2/encryption environment variables set (AC-M6-9).
+//
+// Prior to M6, DISCORD_OAUTH_CLIENT_ID, DISCORD_OAUTH_CLIENT_SECRET,
+// OAUTH_HMAC_SECRET, and ENCRYPTION_KEY were required fields. They must now
+// be absent from the Config struct and Load() must not fail without them.
+func TestLoad_NoOAuthFieldsRequired(t *testing.T) {
+	// Ensure all former OAuth env vars are absent.
+	clearEnv(t,
+		"DISCORD_OAUTH_CLIENT_ID",
+		"DISCORD_OAUTH_CLIENT_SECRET",
+		"OAUTH_HMAC_SECRET",
+		"ENCRYPTION_KEY",
+	)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("AC-M6-9: config.Load() must not fail without OAuth env vars: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("AC-M6-9: Load() returned nil config")
+	}
+}
+
+// TestLoad_OAuthEnvVarsAreIgnored verifies that setting former OAuth env vars
+// does NOT cause config.Load() to fail (they are silently ignored, AC-M6-9).
+func TestLoad_OAuthEnvVarsAreIgnored(t *testing.T) {
+	t.Setenv("DISCORD_OAUTH_CLIENT_ID", "should-be-ignored")
+	t.Setenv("DISCORD_OAUTH_CLIENT_SECRET", "should-be-ignored")
+	t.Setenv("OAUTH_HMAC_SECRET", "should-be-ignored")
+	t.Setenv("ENCRYPTION_KEY", "should-be-ignored")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("AC-M6-9: config.Load() must not fail when OAuth env vars are set (just ignored): %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("AC-M6-9: Load() returned nil config")
+	}
+}
+
+// TestLoad_SMTPFieldsPresent verifies that the M6 SMTP config fields are
+// present on the struct and populated from env vars (AC-M6-5).
+func TestLoad_SMTPFieldsPresent(t *testing.T) {
+	t.Setenv("SMTP_HOST", "smtp.example.com")
+	t.Setenv("SMTP_PORT", "587")
+	t.Setenv("SMTP_USERNAME", "user@example.com")
+	t.Setenv("SMTP_PASSWORD", "fake-smtp-password-for-test")
+	t.Setenv("SMTP_FROM", "noreply@example.com")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.SMTPHost != "smtp.example.com" {
+		t.Errorf("SMTPHost: want smtp.example.com, got %q", cfg.SMTPHost)
+	}
+	if cfg.SMTPPort != 587 {
+		t.Errorf("SMTPPort: want 587, got %d", cfg.SMTPPort)
+	}
+	if cfg.SMTPUsername != "user@example.com" {
+		t.Errorf("SMTPUsername: want user@example.com, got %q", cfg.SMTPUsername)
+	}
+	if cfg.SMTPFrom != "noreply@example.com" {
+		t.Errorf("SMTPFrom: want noreply@example.com, got %q", cfg.SMTPFrom)
+	}
+	// SMTPPassword is present in the struct (never logged, but must be readable).
+	if cfg.SMTPPassword != "fake-smtp-password-for-test" {
+		t.Errorf("SMTPPassword: want populated, got %q", cfg.SMTPPassword)
+	}
+}
+
+// TestLoad_SMTPDefaultPort verifies that SMTP_PORT defaults to 587 when not set (AC-M6-5).
+func TestLoad_SMTPDefaultPort(t *testing.T) {
+	clearEnv(t, "SMTP_PORT")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.SMTPPort != 587 {
+		t.Errorf("SMTPPort: want default 587, got %d", cfg.SMTPPort)
+	}
+}
+
 func clearEnv(t *testing.T, keys ...string) {
 	t.Helper()
 	for _, k := range keys {

@@ -83,12 +83,6 @@ func (n *noopStore) RevokeAPIKey(_ context.Context, _ string) error {
 func (n *noopStore) TouchAPIKeyLastUsed(_ context.Context, _ string) error {
 	panic("TouchAPIKeyLastUsed not stubbed")
 }
-func (n *noopStore) UpsertOAuthToken(_ context.Context, _ store.UpsertOAuthTokenParams) (*domain.OAuthToken, error) {
-	panic("UpsertOAuthToken not stubbed")
-}
-func (n *noopStore) GetOAuthTokenByUserID(_ context.Context, _ string) (*domain.OAuthToken, error) {
-	panic("GetOAuthTokenByUserID not stubbed")
-}
 func (n *noopStore) CreateSpace(_ context.Context, _ store.CreateSpaceParams) (*domain.Space, error) {
 	panic("CreateSpace not stubbed")
 }
@@ -148,8 +142,8 @@ func (n *noopStore) CreateSpaceMember(_ context.Context, _ store.CreateSpaceMemb
 func (n *noopStore) GetSpaceMemberBySpaceAndUser(_ context.Context, _, _ string) (*domain.SpaceMember, error) {
 	panic("GetSpaceMemberBySpaceAndUser not stubbed")
 }
-func (n *noopStore) SetSpaceMemberOverwriteApplied(_ context.Context, _ string) (*domain.SpaceMember, error) {
-	panic("SetSpaceMemberOverwriteApplied not stubbed")
+func (n *noopStore) StampSpaceMemberInviteSent(_ context.Context, _ string) (*domain.SpaceMember, error) {
+	panic("StampSpaceMemberInviteSent not stubbed")
 }
 func (n *noopStore) RevokeSpaceMember(_ context.Context, _ string) (*domain.SpaceMember, error) {
 	panic("RevokeSpaceMember not stubbed")
@@ -190,6 +184,14 @@ func (n *noopStore) GetJobBySpaceIDAndKind(_ context.Context, _, _ string) (*dom
 // ListActiveProvisionedSpaces satisfies store.Store (added in M5 for the scheduled sweep).
 func (n *noopStore) ListActiveProvisionedSpaces(_ context.Context) ([]*domain.Space, error) {
 	panic("ListActiveProvisionedSpaces not stubbed")
+}
+
+// M6 store methods — not exercised by middleware tests.
+func (n *noopStore) SetMerchantInviteLink(_ context.Context, _ string, _ string) (*domain.Merchant, error) {
+	panic("SetMerchantInviteLink not stubbed")
+}
+func (n *noopStore) UpdateSpaceMerchantRoleID(_ context.Context, _, _ string) (*domain.Space, error) {
+	panic("UpdateSpaceMerchantRoleID not stubbed")
 }
 
 // authFakeStore overrides only the two methods Layer A needs.

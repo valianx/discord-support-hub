@@ -14,22 +14,25 @@ import (
 )
 
 // expectedQueueTopology is the canonical priority map from docs/02-architecture.md §3.4.
-// It is the ground truth for AC-4 and must match exactly what worker.New() passes to
-// asynq.Config.Queues. If this map diverges from the implementation, the CI server
+// It is the ground truth for AC-4/AC-M6-6 and must match exactly what worker.New() passes
+// to asynq.Config.Queues. If this map diverges from the implementation, the CI server
 // (which can run with a real Redis) will catch it; the hermetic test guards the contract
 // shape without a network call.
+//
+// M6: fifth queue "notify" added for the send_invite handler (AC-M6-6).
 var expectedQueueTopology = map[string]int{
 	queue.QueueProvision:  3, // high — space creation, ACL apply
 	queue.QueueMembership: 3, // high — overwrite add/remove, role assign, guild add
 	queue.QueueReconcile:  1, // low  — drift detection + repair
 	queue.QueueMarking:    1, // low  — optional nickname suffix (M4)
+	queue.QueueNotify:     2, // default — invite emails, M6 (AC-M6-6)
 }
 
-// TestQueueTopology_FourQueuesRegistered verifies that exactly four queues are declared
-// in the worker topology (AC-4). The four names must be the canonical strings from §3.4.
-func TestQueueTopology_FourQueuesRegistered(t *testing.T) {
-	if len(expectedQueueTopology) != 4 {
-		t.Fatalf("topology map must have exactly 4 queues, got %d", len(expectedQueueTopology))
+// TestQueueTopology_FiveQueuesRegistered verifies that exactly five queues are declared
+// in the worker topology (AC-M6-6). The five names must be the canonical strings from §3.4.
+func TestQueueTopology_FiveQueuesRegistered(t *testing.T) {
+	if len(expectedQueueTopology) != 5 {
+		t.Fatalf("AC-M6-6: topology map must have exactly 5 queues, got %d — 'notify' queue must be present", len(expectedQueueTopology))
 	}
 
 	required := []string{
@@ -37,12 +40,25 @@ func TestQueueTopology_FourQueuesRegistered(t *testing.T) {
 		queue.QueueMembership,
 		queue.QueueReconcile,
 		queue.QueueMarking,
+		queue.QueueNotify, // M6-new (AC-M6-6)
 	}
 
 	for _, q := range required {
 		if _, ok := expectedQueueTopology[q]; !ok {
 			t.Errorf("required queue %q is not in the topology map", q)
 		}
+	}
+}
+
+// TestQueueTopology_NotifyQueueDefaultPriority verifies that QueueNotify is assigned
+// priority 2 (default) as specified for the invite-email queue (AC-M6-6).
+func TestQueueTopology_NotifyQueueDefaultPriority(t *testing.T) {
+	p, ok := expectedQueueTopology[queue.QueueNotify]
+	if !ok {
+		t.Fatal("AC-M6-6: QueueNotify is not in the topology map")
+	}
+	if p != 2 {
+		t.Errorf("AC-M6-6: QueueNotify must have priority 2 (default), got %d", p)
 	}
 }
 
@@ -89,10 +105,11 @@ func TestQueueTopology_NoZeroOrNegativePriority(t *testing.T) {
 	}
 }
 
-// TestHandlerKinds_AllNineRegistered verifies that all nine task kind strings that
+// TestHandlerKinds_AllTenRegistered verifies that all ten task kind strings that
 // worker.registerHandlers() binds to the ServeMux are non-empty and unique.
 // A missing or duplicate kind would cause asynq to silently drop or mis-route tasks.
-func TestHandlerKinds_AllNineRegistered(t *testing.T) {
+// M6: KindSendInvite added as the 10th handler (AC-M6-6).
+func TestHandlerKinds_AllTenRegistered(t *testing.T) {
 	kinds := []string{
 		queue.KindProvisionSpace,
 		queue.KindInviteCollaborator,
@@ -103,10 +120,11 @@ func TestHandlerKinds_AllNineRegistered(t *testing.T) {
 		queue.KindReconcileSpace,
 		queue.KindSyncWelcome,
 		queue.KindApplyNicknameSuffix,
+		queue.KindSendInvite, // M6 (AC-M6-6)
 	}
 
-	if len(kinds) != 9 {
-		t.Fatalf("expected 9 task kinds registered, got %d", len(kinds))
+	if len(kinds) != 10 {
+		t.Fatalf("AC-M6-6: expected 10 task kinds registered (including KindSendInvite), got %d", len(kinds))
 	}
 
 	seen := make(map[string]bool, len(kinds))

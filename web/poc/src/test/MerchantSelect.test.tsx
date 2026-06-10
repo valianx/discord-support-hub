@@ -6,7 +6,6 @@ import type { ApiConfig, Merchant } from '@/lib/api'
 
 const config: ApiConfig = {
   baseUrl: 'http://localhost:8080',
-  apiKey: 'test-key-abc123',
 }
 
 const sampleMerchants: Merchant[] = [
@@ -15,6 +14,8 @@ const sampleMerchants: Merchant[] = [
     external_ref: 'acme-corp',
     name: 'Acme Corp',
     help_desk_url: null,
+    invite_link: null,
+    invite_link_set_at: null,
     is_active: true,
     created_at: '2026-06-09T00:00:00Z',
   },
@@ -23,6 +24,8 @@ const sampleMerchants: Merchant[] = [
     external_ref: 'globex',
     name: 'Globex',
     help_desk_url: null,
+    invite_link: null,
+    invite_link_set_at: null,
     is_active: true,
     created_at: '2026-06-09T00:00:00Z',
   },

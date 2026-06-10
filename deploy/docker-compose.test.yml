@@ -30,21 +30,22 @@ x-app-env: &app-env
   DISCORD_AGENT_ROLE_ID: "${DISCORD_AGENT_ROLE_ID:-100000000000000002}"  # must differ from guild id (boot guard)
   DISCORD_CATEGORY_ID: "${DISCORD_CATEGORY_ID:-100000000000000003}"
 
-  # OAuth2 (collaborator onboarding) — empty by default; set in deploy/.env.demo if needed.
-  DISCORD_OAUTH_CLIENT_ID: "${DISCORD_OAUTH_CLIENT_ID:-}"
-  DISCORD_OAUTH_CLIENT_SECRET: "${DISCORD_OAUTH_CLIENT_SECRET:-}"
-  DISCORD_OAUTH_REDIRECT_URL: "${DISCORD_OAUTH_REDIRECT_URL:-http://localhost:3000/v1/oauth/discord/callback}"
-
   # Operator brand: agent nickname suffix (e.g. "- Acme"). Empty = marking off.
   AGENT_NICKNAME_SUFFIX: "${AGENT_NICKNAME_SUFFIX:-}"
 
-  # AES-256-GCM key (base64 32 bytes) — TEST default; override in deploy/.env.demo.
-  # Generate your own: openssl rand -base64 32
-  ENCRYPTION_KEY: "${ENCRYPTION_KEY:-Gk7yssW60Qb46DN6tZ97l9gxxuvXdlsvMU/n2SI5hgo=}"
+  # SMTP relay for the invite email (notify queue). Defaults point at the Mailpit
+  # catcher in this stack — no auth, no TLS — so send-invite works out of the box
+  # and the email is viewable at http://localhost:8025. Override in deploy/.env.demo
+  # to send through a real relay.
+  SMTP_HOST: "${SMTP_HOST:-mailpit}"
+  SMTP_PORT: "${SMTP_PORT:-1025}"
+  SMTP_USERNAME: "${SMTP_USERNAME:-}"
+  SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+  SMTP_FROM: "${SMTP_FROM:-support@discord-support-hub.test}"
 
-  # HMAC secret (hex 32 bytes) — TEST default; override in deploy/.env.demo.
-  # Generate your own: openssl rand -hex 32
-  OAUTH_HMAC_SECRET: "${OAUTH_HMAC_SECRET:-d2344cc14d716cd4d1c360257b68876ad15bd6ff20126cefe2135c5acd021212}"
+  # Welcome channel (#bienvenida) — created visible to @everyone with this message.
+  WELCOME_CHANNEL_NAME: "${WELCOME_CHANNEL_NAME:-bienvenida}"
+  WELCOME_MESSAGE: "${WELCOME_MESSAGE:-Welcome to Support. Your private channel will appear once your role is assigned.}"
 
   # Disable the reconcile sweep in the test stack (no real Discord to sweep).
   RECONCILE_SWEEP_CRON: ""
@@ -128,18 +129,41 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      mailpit:
+        condition: service_started
 
   # Frontend — nginx serving the Vite SPA build; proxies /v1, /livez, /readyz, /metrics to api.
   # Open http://localhost:3000 in your browser.
+  #
+  # The nginx reverse-proxy injects "Authorization: Bearer <key>" on every /v1/ request
+  # using BACKOFFICE_API_KEY. The browser never sees or holds the key.
+  # Mint a key with:
+  #   docker compose -f deploy/docker-compose.test.yml --profile tools run --rm keygen
+  # Then set it in deploy/.env.demo (git-ignored) or export it in your shell before `up`.
   frontend:
     build:
       context: ../web/poc
       dockerfile: Dockerfile
     ports:
       - "3000:80"
+    environment:
+      # Operator mints a key with the keygen tool and sets this variable.
+      # The value is injected into the nginx config at container start via envsubst.
+      BACKOFFICE_API_KEY: "${BACKOFFICE_API_KEY:-}"
+      NGINX_ENVSUBST_FILTER: "BACKOFFICE_API_KEY"
     depends_on:
       api:
         condition: service_started
+
+  # Mailpit — SMTP catcher for the invite email. Accepts mail on :1025 (no auth,
+  # no TLS); view captured messages at http://localhost:8025.
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "8025:8025"
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
 
   # ── Tools profile ────────────────────────────────────────────────────────────
   # Services in this profile do NOT start on a normal `docker compose up`.

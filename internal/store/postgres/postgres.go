@@ -65,7 +65,8 @@ func (s *Store) CreateMerchant(ctx context.Context, p store.CreateMerchantParams
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO merchants (external_ref, name, help_desk_url)
 		VALUES ($1, $2, $3)
-		RETURNING id, external_ref, name, help_desk_url, is_active, created_at, updated_at`,
+		RETURNING id, external_ref, name, help_desk_url, invite_link, invite_link_set_at,
+		          is_active, created_at, updated_at`,
 		p.ExternalRef, p.Name, p.HelpDeskURL,
 	)
 	m, err := scanMerchant(row)
@@ -81,7 +82,8 @@ func (s *Store) CreateMerchant(ctx context.Context, p store.CreateMerchantParams
 // GetMerchantByID returns the merchant for the given id.
 func (s *Store) GetMerchantByID(ctx context.Context, id string) (*domain.Merchant, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, external_ref, name, help_desk_url, is_active, created_at, updated_at
+		SELECT id, external_ref, name, help_desk_url, invite_link, invite_link_set_at,
+		       is_active, created_at, updated_at
 		FROM merchants WHERE id = $1`, id)
 	return scanMerchant(row)
 }
@@ -90,9 +92,28 @@ func (s *Store) GetMerchantByID(ctx context.Context, id string) (*domain.Merchan
 // Returns store.ErrNotFound when no row matches.
 func (s *Store) GetMerchantByExternalRef(ctx context.Context, ref string) (*domain.Merchant, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, external_ref, name, help_desk_url, is_active, created_at, updated_at
+		SELECT id, external_ref, name, help_desk_url, invite_link, invite_link_set_at,
+		       is_active, created_at, updated_at
 		FROM merchants WHERE external_ref = $1`, ref)
 	return scanMerchant(row)
+}
+
+// SetMerchantInviteLink stores the native Discord invite-with-role URL for a merchant.
+// Returns store.ErrNotFound when the merchant does not exist (AC-M6-3).
+func (s *Store) SetMerchantInviteLink(ctx context.Context, merchantID, inviteLink string) (*domain.Merchant, error) {
+	row := s.pool.QueryRow(ctx, `
+		UPDATE merchants
+		SET invite_link = $1, invite_link_set_at = now(), updated_at = now()
+		WHERE id = $2
+		RETURNING id, external_ref, name, help_desk_url, invite_link, invite_link_set_at,
+		          is_active, created_at, updated_at`,
+		inviteLink, merchantID,
+	)
+	m, err := scanMerchant(row)
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // ListMerchants returns merchants ordered by created_at ASC with optional filters
@@ -116,7 +137,8 @@ func (s *Store) ListMerchants(ctx context.Context, p store.ListMerchantsParams) 
 	}
 
 	args = append(args, limit)
-	query := `SELECT id, external_ref, name, help_desk_url, is_active, created_at, updated_at
+	query := `SELECT id, external_ref, name, help_desk_url, invite_link, invite_link_set_at,
+		         is_active, created_at, updated_at
 		  FROM merchants` + where + fmt.Sprintf(` ORDER BY created_at ASC LIMIT $%d`, len(args))
 
 	rows, err := s.pool.Query(ctx, query, args...)
@@ -140,6 +162,7 @@ func scanMerchant(row interface{ Scan(dest ...any) error }) (*domain.Merchant, e
 	var m domain.Merchant
 	err := row.Scan(
 		&m.ID, &m.ExternalRef, &m.Name, &m.HelpDeskURL,
+		&m.InviteLink, &m.InviteLinkSetAt,
 		&m.IsActive, &m.CreatedAt, &m.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -382,66 +405,6 @@ func scanAPIKey(row interface {
 	return &k, nil
 }
 
-// ─── OAuth Tokens ─────────────────────────────────────────────────────────────
-
-// UpsertOAuthToken stores or replaces an encrypted OAuth token (UNIQUE user_id).
-func (s *Store) UpsertOAuthToken(ctx context.Context, p store.UpsertOAuthTokenParams) (*domain.OAuthToken, error) {
-	row := s.pool.QueryRow(ctx, `
-		INSERT INTO oauth_tokens (
-			user_id, access_token_cipher, access_token_nonce,
-			refresh_token_cipher, refresh_token_nonce,
-			encryption_key_version, scopes, expires_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-		ON CONFLICT (user_id) DO UPDATE SET
-			access_token_cipher    = EXCLUDED.access_token_cipher,
-			access_token_nonce     = EXCLUDED.access_token_nonce,
-			refresh_token_cipher   = EXCLUDED.refresh_token_cipher,
-			refresh_token_nonce    = EXCLUDED.refresh_token_nonce,
-			encryption_key_version = EXCLUDED.encryption_key_version,
-			scopes                 = EXCLUDED.scopes,
-			expires_at             = EXCLUDED.expires_at,
-			updated_at             = now()
-		RETURNING id, user_id, access_token_cipher, access_token_nonce,
-		          refresh_token_cipher, refresh_token_nonce,
-		          encryption_key_version, scopes, expires_at, created_at, updated_at`,
-		p.UserID,
-		p.AccessTokenCipher, p.AccessTokenNonce,
-		p.RefreshTokenCipher, p.RefreshTokenNonce,
-		p.EncryptionKeyVersion, p.Scopes, p.ExpiresAt,
-	)
-	return scanOAuthToken(row)
-}
-
-// GetOAuthTokenByUserID returns the stored encrypted token for a user.
-func (s *Store) GetOAuthTokenByUserID(ctx context.Context, userID string) (*domain.OAuthToken, error) {
-	row := s.pool.QueryRow(ctx, `
-		SELECT id, user_id, access_token_cipher, access_token_nonce,
-		       refresh_token_cipher, refresh_token_nonce,
-		       encryption_key_version, scopes, expires_at, created_at, updated_at
-		FROM oauth_tokens WHERE user_id = $1`, userID)
-	return scanOAuthToken(row)
-}
-
-func scanOAuthToken(row interface {
-	Scan(dest ...any) error
-}) (*domain.OAuthToken, error) {
-	var t domain.OAuthToken
-	err := row.Scan(
-		&t.ID, &t.UserID,
-		&t.AccessTokenCipher, &t.AccessTokenNonce,
-		&t.RefreshTokenCipher, &t.RefreshTokenNonce,
-		&t.EncryptionKeyVersion, &t.Scopes, &t.ExpiresAt,
-		&t.CreatedAt, &t.UpdatedAt,
-	)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, store.ErrNotFound
-	}
-	if err != nil {
-		return nil, fmt.Errorf("postgres: scan oauth_token: %w", err)
-	}
-	return &t, nil
-}
-
 // ─── Spaces ───────────────────────────────────────────────────────────────────
 
 // CreateSpace inserts a new desired-state space row.
@@ -449,8 +412,8 @@ func (s *Store) CreateSpace(ctx context.Context, p store.CreateSpaceParams) (*do
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO spaces (merchant_id, name, discord_category_id)
 		VALUES ($1, $2, $3)
-		RETURNING id, merchant_id, discord_channel_id, discord_category_id, name,
-		          lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		RETURNING id, merchant_id, discord_channel_id, discord_category_id, merchant_role_id,
+		          name, lifecycle_state, acl_state, welcome_message_id, last_activity_at,
 		          reconciled_at, drift_count, created_at, updated_at, archived_at`,
 		p.MerchantID, p.Name, p.DiscordCategoryID,
 	)
@@ -468,8 +431,8 @@ func (s *Store) CreateSpace(ctx context.Context, p store.CreateSpaceParams) (*do
 // GetSpaceByID returns the space for the given id.
 func (s *Store) GetSpaceByID(ctx context.Context, id string) (*domain.Space, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, merchant_id, discord_channel_id, discord_category_id, name,
-		       lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		SELECT id, merchant_id, discord_channel_id, discord_category_id, merchant_role_id,
+		       name, lifecycle_state, acl_state, welcome_message_id, last_activity_at,
 		       reconciled_at, drift_count, created_at, updated_at, archived_at
 		FROM spaces WHERE id = $1`, id)
 	return scanSpace(row)
@@ -478,8 +441,8 @@ func (s *Store) GetSpaceByID(ctx context.Context, id string) (*domain.Space, err
 // GetSpaceByMerchantID returns the single space owned by the merchant.
 func (s *Store) GetSpaceByMerchantID(ctx context.Context, merchantID string) (*domain.Space, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, merchant_id, discord_channel_id, discord_category_id, name,
-		       lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		SELECT id, merchant_id, discord_channel_id, discord_category_id, merchant_role_id,
+		       name, lifecycle_state, acl_state, welcome_message_id, last_activity_at,
 		       reconciled_at, drift_count, created_at, updated_at, archived_at
 		FROM spaces WHERE merchant_id = $1`, merchantID)
 	return scanSpace(row)
@@ -492,10 +455,24 @@ func (s *Store) UpdateSpaceDiscordChannel(ctx context.Context, p store.UpdateSpa
 		SET discord_channel_id = $1, discord_category_id = COALESCE($2, discord_category_id),
 		    acl_state = $3, updated_at = now()
 		WHERE id = $4
-		RETURNING id, merchant_id, discord_channel_id, discord_category_id, name,
-		          lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		RETURNING id, merchant_id, discord_channel_id, discord_category_id, merchant_role_id,
+		          name, lifecycle_state, acl_state, welcome_message_id, last_activity_at,
 		          reconciled_at, drift_count, created_at, updated_at, archived_at`,
 		p.DiscordChannelID, p.DiscordCategoryID, p.ACLState, p.SpaceID,
+	)
+	return scanSpace(row)
+}
+
+// UpdateSpaceMerchantRoleID persists the Discord merchant role id after GuildRoleCreate (AC-M6-1).
+// Idempotent: if merchant_role_id is already set to the same value the update is a no-op.
+func (s *Store) UpdateSpaceMerchantRoleID(ctx context.Context, spaceID, roleID string) (*domain.Space, error) {
+	row := s.pool.QueryRow(ctx, `
+		UPDATE spaces SET merchant_role_id = $1, updated_at = now()
+		WHERE id = $2
+		RETURNING id, merchant_id, discord_channel_id, discord_category_id, merchant_role_id,
+		          name, lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		          reconciled_at, drift_count, created_at, updated_at, archived_at`,
+		roleID, spaceID,
 	)
 	return scanSpace(row)
 }
@@ -505,8 +482,8 @@ func (s *Store) UpdateSpaceACLState(ctx context.Context, spaceID string, state d
 	row := s.pool.QueryRow(ctx, `
 		UPDATE spaces SET acl_state = $1, updated_at = now()
 		WHERE id = $2
-		RETURNING id, merchant_id, discord_channel_id, discord_category_id, name,
-		          lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		RETURNING id, merchant_id, discord_channel_id, discord_category_id, merchant_role_id,
+		          name, lifecycle_state, acl_state, welcome_message_id, last_activity_at,
 		          reconciled_at, drift_count, created_at, updated_at, archived_at`,
 		state, spaceID,
 	)
@@ -516,8 +493,8 @@ func (s *Store) UpdateSpaceACLState(ctx context.Context, spaceID string, state d
 func scanSpace(row interface{ Scan(dest ...any) error }) (*domain.Space, error) {
 	var sp domain.Space
 	err := row.Scan(
-		&sp.ID, &sp.MerchantID, &sp.DiscordChannelID, &sp.DiscordCategoryID, &sp.Name,
-		&sp.LifecycleState, &sp.ACLState, &sp.WelcomeMessageID, &sp.LastActivityAt,
+		&sp.ID, &sp.MerchantID, &sp.DiscordChannelID, &sp.DiscordCategoryID, &sp.MerchantRoleID,
+		&sp.Name, &sp.LifecycleState, &sp.ACLState, &sp.WelcomeMessageID, &sp.LastActivityAt,
 		&sp.ReconciledAt, &sp.DriftCount, &sp.CreatedAt, &sp.UpdatedAt, &sp.ArchivedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -716,8 +693,8 @@ func (s *Store) ListSpaces(ctx context.Context, p store.ListSpacesParams) ([]*do
 	}
 
 	args = append(args, limit)
-	query := `SELECT id, merchant_id, discord_channel_id, discord_category_id, name,
-		       lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+	query := `SELECT id, merchant_id, discord_channel_id, discord_category_id, merchant_role_id,
+		       name, lifecycle_state, acl_state, welcome_message_id, last_activity_at,
 		       reconciled_at, drift_count, created_at, updated_at, archived_at
 		  FROM spaces` + where + fmt.Sprintf(` ORDER BY created_at ASC LIMIT $%d`, len(args))
 
@@ -759,8 +736,8 @@ func (s *Store) CreateSpaceWithOutbox(
 	spRow := tx.QueryRow(ctx, `
 		INSERT INTO spaces (merchant_id, name, discord_category_id)
 		VALUES ($1, $2, $3)
-		RETURNING id, merchant_id, discord_channel_id, discord_category_id, name,
-		          lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		RETURNING id, merchant_id, discord_channel_id, discord_category_id, merchant_role_id,
+		          name, lifecycle_state, acl_state, welcome_message_id, last_activity_at,
 		          reconciled_at, drift_count, created_at, updated_at, archived_at`,
 		sp.MerchantID, sp.Name, sp.DiscordCategoryID,
 	)
@@ -880,13 +857,17 @@ func scanOutboxRow(row interface{ Scan(dest ...any) error }) (*domain.OutboxRow,
 
 // ─── Space members ────────────────────────────────────────────────────────────
 
+// spaceMemberColumns is the canonical SELECT/RETURNING column list for space_members (AC-M6-10).
+// overwrite_applied was dropped; invite_sent_at and role_observed_at were added.
+const spaceMemberColumns = `id, space_id, user_id, role, invite_sent_at, role_observed_at, invited_by, created_at, revoked_at`
+
 // CreateSpaceMember inserts a desired space_member row.
 // Returns store.ErrConflict on (space_id, user_id) unique violation.
 func (s *Store) CreateSpaceMember(ctx context.Context, p store.CreateSpaceMemberParams) (*domain.SpaceMember, error) {
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO space_members (space_id, user_id, role, invited_by)
 		VALUES ($1, $2, $3, $4)
-		RETURNING id, space_id, user_id, role, overwrite_applied, invited_by, created_at, revoked_at`,
+		RETURNING `+spaceMemberColumns,
 		p.SpaceID, p.UserID, p.Role, p.InvitedBy,
 	)
 	sm, err := scanSpaceMember(row)
@@ -903,17 +884,18 @@ func (s *Store) CreateSpaceMember(ctx context.Context, p store.CreateSpaceMember
 // GetSpaceMemberBySpaceAndUser returns the space_member for (space_id, user_id).
 func (s *Store) GetSpaceMemberBySpaceAndUser(ctx context.Context, spaceID, userID string) (*domain.SpaceMember, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, space_id, user_id, role, overwrite_applied, invited_by, created_at, revoked_at
+		SELECT `+spaceMemberColumns+`
 		FROM space_members WHERE space_id = $1 AND user_id = $2`, spaceID, userID)
 	return scanSpaceMember(row)
 }
 
-// SetSpaceMemberOverwriteApplied marks the Discord overwrite as projected.
-func (s *Store) SetSpaceMemberOverwriteApplied(ctx context.Context, id string) (*domain.SpaceMember, error) {
+// StampSpaceMemberInviteSent records invite_sent_at = now() after the notify worker
+// successfully emails the merchant invite link to the collaborator (AC-M6-5).
+func (s *Store) StampSpaceMemberInviteSent(ctx context.Context, id string) (*domain.SpaceMember, error) {
 	row := s.pool.QueryRow(ctx, `
-		UPDATE space_members SET overwrite_applied = TRUE
+		UPDATE space_members SET invite_sent_at = now()
 		WHERE id = $1
-		RETURNING id, space_id, user_id, role, overwrite_applied, invited_by, created_at, revoked_at`, id)
+		RETURNING `+spaceMemberColumns, id)
 	return scanSpaceMember(row)
 }
 
@@ -922,14 +904,14 @@ func (s *Store) RevokeSpaceMember(ctx context.Context, id string) (*domain.Space
 	row := s.pool.QueryRow(ctx, `
 		UPDATE space_members SET revoked_at = now()
 		WHERE id = $1
-		RETURNING id, space_id, user_id, role, overwrite_applied, invited_by, created_at, revoked_at`, id)
+		RETURNING `+spaceMemberColumns, id)
 	return scanSpaceMember(row)
 }
 
 // ListSpaceMembers returns active (revoked_at IS NULL) space_member rows for a space.
 func (s *Store) ListSpaceMembers(ctx context.Context, spaceID string) ([]*domain.SpaceMember, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, space_id, user_id, role, overwrite_applied, invited_by, created_at, revoked_at
+		SELECT `+spaceMemberColumns+`
 		FROM space_members
 		WHERE space_id = $1 AND revoked_at IS NULL
 		ORDER BY created_at ASC`, spaceID)
@@ -943,7 +925,7 @@ func (s *Store) ListSpaceMembers(ctx context.Context, spaceID string) ([]*domain
 // ListCollaboratorChannels returns active space_member rows for a user.
 func (s *Store) ListCollaboratorChannels(ctx context.Context, userID string) ([]*domain.SpaceMember, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, space_id, user_id, role, overwrite_applied, invited_by, created_at, revoked_at
+		SELECT `+spaceMemberColumns+`
 		FROM space_members
 		WHERE user_id = $1 AND revoked_at IS NULL
 		ORDER BY created_at ASC`, userID)
@@ -954,11 +936,12 @@ func (s *Store) ListCollaboratorChannels(ctx context.Context, userID string) ([]
 	return collectSpaceMembers(rows)
 }
 
-// ListActiveSpaceMembers returns space_member rows for a space with overwrite_applied=true.
-// Used by the reconciler to compare the Postgres-blessed set against Discord's overwrites.
+// ListActiveSpaceMembers returns all non-revoked space_member rows for a space (AC-M6-8).
+// The reconciler diffs merchant-role membership against this set — desired-state is Postgres,
+// real-state is the guild members currently holding the merchant role.
 func (s *Store) ListActiveSpaceMembers(ctx context.Context, spaceID string) ([]*domain.SpaceMember, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, space_id, user_id, role, overwrite_applied, invited_by, created_at, revoked_at
+		SELECT `+spaceMemberColumns+`
 		FROM space_members
 		WHERE space_id = $1 AND revoked_at IS NULL`, spaceID)
 	if err != nil {
@@ -984,7 +967,8 @@ func scanSpaceMember(row interface{ Scan(dest ...any) error }) (*domain.SpaceMem
 	var sm domain.SpaceMember
 	err := row.Scan(
 		&sm.ID, &sm.SpaceID, &sm.UserID, &sm.Role,
-		&sm.OverwriteApplied, &sm.InvitedBy, &sm.CreatedAt, &sm.RevokedAt,
+		&sm.InviteSentAt, &sm.RoleObservedAt, &sm.InvitedBy,
+		&sm.CreatedAt, &sm.RevokedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, store.ErrNotFound
@@ -1078,8 +1062,8 @@ func (s *Store) UpdateSpaceLifecycle(ctx context.Context, p store.UpdateSpaceLif
 		    archived_at = CASE WHEN $1::text = 'archived' THEN now() ELSE NULL END,
 		    updated_at = now()
 		WHERE id = $2
-		RETURNING id, merchant_id, discord_channel_id, discord_category_id, name,
-		          lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		RETURNING id, merchant_id, discord_channel_id, discord_category_id, merchant_role_id,
+		          name, lifecycle_state, acl_state, welcome_message_id, last_activity_at,
 		          reconciled_at, drift_count, created_at, updated_at, archived_at`,
 		p.LifecycleState, p.SpaceID,
 	)
@@ -1095,8 +1079,8 @@ func (s *Store) UpdateSpaceWelcomeMessageID(ctx context.Context, spaceID, messag
 	row := s.pool.QueryRow(ctx, `
 		UPDATE spaces SET welcome_message_id = $1, updated_at = now()
 		WHERE id = $2
-		RETURNING id, merchant_id, discord_channel_id, discord_category_id, name,
-		          lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		RETURNING id, merchant_id, discord_channel_id, discord_category_id, merchant_role_id,
+		          name, lifecycle_state, acl_state, welcome_message_id, last_activity_at,
 		          reconciled_at, drift_count, created_at, updated_at, archived_at`,
 		messageID, spaceID,
 	)
@@ -1207,8 +1191,8 @@ func (s *Store) GetJobBySpaceIDAndKind(ctx context.Context, spaceID, kind string
 // discord_channel_id set. Used by the M5 scheduled full-guild reconcile sweep (AC-5).
 func (s *Store) ListActiveProvisionedSpaces(ctx context.Context) ([]*domain.Space, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, merchant_id, discord_channel_id, discord_category_id, name,
-		       lifecycle_state, acl_state, welcome_message_id, last_activity_at,
+		SELECT id, merchant_id, discord_channel_id, discord_category_id, merchant_role_id,
+		       name, lifecycle_state, acl_state, welcome_message_id, last_activity_at,
 		       reconciled_at, drift_count, created_at, updated_at, archived_at
 		FROM spaces
 		WHERE lifecycle_state = 'active'
