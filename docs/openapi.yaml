@@ -16,7 +16,11 @@ info:
       * **Authorization always resolves against Postgres**, never the Discord role (NFR-13).
       * **Idempotency:** mutating requests accept an `Idempotency-Key` header; a repeated key
         replays the original response instead of re-enqueueing (NFR-3).
-      * **No invite links** anywhere: guild entry is OAuth2 `guilds.join` for everyone (NFR-14).
+      * **Role-per-merchant access.** Provisioning a space auto-creates a Discord role for the
+        merchant and grants that role VIEW+SEND on the channel. A collaborator acquires access by
+        joining through the merchant's native invite-with-role link (created once by the operator
+        in the Discord client and stored via `PUT /merchants/{merchantId}/invite`), which the hub
+        emails. There are no per-user channel overwrites and no OAuth2 onboarding.
   license:
     name: Apache-2.0
     identifier: Apache-2.0
@@ -40,7 +44,7 @@ tags:
   - name: Agents
     description: Agent roster management (Admin only).
   - name: Transversal
-    description: Directory, audit, OAuth2 callback.
+    description: Directory, audit.
   - name: Jobs
     description: Poll the status of asynchronous mutating operations.
 
@@ -146,6 +150,46 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /merchants/{merchantId}/invite:
+    put:
+      tags: [Merchants]
+      operationId: setMerchantInvite
+      summary: Store the merchant's native invite-with-role link (synchronous).
+      description: |
+        Stores the **native Discord invite-with-role link** for this merchant. The link binds the
+        invite to the merchant's role and is the entry path for every collaborator of this merchant
+        (reusable). Because the Discord REST API cannot attach a role to a programmatically-created
+        invite, this link is created **by hand once** in the Discord client ("Roles (opcional)"
+        dialog) and stored here. The hub emails it on `:send-invite`.
+
+        Synchronous Postgres write (no Discord side-effect); returns `200`. Idempotent: storing the
+        same link again is a no-op. Until a link is stored, `:send-invite` for this merchant's
+        collaborators returns `409`. Control-plane authority required.
+      parameters:
+        - $ref: '#/components/parameters/MerchantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invite_link]
+              properties:
+                invite_link:
+                  type: string
+                  format: uri
+                  description: The native Discord invite-with-role URL (e.g. https://discord.gg/...).
+      responses:
+        '200':
+          description: Invite link stored.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Merchant' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   # ----------------------------------------------------------------------- #
   # SPACES
   # ----------------------------------------------------------------------- #
@@ -155,9 +199,12 @@ paths:
       operationId: provisionSpace
       summary: Provision a private space (channel) for a merchant (async).
       description: |
-        Records desired state and enqueues a provisioning job. The worker creates a Discord
-        channel already denied to `@everyone` (fail-closed, NFR-4), applies the category-level
-        Agent allow, and persists `discord_channel_id`. Returns `202` with a job handle.
+        Records desired state and enqueues a provisioning job. The worker creates the merchant's
+        Discord **role** (`GuildRoleCreate`), creates a Discord channel already denied to
+        `@everyone` (fail-closed, NFR-4), grants the **merchant role** VIEW+SEND on the channel and
+        the Agent role VIEW at the category, and persists `discord_channel_id` + `merchant_role_id`.
+        Collaborators later acquire the merchant role by joining through the stored invite-with-role
+        link. Returns `202` with a job handle.
 
         `{merchantId}` is the merchant **UUID `id`** returned by `POST /merchants` (not the
         `external_ref`). The merchant must already exist: register it first with `POST /merchants`.
@@ -315,12 +362,16 @@ paths:
   /channels/{id}/collaborators:
     post:
       tags: [Collaborators]
-      operationId: inviteCollaborator
-      summary: Invite a collaborator to a space (overwrite + OAuth2 join if needed, async).
+      operationId: registerCollaborator
+      summary: Register a collaborator on a space by name + work email (synchronous).
       description: |
-        Records the desired `space_member`, enqueues a job that (a) adds the user to the guild
-        via OAuth2 `guilds.join` if not already present, and (b) applies the per-user permission
-        overwrite granting access to this one space. Only Agents/Admins may invite (FR-20).
+        Records the desired `space_member` plus the collaborator's **name and work email** (our
+        traceability labels, stored in Postgres — never a Discord lookup key). This is a synchronous
+        roster write with **no Discord side-effect**: access is role-based and is acquired later when
+        the collaborator joins through the merchant's invite-with-role link. Returns `201`.
+
+        Send the invite with `POST /channels/{id}/collaborators/{userId}:send-invite`. Only
+        Agents/Admins may register collaborators (FR-20).
       parameters:
         - $ref: '#/components/parameters/SpaceId'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -329,30 +380,48 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/InviteCollaboratorRequest'
+              $ref: '#/components/schemas/RegisterCollaboratorRequest'
       responses:
-        '202':
-          description: |
-            Accepted. If the collaborator has not yet completed "Connect with Discord", the
-            response includes a `connect_url` for the one-time OAuth2 step.
+        '201':
+          description: Collaborator registered on the space (invite not yet sent).
           content:
             application/json:
-              schema:
-                allOf:
-                  - $ref: '#/components/schemas/JobAcceptedBody'
-                  - type: object
-                    properties:
-                      connect_url:
-                        type: [string, 'null']
-                        format: uri
-                        description: One-time OAuth2 guilds.join URL, present when the user must connect first.
-          headers:
-            Location: { $ref: '#/components/headers/JobLocation' }
+              schema: { $ref: '#/components/schemas/SpaceMember' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+
+  /channels/{id}/collaborators/{userId}:send-invite:
+    post:
+      tags: [Collaborators]
+      operationId: sendCollaboratorInvite
+      summary: Email the merchant's invite-with-role link to a registered collaborator (async).
+      description: |
+        Enqueues a `notify` job that emails the merchant's stored invite-with-role link (with the
+        configurable welcome message) to the collaborator's work email via the hub's SMTP relay.
+        Discord does **not** send this email — the hub does. Returns `202`.
+
+        Requires the merchant to have an invite link stored (`PUT /merchants/{merchantId}/invite`);
+        if none is stored, returns `409`. Idempotent re-sends are safe (the same link is re-emailed).
+        Only Agents/Admins may send (FR-20).
+      parameters:
+        - $ref: '#/components/parameters/SpaceId'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            No invite-with-role link is stored for this space's merchant. Store one first via
+            `PUT /merchants/{merchantId}/invite`. Body is `{code, message}`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /channels/{id}/collaborators/{userId}:
     delete:
@@ -360,8 +429,10 @@ paths:
       operationId: expelCollaborator
       summary: Expel a collaborator from a space (FR-19, async).
       description: |
-        `scope=channel` (default) revokes the per-user overwrite, keeping the person in the guild.
-        `scope=server` also removes them from the guild. Audited either way.
+        `scope=channel` (default) removes the merchant role from the member, keeping the person in
+        the guild but dropping access to the merchant's channel. `scope=server` also removes them
+        from the guild entirely. Audited either way. Note: because access is role-based, channel-scope
+        removal drops access to the merchant's space (one space at the 1:1 cardinality).
       parameters:
         - $ref: '#/components/parameters/SpaceId'
         - $ref: '#/components/parameters/UserId'
@@ -429,9 +500,9 @@ paths:
       operationId: addAgent
       summary: Add an agent to the roster (Admin only) (FR-23).
       description: |
-        Synchronously records `type=agent` (+ `is_admin`) in Postgres - the authZ source of truth -
-        and returns a one-time Connect-with-Discord link. A reconcile job projects the Agent role
-        once the agent has joined the guild. Returns `201`.
+        Synchronously records `type=agent` (+ `is_admin`) in Postgres - the authZ source of truth.
+        A reconcile job projects the Agent role onto the agent's Discord identity once they are
+        present in the guild. Returns `201`.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -442,18 +513,10 @@ paths:
               $ref: '#/components/schemas/AddAgentRequest'
       responses:
         '201':
-          description: Agent recorded; returns the agent and a one-time connect URL.
+          description: Agent recorded.
           content:
             application/json:
-              schema:
-                allOf:
-                  - $ref: '#/components/schemas/Agent'
-                  - type: object
-                    properties:
-                      connect_url:
-                        type: string
-                        format: uri
-                        description: One-time OAuth2 guilds.join URL for the agent.
+              schema: { $ref: '#/components/schemas/Agent' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -562,36 +625,6 @@ paths:
                     items: { $ref: '#/components/schemas/AuditEntry' }
                   next_cursor: { type: [string, 'null'] }
         '401': { $ref: '#/components/responses/Unauthorized' }
-
-  /oauth/discord/callback:
-    get:
-      tags: [Transversal]
-      operationId: oauthDiscordCallback
-      summary: OAuth2 "Connect with Discord" callback (FR-22).
-      description: |
-        Discord redirects here after the user authorizes `identify guilds.join`. The hub exchanges
-        the `code` for an access token (stored encrypted), links it to the user, and enqueues the
-        add-to-guild + access-grant job. **No invite link is ever used.** This endpoint is reached
-        via browser redirect and is exempt from the service-API-key requirement (CSRF-protected via
-        the signed `state` parameter).
-      security: []
-      parameters:
-        - name: code
-          in: query
-          required: true
-          schema: { type: string }
-        - name: state
-          in: query
-          required: true
-          description: Signed, single-use anti-CSRF token binding the callback to the initiating request.
-          schema: { type: string }
-      responses:
-        '302':
-          description: Redirect to a backoffice/POC success or failure page.
-          headers:
-            Location:
-              schema: { type: string, format: uri }
-        '400': { $ref: '#/components/responses/BadRequest' }
 
   # ----------------------------------------------------------------------- #
   # JOBS (async polling)
@@ -732,7 +765,9 @@ components:
 
     Merchant:
       type: object
-      description: An external customer. Owns exactly one space (1:1); see POST /merchants/{merchantId}/channels.
+      description: |
+        An external customer. Owns exactly one space (1:1) and one Discord merchant role (1:1).
+        Stores the per-merchant invite-with-role link used to onboard its collaborators.
       required: [id, external_ref, name, is_active, created_at]
       properties:
         id:
@@ -746,6 +781,15 @@ components:
         help_desk_url:
           type: [string, 'null']
           format: uri
+        invite_link:
+          type: [string, 'null']
+          format: uri
+          description: |
+            The merchant's stored native invite-with-role link (set via PUT /merchants/{merchantId}/invite).
+            Null until the operator stores it; :send-invite is rejected while null.
+        invite_link_set_at:
+          type: [string, 'null']
+          format: date-time
         is_active: { type: boolean }
         created_at: { type: string, format: date-time }
 
@@ -780,27 +824,29 @@ components:
           type: [string, 'null']
           description: Static help-desk message for topic/pin (FR-15 static).
 
-    InviteCollaboratorRequest:
+    RegisterCollaboratorRequest:
       type: object
       description: |
-        Identify the collaborator by hub user id, or by Discord id / email to create the roster row.
-        A collaborator is a global identity, not bound to a merchant; the merchant scope comes from the
-        target space (the path `id`). The same collaborator may be invited to spaces of several merchants.
+        Register a collaborator on a space by **name and work email** — our traceability labels,
+        stored in Postgres, never a Discord lookup key. An existing collaborator may be referenced by
+        `user_id` instead (e.g. one already registered on another merchant's space). A collaborator is
+        a global identity, not bound to a merchant; the merchant scope comes from the target space
+        (the path `id`). The same collaborator may be registered on spaces of several merchants.
       properties:
         user_id:
           type: [string, 'null']
           format: uuid
-        discord_user_id:
-          type: [string, 'null']
+          description: Reference an existing collaborator instead of supplying name+email.
         email:
           type: [string, 'null']
           format: email
-        display_name:
+          description: The collaborator's work email; the invite link is emailed here.
+        name:
           type: [string, 'null']
+          description: The collaborator's name (traceability label).
       anyOf:
         - required: [user_id]
-        - required: [discord_user_id]
-        - required: [email]
+        - required: [email, name]
 
     AddAgentRequest:
       type: object
@@ -810,7 +856,7 @@ components:
         display_name: { type: [string, 'null'] }
         discord_user_id:
           type: [string, 'null']
-          description: Known Discord id if available; otherwise captured at OAuth2 connect.
+          description: The agent's Discord id, supplied by the admin; the Agent role is projected onto it.
         is_admin:
           type: boolean
           default: false
@@ -827,6 +873,9 @@ components:
           type: [string, 'null']
           description: Null until provisioned by the worker.
         discord_category_id: { type: [string, 'null'] }
+        merchant_role_id:
+          type: [string, 'null']
+          description: The merchant's Discord role id (created on provision); grants VIEW+SEND on the channel. Null until provisioned.
         lifecycle_state: { $ref: '#/components/schemas/SpaceLifecycleState' }
         acl_state: { $ref: '#/components/schemas/AclState' }
         last_activity_at: { type: [string, 'null'], format: date-time }
@@ -844,12 +893,17 @@ components:
           type: [string, 'null']
           format: uuid
           description: The space's merchant (derived from the space, not a property of the collaborator). A collaborator is a global identity and may be a member of spaces across several merchants.
+        email:
+          type: [string, 'null']
+          format: email
+          description: The collaborator's work email (our label); the invite link is emailed here.
         role:
           type: string
           enum: [collaborator]
-        overwrite_applied:
-          type: boolean
-          description: Whether the per-user Discord overwrite has been projected.
+        invite_sent_at:
+          type: [string, 'null']
+          format: date-time
+          description: When the merchant invite-with-role link was emailed to this collaborator (null = not yet sent).
         invited_by: { type: [string, 'null'], format: uuid }
         created_at: { type: string, format: date-time }
 
@@ -912,7 +966,7 @@ components:
         id: { type: integer, format: int64 }
         action:
           type: string
-          description: e.g. space.provision, collaborator.invite, collaborator.expel, agent.add, space.archive, reconcile.repair.
+          description: e.g. space.provision, merchant.invite_set, collaborator.register, collaborator.invite_sent, collaborator.expel, agent.add, space.archive, reconcile.repair.
         actor_user_id: { type: [string, 'null'], format: uuid }
         merchant_id: { type: [string, 'null'], format: uuid }
         space_id: { type: [string, 'null'], format: uuid }
@@ -938,7 +992,7 @@ components:
         id: { type: string, format: uuid }
         kind:
           type: string
-          description: e.g. provision_space, invite_collaborator, expel, project_agent_role, change_lifecycle.
+          description: e.g. provision_space, send_collaborator_invite, expel, project_agent_role, change_lifecycle.
         status: { $ref: '#/components/schemas/JobStatus' }
         space_id: { type: [string, 'null'], format: uuid }
         merchant_id: { type: [string, 'null'], format: uuid }

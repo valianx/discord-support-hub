@@ -1,4 +1,4 @@
--- discord-support-hub — PostgreSQL data model (M0–M3)
+-- discord-support-hub — PostgreSQL data model (M0–M7)
 -- Source of truth for roster, mappings, and authorization (NFR-9, NFR-13).
 -- Conforms to 01-mvp-scope.md (scope-locked) and 02-architecture.md.
 --
@@ -8,11 +8,18 @@
 --   * Fail-closed ACL state is tracked, never assumed open (NFR-4).
 --   * One merchant -> exactly one space (1:1), enforced by UNIQUE(merchant_id) on
 --     `spaces`. Lifecycle (archive/reopen) acts on that single space.
+--   * One merchant -> exactly one Discord role (1:1). The merchant role is created by
+--     the API on provision; its channel allow grants collaborators access. The role id
+--     lives on `spaces.merchant_role_id`.
 --   * A collaborator is a global external identity invited to many merchants' spaces
 --     (M:N via space_members); tenant grouping for a collaborator is DERIVED from space
---     membership, never a user->merchant foreign key.
---   * Secrets (OAuth2 tokens) stored encrypted at rest; only ciphertext + nonce + key
---     version persisted (NFR-6).
+--     membership, never a user->merchant foreign key. Access is role-based: a collaborator
+--     acquires the merchant role natively, by joining through the merchant's stored
+--     invite-with-role link (see 02-architecture.md §6).
+--   * The collaborator's name and work email are OUR labels (traceability), stored here;
+--     they are never a Discord primitive (Discord has no email key). Email is PII.
+--   * App-level secrets (bot token, SMTP credentials) are config-by-env, never persisted.
+--     There is NO per-user token store: dropping OAuth2 removed `oauth_tokens` entirely.
 --
 -- Conventions: snake_case, UUID primary keys (gen_random_uuid via pgcrypto),
 -- timestamptz everywhere, soft-state lifecycle (no destructive deletes for spaces).
@@ -56,10 +63,17 @@ CREATE TYPE expulsion_scope AS ENUM ('channel', 'server');
 
 -- ===========================================================================
 -- merchants
--- One external customer. Owns exactly one space (1:1). Collaborators are NOT owned by
--- a merchant; they are global identities granted access per-space (see space_members).
--- The merchant grouping lives HERE (in Postgres), never as a Discord role (Discord caps
--- at 250 roles; a role-per-merchant does not scale -- see scope §4.3).
+-- One external customer. Owns exactly one space (1:1) and exactly one Discord role
+-- (1:1). Collaborators are NOT owned by a merchant; they are global identities granted
+-- access per-space (see space_members), projected via the merchant role. The merchant
+-- grouping is a DB fact; the merchant ROLE is its Discord projection (one role per
+-- merchant -- viable to ~200 merchants against Discord's 250-role/server cap; see
+-- 02-architecture.md §5.3).
+--
+-- The invite-with-role link is a per-merchant fact: the operator creates it once by hand
+-- in the Discord client (the REST API cannot attach a role to an invite -- see §6), and
+-- it is stored here, reusable for every collaborator of this merchant and emailed by the
+-- hub's SMTP sender.
 -- ===========================================================================
 CREATE TABLE merchants (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -69,13 +83,19 @@ CREATE TABLE merchants (
     name            TEXT NOT NULL,
     -- Per-merchant help-desk link parameterization (FR-15 static); nullable.
     help_desk_url   TEXT,
+    -- Native Discord invite-with-role link, bound to this merchant's role. Created by the
+    -- operator once in the Discord client and stored via PUT /merchants/{id}/invite.
+    -- NULL until the operator stores it; :send-invite is rejected while NULL.
+    invite_link     TEXT,
+    invite_link_set_at TIMESTAMPTZ,
     is_active       BOOLEAN NOT NULL DEFAULT TRUE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT merchants_external_ref_key UNIQUE (external_ref)
 );
-COMMENT ON TABLE merchants IS 'External customers; merchant grouping is a DB fact, never a Discord role.';
+COMMENT ON TABLE merchants IS 'External customers; one merchant -> one space and one Discord merchant role. Stores the per-merchant invite-with-role link.';
 COMMENT ON COLUMN merchants.external_ref IS 'Stable id from the backoffice; enables idempotent addressing.';
+COMMENT ON COLUMN merchants.invite_link IS 'Operator-created native invite-with-role link (client-only feature); stored here, emailed by the hub. NULL blocks :send-invite.';
 
 
 -- ===========================================================================
@@ -95,12 +115,17 @@ CREATE TABLE users (
     type              user_type NOT NULL,
     -- Admin privilege is only meaningful for agents (roster management safeguard).
     is_admin          BOOLEAN NOT NULL DEFAULT FALSE,
-    -- Discord identity. Nullable until the user completes "Connect with Discord"
-    -- (OAuth2 identify) -- a roster row can exist before the user has joined.
+    -- Discord identity. Nullable: for agents it is supplied by the admin; for
+    -- collaborators it is unknown at registration (they are recorded by name+email and
+    -- join later via the invite-with-role link). May be backfilled by the console /
+    -- reconciler once observed. Access never depends on it being populated.
     discord_user_id   TEXT,
+    -- Work email: OUR traceability label (PII), never a Discord lookup key. For a
+    -- collaborator this is the address the invite link is emailed to.
     email             CITEXT,
     display_name      TEXT,
-    -- Set once the bot has added the user to the guild and projected role/overwrite.
+    -- For an agent: set once the Agent role is projected. For a collaborator: set when
+    -- the merchant role / membership is first observed (optional; access is role-native).
     provisioned_at    TIMESTAMPTZ,
     is_active         BOOLEAN NOT NULL DEFAULT TRUE,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -112,7 +137,8 @@ CREATE TABLE users (
     CONSTRAINT users_discord_user_id_key UNIQUE (discord_user_id)
 );
 COMMENT ON TABLE users IS 'Roster + AuthZ source of truth; a user is an identity (agent or collaborator), not merchant-bound. Discord role is a projection of type/is_admin.';
-COMMENT ON COLUMN users.discord_user_id IS 'NULL until the user completes OAuth2 identify; one identity = one row.';
+COMMENT ON COLUMN users.discord_user_id IS 'Nullable; agents supply it, collaborators are registered by name+email and join via invite-with-role. One identity = one row when present.';
+COMMENT ON COLUMN users.email IS 'Our traceability label and the collaborator invite recipient (PII); never a Discord lookup key.';
 
 CREATE INDEX users_type_idx            ON users (type);
 CREATE INDEX users_is_admin_idx        ON users (is_admin) WHERE is_admin = TRUE;
@@ -134,6 +160,11 @@ CREATE TABLE spaces (
     -- The Discord category the channel lives under; the Agent-role VIEW_CHANNEL allow
     -- is applied at THIS category level so agents see all spaces with one overwrite.
     discord_category_id TEXT,
+    -- The merchant's Discord role id (created by the API on provision, GuildRoleCreate).
+    -- The channel grants this role VIEW_CHANNEL+SEND; collaborators acquire it by joining
+    -- through the merchant's invite-with-role link. NULL until provisioned. UNIQUE so two
+    -- spaces can never share a merchant role (mirrors the 1:1 merchant<->role invariant).
+    merchant_role_id    TEXT,
     name                TEXT NOT NULL,
     lifecycle_state     space_lifecycle_state NOT NULL DEFAULT 'active',
     -- Fail-closed ACL tracking (NFR-4). A space is only treated as accessible to its
@@ -149,12 +180,15 @@ CREATE TABLE spaces (
     archived_at         TIMESTAMPTZ,
 
     CONSTRAINT spaces_discord_channel_id_key UNIQUE (discord_channel_id),
+    -- One merchant role per space (and per merchant, since merchant<->space is 1:1).
+    CONSTRAINT spaces_merchant_role_id_key UNIQUE (merchant_role_id),
     -- 1:1 merchant<->space: a merchant has exactly one space (hard invariant).
     CONSTRAINT spaces_merchant_id_key UNIQUE (merchant_id)
 );
-COMMENT ON TABLE spaces IS 'Per-merchant private channel; one merchant -> exactly one space (1:1, UNIQUE merchant_id). Tracks fail-closed ACL state.';
+COMMENT ON TABLE spaces IS 'Per-merchant private channel; one merchant -> exactly one space (1:1, UNIQUE merchant_id) and one merchant role. Tracks fail-closed ACL state.';
 COMMENT ON COLUMN spaces.acl_state IS 'Fail-closed: space treated accessible only when applied; else invisible (NFR-4).';
 COMMENT ON COLUMN spaces.discord_channel_id IS 'NULL until worker provisions the channel; UNIQUE prevents double-projection.';
+COMMENT ON COLUMN spaces.merchant_role_id IS 'Merchant Discord role id (GuildRoleCreate on provision); channel grants it VIEW+SEND. Collaborators acquire it via invite-with-role.';
 
 -- merchant_id is already indexed by the UNIQUE(merchant_id) constraint above.
 CREATE INDEX spaces_lifecycle_state_idx    ON spaces (lifecycle_state);
@@ -164,30 +198,41 @@ CREATE INDEX spaces_last_activity_idx      ON spaces (last_activity_at);
 
 -- ===========================================================================
 -- space_members
--- The per-collaborator overwrite mapping (FR-3, FR-4). One row = one collaborator's
--- access to one space, projected as a Discord per-user permission overwrite
--- (ChannelPermissionSet, PermissionOverwriteTypeMember). Agents are NOT listed here;
--- they get access via the category-level Agent role, not per-space overwrites.
+-- The per-collaborator access mapping (FR-3, FR-4). One row = one collaborator's
+-- DESIRED access to one space. Access is ROLE-BASED: the collaborator acquires the
+-- space's merchant role natively by joining through the merchant invite-with-role link
+-- (no per-user channel overwrite). Agents are NOT listed here; they get access via the
+-- category-level Agent role.
 --
--- This table is DESIRED state. The worker projects it onto Discord; the reconciler
--- revokes any Discord overwrite NOT backed by a row here (isolation teeth, NFR-5).
+-- This table is DESIRED state. The reconciler diffs which members carry each merchant
+-- role against these rows and removes a merchant role from any member the source of
+-- truth does not list here (isolation teeth, NFR-5).
+--
+-- The invite-send lifecycle (name+email captured at registration; the stored merchant
+-- link emailed by the hub) is tracked per row: invite_sent_at marks delivery; the
+-- merchant link itself lives on `merchants.invite_link` (reusable, not per collaborator).
 -- ===========================================================================
 CREATE TABLE space_members (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     space_id          UUID NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
     user_id           UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     role              space_member_role NOT NULL DEFAULT 'collaborator',
-    -- Projection state: has the per-user overwrite been applied in Discord?
-    overwrite_applied BOOLEAN NOT NULL DEFAULT FALSE,
-    invited_by        UUID REFERENCES users(id),  -- the Agent who invited (FR-19/FR-20 audit)
+    -- Has the merchant invite link been emailed to this collaborator? Set by the notify
+    -- worker on successful SMTP send. NULL = registered but invite not yet sent.
+    invite_sent_at    TIMESTAMPTZ,
+    -- Has the collaborator been observed carrying the merchant role in Discord? Optional
+    -- liveness signal (console/reconciler); access does not depend on it being set.
+    role_observed_at  TIMESTAMPTZ,
+    invited_by        UUID REFERENCES users(id),  -- the Agent who registered (FR-19/FR-20 audit)
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     revoked_at        TIMESTAMPTZ,                 -- set on channel-scope expulsion; row kept for audit
 
     -- A user appears at most once per space (active membership).
     CONSTRAINT space_members_space_user_key UNIQUE (space_id, user_id)
 );
-COMMENT ON TABLE space_members IS 'DESIRED per-collaborator overwrites. Reconciler revokes Discord overwrites not backed here (NFR-5).';
+COMMENT ON TABLE space_members IS 'DESIRED per-collaborator access (role-based). Reconciler strips merchant roles from members not backed by a row here (NFR-5).';
 COMMENT ON COLUMN space_members.role IS 'Only collaborators are listed; agents access via category-level role.';
+COMMENT ON COLUMN space_members.invite_sent_at IS 'Set by the notify worker when the merchant invite link is emailed to this collaborator.';
 
 CREATE INDEX space_members_space_id_idx ON space_members (space_id);
 CREATE INDEX space_members_user_id_idx  ON space_members (user_id);
@@ -196,32 +241,13 @@ CREATE INDEX space_members_active_idx   ON space_members (user_id, space_id) WHE
 
 
 -- ===========================================================================
--- oauth_tokens
--- Encrypted-at-rest OAuth2 tokens captured at /oauth/discord/callback (FR-22, NFR-6).
--- The `guilds.join` access token lets the bot add the user to the guild
--- (GuildMemberAdd uses GuildMemberAddParams.AccessToken). We store ONLY ciphertext
--- + nonce + key version -- never plaintext, never logged.
+-- (removed) oauth_tokens
+-- The OAuth2 `guilds.join` onboarding model was dropped in favour of native Discord
+-- invite-with-role links (see 02-architecture.md §6). There are no per-user Discord
+-- tokens to store: onboarding carries no Discord credential. The merchant invite link
+-- lives on `merchants.invite_link`; the collaborator's email is a traceability label on
+-- `users.email`. App-level secrets (bot token, SMTP credentials) are config-by-env.
 -- ===========================================================================
-CREATE TABLE oauth_tokens (
-    id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id                UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    -- AES-256-GCM ciphertext of the access/refresh tokens.
-    access_token_cipher    BYTEA NOT NULL,
-    access_token_nonce     BYTEA NOT NULL,
-    refresh_token_cipher   BYTEA,
-    refresh_token_nonce    BYTEA,
-    -- Key version enables rotation without downtime (re-encrypt under new key).
-    encryption_key_version INTEGER NOT NULL DEFAULT 1,
-    scopes                 TEXT NOT NULL,          -- e.g. 'identify guilds.join'
-    expires_at             TIMESTAMPTZ,            -- access token expiry; refresh before use
-    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-    -- One current token record per user (rotated in place on refresh/reconnect).
-    CONSTRAINT oauth_tokens_user_id_key UNIQUE (user_id)
-);
-COMMENT ON TABLE oauth_tokens IS 'Encrypted-at-rest OAuth2 tokens (guilds.join). Only ciphertext+nonce+key_version stored (NFR-6).';
-COMMENT ON COLUMN oauth_tokens.encryption_key_version IS 'Supports key rotation: re-encrypt rows under a new key version.';
 
 
 -- ===========================================================================
@@ -394,5 +420,4 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER merchants_set_updated_at    BEFORE UPDATE ON merchants    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 CREATE TRIGGER users_set_updated_at        BEFORE UPDATE ON users        FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 CREATE TRIGGER spaces_set_updated_at       BEFORE UPDATE ON spaces       FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-CREATE TRIGGER oauth_tokens_set_updated_at BEFORE UPDATE ON oauth_tokens FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 CREATE TRIGGER jobs_set_updated_at         BEFORE UPDATE ON jobs         FOR EACH ROW EXECUTE FUNCTION set_updated_at();
