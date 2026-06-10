@@ -69,7 +69,15 @@ func (s *Sender) Send(_ context.Context, to, subject, body string) error {
 	}
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
-	auth := smtp.PlainAuth("", s.cfg.Username, s.cfg.Password, s.cfg.Host)
+	// Only authenticate when a username is configured. PlainAuth refuses to send
+	// credentials over a non-TLS connection (Go stdlib), so passing it to an
+	// unauthenticated/dev relay that advertises AUTH would fail with
+	// "unencrypted connection". A nil auth lets net/smtp skip authentication
+	// entirely; a credentialed relay still gets PlainAuth (which requires TLS).
+	var auth smtp.Auth
+	if s.cfg.Username != "" {
+		auth = smtp.PlainAuth("", s.cfg.Username, s.cfg.Password, s.cfg.Host)
+	}
 
 	// Build the RFC 2822 message.
 	msg := buildMessage(s.cfg.From, to, subject, body)
