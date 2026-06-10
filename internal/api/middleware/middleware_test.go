@@ -56,6 +56,9 @@ func (n *noopStore) GetUserByID(_ context.Context, _ string) (*domain.User, erro
 func (n *noopStore) GetUserByDiscordID(_ context.Context, _ string) (*domain.User, error) {
 	panic("GetUserByDiscordID not stubbed")
 }
+func (n *noopStore) GetUserByEmail(_ context.Context, _ string) (*domain.User, error) {
+	panic("GetUserByEmail not stubbed")
+}
 func (n *noopStore) ListAgents(_ context.Context, _ bool) ([]*domain.User, error) {
 	panic("ListAgents not stubbed")
 }

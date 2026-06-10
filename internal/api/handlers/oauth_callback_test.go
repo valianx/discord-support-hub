@@ -109,6 +109,9 @@ func (f *oauthFakeStore) GetUserByID(_ context.Context, _ string) (*domain.User,
 func (f *oauthFakeStore) GetUserByDiscordID(_ context.Context, _ string) (*domain.User, error) {
 	panic("GetUserByDiscordID")
 }
+func (f *oauthFakeStore) GetUserByEmail(_ context.Context, _ string) (*domain.User, error) {
+	panic("GetUserByEmail")
+}
 func (f *oauthFakeStore) ListAgents(_ context.Context, _ bool) ([]*domain.User, error) {
 	panic("ListAgents")
 }

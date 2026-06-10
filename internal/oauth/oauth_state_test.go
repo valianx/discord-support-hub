@@ -253,6 +253,9 @@ func (f *tokenFakeStore) GetUserByID(_ context.Context, _ string) (*domain.User,
 func (f *tokenFakeStore) GetUserByDiscordID(_ context.Context, _ string) (*domain.User, error) {
 	panic("GetUserByDiscordID")
 }
+func (f *tokenFakeStore) GetUserByEmail(_ context.Context, _ string) (*domain.User, error) {
+	panic("GetUserByEmail")
+}
 func (f *tokenFakeStore) ListAgents(_ context.Context, _ bool) ([]*domain.User, error) {
 	panic("ListAgents")
 }

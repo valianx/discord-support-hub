@@ -3,6 +3,10 @@
 // Tests cover (AC-2, AC-4, AC-5, FR-20):
 //   - InviteCollaborator: control-plane gate (AC-4 / FR-20); happy path 202;
 //     space-not-found 404; user-not-found 404; connect_url returned when no Discord ID.
+//   - InviteCollaborator by email / discord_user_id (no existing user) → creates collaborator.
+//   - InviteCollaborator: bad email / non-numeric discord_user_id / unsafe display_name → 400.
+//   - InviteCollaborator: none of the three identifiers → 400.
+//   - InviteCollaborator: idempotent re-invite (ErrConflict on CreateSpaceMember → 202).
 //   - ExpelCollaborator: control-plane gate; scope=channel vs scope=server dispatch;
 //     invalid scope rejected 400; space/user not-found 404.
 //   - ListCollaboratorChannels: control-plane gate; user-not-found 404; items returned.
@@ -102,17 +106,37 @@ type collaboratorFakeStore struct {
 	members   map[string][]*domain.SpaceMember // userID → members
 	spaceMap  map[string][]*domain.SpaceMember // spaceID → members
 
+	// Indexed lookup maps for the new resolution paths.
+	usersByDiscordID map[string]*domain.User
+	usersByEmail     map[string]*domain.User
+
 	createMemberErr error
 	createJobErr    error
+
+	// Track created users for test assertions.
+	createdUsers []*domain.User
 }
 
 func newCollaboratorFakeStore() *collaboratorFakeStore {
 	return &collaboratorFakeStore{
-		spaces:    make(map[string]*domain.Space),
-		users:     make(map[string]*domain.User),
-		merchants: make(map[string]*domain.Merchant),
-		members:   make(map[string][]*domain.SpaceMember),
-		spaceMap:  make(map[string][]*domain.SpaceMember),
+		spaces:           make(map[string]*domain.Space),
+		users:            make(map[string]*domain.User),
+		merchants:        make(map[string]*domain.Merchant),
+		members:          make(map[string][]*domain.SpaceMember),
+		spaceMap:         make(map[string][]*domain.SpaceMember),
+		usersByDiscordID: make(map[string]*domain.User),
+		usersByEmail:     make(map[string]*domain.User),
+	}
+}
+
+// addUser registers a user into all relevant index maps.
+func (f *collaboratorFakeStore) addUser(u *domain.User) {
+	f.users[u.ID] = u
+	if u.DiscordUserID != nil {
+		f.usersByDiscordID[*u.DiscordUserID] = u
+	}
+	if u.Email != nil {
+		f.usersByEmail[*u.Email] = u
 	}
 }
 
@@ -129,6 +153,38 @@ func (f *collaboratorFakeStore) GetUserByID(_ context.Context, id string) (*doma
 	if !ok {
 		return nil, store.ErrNotFound
 	}
+	return u, nil
+}
+
+func (f *collaboratorFakeStore) GetUserByDiscordID(_ context.Context, discordID string) (*domain.User, error) {
+	u, ok := f.usersByDiscordID[discordID]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	return u, nil
+}
+
+func (f *collaboratorFakeStore) GetUserByEmail(_ context.Context, email string) (*domain.User, error) {
+	u, ok := f.usersByEmail[email]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	return u, nil
+}
+
+func (f *collaboratorFakeStore) CreateUser(_ context.Context, p store.CreateUserParams) (*domain.User, error) {
+	u := &domain.User{
+		ID:            "created-" + time.Now().Format("150405.000000000"),
+		Type:          p.Type,
+		IsAdmin:       p.IsAdmin,
+		DiscordUserID: p.DiscordUserID,
+		Email:         p.Email,
+		DisplayName:   p.DisplayName,
+		IsActive:      true,
+		CreatedAt:     time.Now(),
+	}
+	f.addUser(u)
+	f.createdUsers = append(f.createdUsers, u)
 	return u, nil
 }
 
@@ -185,12 +241,6 @@ func (f *collaboratorFakeStore) ListSpaceMembers(_ context.Context, spaceID stri
 func (f *collaboratorFakeStore) Ping(_ context.Context) error { panic("Ping") }
 func (f *collaboratorFakeStore) CreateMerchant(_ context.Context, _ store.CreateMerchantParams) (*domain.Merchant, error) {
 	panic("CreateMerchant")
-}
-func (f *collaboratorFakeStore) CreateUser(_ context.Context, _ store.CreateUserParams) (*domain.User, error) {
-	panic("CreateUser")
-}
-func (f *collaboratorFakeStore) GetUserByDiscordID(_ context.Context, _ string) (*domain.User, error) {
-	panic("GetUserByDiscordID")
 }
 func (f *collaboratorFakeStore) ListAgents(_ context.Context, _ bool) ([]*domain.User, error) {
 	panic("ListAgents")
@@ -381,7 +431,7 @@ func TestInviteCollaborator_NilPrincipal_Returns403(t *testing.T) {
 func TestInviteCollaborator_Returns202(t *testing.T) {
 	s := newCollaboratorFakeStore()
 	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
-	s.users["user-001"] = makeCollaborator("user-001", true) // has Discord ID
+	s.addUser(makeCollaborator("user-001", true)) // has Discord ID
 
 	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
 
@@ -453,7 +503,7 @@ func TestInviteCollaborator_UserNotFound_Returns404(t *testing.T) {
 func TestInviteCollaborator_NoDiscordID_ConnectURLPresent(t *testing.T) {
 	s := newCollaboratorFakeStore()
 	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
-	s.users["user-no-discord"] = makeCollaborator("user-no-discord", false) // NO Discord ID
+	s.addUser(makeCollaborator("user-no-discord", false)) // NO Discord ID
 
 	// Wire a real StateManager so connect_url generation works.
 	sm := makeTestStateManager(t)
@@ -489,7 +539,7 @@ func TestInviteCollaborator_NoDiscordID_ConnectURLPresent(t *testing.T) {
 func TestInviteCollaborator_WithDiscordID_NoConnectURL(t *testing.T) {
 	s := newCollaboratorFakeStore()
 	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
-	s.users["user-with-discord"] = makeCollaborator("user-with-discord", true) // HAS Discord ID
+	s.addUser(makeCollaborator("user-with-discord", true)) // HAS Discord ID
 
 	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
 
@@ -514,6 +564,256 @@ func TestInviteCollaborator_WithDiscordID_NoConnectURL(t *testing.T) {
 	}
 }
 
+// ─── New identifier paths (email / discord_user_id) ──────────────────────────
+
+// TestInviteCollaborator_ByEmail_CreatesUserAndReturns202 verifies that when an email is
+// provided for an unknown user, a type=collaborator user is created and 202 + connect_url
+// is returned (no Discord linked yet).
+func TestInviteCollaborator_ByEmail_CreatesUserAndReturns202(t *testing.T) {
+	s := newCollaboratorFakeStore()
+	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
+	// No pre-existing user.
+
+	sm := makeTestStateManager(t)
+	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), sm)
+
+	body := `{"email":"alice@example.com","display_name":"Alice"}`
+	req := httptest.NewRequest(http.MethodPost, "/channels/space-001/collaborators",
+		bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("want 202 for invite by email, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["job"] == nil {
+		t.Error("response must contain a job field")
+	}
+	// New collaborator has no Discord ID → connect_url must be present.
+	if resp["connect_url"] == nil {
+		t.Error("AC-2: connect_url must be present for a newly created collaborator with no Discord ID")
+	}
+
+	// Assert the collaborator user was actually created.
+	if len(s.createdUsers) != 1 {
+		t.Fatalf("expected 1 created user, got %d", len(s.createdUsers))
+	}
+	created := s.createdUsers[0]
+	if created.Type != domain.UserTypeCollaborator {
+		t.Errorf("created user must be type=collaborator, got %s", created.Type)
+	}
+	if created.Email == nil || *created.Email != "alice@example.com" {
+		t.Errorf("created user email mismatch, got %v", created.Email)
+	}
+}
+
+// TestInviteCollaborator_ByEmail_ExistingUser_Returns202 verifies that when an email matches
+// an existing user, no new user is created and 202 is returned.
+func TestInviteCollaborator_ByEmail_ExistingUser_Returns202(t *testing.T) {
+	s := newCollaboratorFakeStore()
+	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
+	email := "bob@example.com"
+	existing := &domain.User{
+		ID:        "user-bob",
+		Type:      domain.UserTypeCollaborator,
+		Email:     &email,
+		IsActive:  true,
+		CreatedAt: time.Now(),
+	}
+	s.addUser(existing)
+
+	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
+
+	body := `{"email":"bob@example.com"}`
+	req := httptest.NewRequest(http.MethodPost, "/channels/space-001/collaborators",
+		bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("want 202, got %d: %s", w.Code, w.Body.String())
+	}
+	// No new user should have been created.
+	if len(s.createdUsers) != 0 {
+		t.Errorf("must not create a new user when email matches an existing row, created %d", len(s.createdUsers))
+	}
+}
+
+// TestInviteCollaborator_ByDiscordUserID_CreatesUserAndReturns202 verifies that when a
+// discord_user_id is provided for an unknown user, a collaborator user is created and 202
+// is returned.
+func TestInviteCollaborator_ByDiscordUserID_CreatesUserAndReturns202(t *testing.T) {
+	s := newCollaboratorFakeStore()
+	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
+	// No pre-existing user.
+
+	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
+
+	body := `{"discord_user_id":"123456789012345678"}`
+	req := httptest.NewRequest(http.MethodPost, "/channels/space-001/collaborators",
+		bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("want 202 for invite by discord_user_id, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Assert the collaborator user was created with correct discord_user_id.
+	if len(s.createdUsers) != 1 {
+		t.Fatalf("expected 1 created user, got %d", len(s.createdUsers))
+	}
+	created := s.createdUsers[0]
+	if created.Type != domain.UserTypeCollaborator {
+		t.Errorf("created user must be type=collaborator, got %s", created.Type)
+	}
+	if created.DiscordUserID == nil || *created.DiscordUserID != "123456789012345678" {
+		t.Errorf("created user discord_user_id mismatch, got %v", created.DiscordUserID)
+	}
+}
+
+// TestInviteCollaborator_ByDiscordUserID_ExistingUser_Returns202 verifies that when a
+// discord_user_id matches an existing user, no new user is created.
+func TestInviteCollaborator_ByDiscordUserID_ExistingUser_Returns202(t *testing.T) {
+	s := newCollaboratorFakeStore()
+	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
+	did := "999888777666555444"
+	existing := makeCollaborator("user-existing-discord", false)
+	existing.DiscordUserID = &did
+	s.addUser(existing)
+
+	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
+
+	body := `{"discord_user_id":"999888777666555444"}`
+	req := httptest.NewRequest(http.MethodPost, "/channels/space-001/collaborators",
+		bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("want 202, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(s.createdUsers) != 0 {
+		t.Errorf("must not create a new user when discord_user_id matches an existing row, created %d", len(s.createdUsers))
+	}
+}
+
+// ─── Validation: missing identifier → 400 ────────────────────────────────────
+
+// TestInviteCollaborator_NoIdentifier_Returns400 verifies that sending a body with none
+// of user_id, discord_user_id, or email returns 400.
+func TestInviteCollaborator_NoIdentifier_Returns400(t *testing.T) {
+	s := newCollaboratorFakeStore()
+	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
+
+	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
+
+	body := `{"display_name":"NoID"}`
+	req := httptest.NewRequest(http.MethodPost, "/channels/space-001/collaborators",
+		bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("want 400 when no identifier is provided, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestInviteCollaborator_BadEmail_Returns400 verifies that a malformed email returns 400.
+func TestInviteCollaborator_BadEmail_Returns400(t *testing.T) {
+	s := newCollaboratorFakeStore()
+	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
+
+	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
+
+	body := `{"email":"not-an-email"}`
+	req := httptest.NewRequest(http.MethodPost, "/channels/space-001/collaborators",
+		bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("want 400 for malformed email, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestInviteCollaborator_NonNumericDiscordID_Returns400 verifies that a non-numeric
+// discord_user_id (not a snowflake) returns 400.
+func TestInviteCollaborator_NonNumericDiscordID_Returns400(t *testing.T) {
+	s := newCollaboratorFakeStore()
+	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
+
+	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
+
+	body := `{"discord_user_id":"not-a-snowflake"}`
+	req := httptest.NewRequest(http.MethodPost, "/channels/space-001/collaborators",
+		bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("want 400 for non-numeric discord_user_id, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestInviteCollaborator_UnsafeDisplayName_Returns400 verifies that a display_name
+// containing a Unicode bidi override character returns 400 (SEC-M3-001, SEC-M4-002).
+func TestInviteCollaborator_UnsafeDisplayName_Returns400(t *testing.T) {
+	s := newCollaboratorFakeStore()
+	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
+
+	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
+
+	// U+202E RIGHT-TO-LEFT OVERRIDE is a Cf character — must be rejected.
+	body := "{\"email\":\"user@example.com\",\"display_name\":\"evil‮name\"}"
+	req := httptest.NewRequest(http.MethodPost, "/channels/space-001/collaborators",
+		bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("want 400 for unsafe display_name (bidi override), got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ─── Idempotent re-invite ─────────────────────────────────────────────────────
+
+// TestInviteCollaborator_IdempotentReInvite_Returns202 verifies that re-inviting the same
+// collaborator to the same space (ErrConflict on CreateSpaceMember) still returns 202.
+func TestInviteCollaborator_IdempotentReInvite_Returns202(t *testing.T) {
+	s := newCollaboratorFakeStore()
+	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
+	s.addUser(makeCollaborator("user-001", true))
+	// Simulate existing membership by making CreateSpaceMember return ErrConflict.
+	s.createMemberErr = store.ErrConflict
+
+	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
+
+	body := `{"user_id":"user-001"}`
+	req := httptest.NewRequest(http.MethodPost, "/channels/space-001/collaborators",
+		bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Errorf("re-invite of same collaborator must still return 202, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // ─── AC-5: ExpelCollaborator ─────────────────────────────────────────────────
 
 // TestExpelCollaborator_NonControlPlane_Returns403 verifies FR-20 for expel.
@@ -535,7 +835,7 @@ func TestExpelCollaborator_NonControlPlane_Returns403(t *testing.T) {
 func TestExpelCollaborator_ChannelScope_Returns202(t *testing.T) {
 	s := newCollaboratorFakeStore()
 	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
-	s.users["user-001"] = makeCollaborator("user-001", true)
+	s.addUser(makeCollaborator("user-001", true))
 
 	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
 
@@ -562,7 +862,7 @@ func TestExpelCollaborator_ChannelScope_Returns202(t *testing.T) {
 func TestExpelCollaborator_ServerScope_Returns202(t *testing.T) {
 	s := newCollaboratorFakeStore()
 	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
-	s.users["user-001"] = makeCollaborator("user-001", true)
+	s.addUser(makeCollaborator("user-001", true))
 
 	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
 
@@ -581,7 +881,7 @@ func TestExpelCollaborator_ServerScope_Returns202(t *testing.T) {
 func TestExpelCollaborator_DefaultScope_IsChannel(t *testing.T) {
 	s := newCollaboratorFakeStore()
 	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
-	s.users["user-001"] = makeCollaborator("user-001", true)
+	s.addUser(makeCollaborator("user-001", true))
 
 	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
 
@@ -601,7 +901,7 @@ func TestExpelCollaborator_DefaultScope_IsChannel(t *testing.T) {
 func TestExpelCollaborator_InvalidScope_Returns400(t *testing.T) {
 	s := newCollaboratorFakeStore()
 	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
-	s.users["user-001"] = makeCollaborator("user-001", true)
+	s.addUser(makeCollaborator("user-001", true))
 
 	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
 
@@ -682,7 +982,7 @@ func TestListCollaboratorChannels_UserNotFound_Returns404(t *testing.T) {
 // space memberships gets a 200 with an items list (AC-7).
 func TestListCollaboratorChannels_ReturnsItems(t *testing.T) {
 	s := newCollaboratorFakeStore()
-	s.users["user-001"] = makeCollaborator("user-001", true)
+	s.addUser(makeCollaborator("user-001", true))
 	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
 	s.merchants["merchant-001"] = makeMerchant("merchant-001")
 
@@ -722,7 +1022,7 @@ func TestListCollaboratorChannels_ReturnsItems(t *testing.T) {
 // memberships returns 200 with an empty items array (not 404).
 func TestListCollaboratorChannels_EmptyList_Returns200(t *testing.T) {
 	s := newCollaboratorFakeStore()
-	s.users["user-no-spaces"] = makeCollaborator("user-no-spaces", true)
+	s.addUser(makeCollaborator("user-no-spaces", true))
 	// No space memberships.
 
 	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
@@ -768,7 +1068,7 @@ func TestIsolation_CollaboratorWithOverwritesOnAandC_NotB(t *testing.T) {
 	s.spaces["space-c"] = makeSpace("space-c", "merchant-c")
 
 	// CollabX is invited to merchant-A and merchant-C, but NOT merchant-B.
-	s.users["collab-x"] = makeCollaborator("collab-x", true)
+	s.addUser(makeCollaborator("collab-x", true))
 	s.members["collab-x"] = []*domain.SpaceMember{
 		{ID: "sm-xa", SpaceID: "space-a", UserID: "collab-x", Role: domain.SpaceMemberRoleCollaborator, CreatedAt: time.Now()},
 		{ID: "sm-xc", SpaceID: "space-c", UserID: "collab-x", Role: domain.SpaceMemberRoleCollaborator, CreatedAt: time.Now()},
@@ -813,7 +1113,7 @@ func TestIsolation_CollaboratorWithOverwritesOnAandC_NotB(t *testing.T) {
 // with no space_members rows receives an empty list (AC-1 zero-membership fixture).
 func TestIsolation_CollaboratorWithZeroMembers_SeesNothing(t *testing.T) {
 	s := newCollaboratorFakeStore()
-	s.users["collab-zero"] = makeCollaborator("collab-zero", true)
+	s.addUser(makeCollaborator("collab-zero", true))
 	// No space_member rows — isolation: sees nothing.
 
 	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
@@ -847,7 +1147,7 @@ func TestIsolation_CollaboratorWithZeroMembers_SeesNothing(t *testing.T) {
 func TestInviteCollaborator_NoInviteLinkCreated(t *testing.T) {
 	s := newCollaboratorFakeStore()
 	s.spaces["space-001"] = makeSpace("space-001", "merchant-001")
-	s.users["user-001"] = makeCollaborator("user-001", true)
+	s.addUser(makeCollaborator("user-001", true))
 
 	r := buildCollaboratorRouter(s, collabTestCPPrincipal(), nil)
 

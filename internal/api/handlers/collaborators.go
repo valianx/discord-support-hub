@@ -13,7 +13,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -27,14 +29,19 @@ import (
 // ─── InviteCollaborator ───────────────────────────────────────────────────────
 
 // inviteCollaboratorRequest is the JSON body for POST /channels/{id}/collaborators.
+// At least one of user_id, discord_user_id, or email must be non-empty (OpenAPI anyOf).
 type inviteCollaboratorRequest struct {
-	UserID      string  `json:"user_id"`
-	DisplayName *string `json:"display_name"`
+	UserID        string  `json:"user_id"`
+	DiscordUserID string  `json:"discord_user_id"`
+	Email         string  `json:"email"`
+	DisplayName   *string `json:"display_name"`
 }
 
 // InviteCollaborator handles POST /channels/{id}/collaborators (FR-4, AC-2, AC-4).
 //
 // Control-plane gated. Only Agents/Admins may invite (FR-20) — collaborators cannot (AC-4).
+// Accepts user_id, discord_user_id, or email to identify the collaborator; creates the user
+// row when identified by discord_user_id or email and no matching user exists.
 // Records the desired space_member row and enqueues an invite_collaborator job.
 // Returns 202 + connect_url if the user must connect Discord first (AC-2).
 func (h *Handlers) InviteCollaborator(c *gin.Context) {
@@ -60,8 +67,19 @@ func (h *Handlers) InviteCollaborator(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "validation_error", "message": err.Error()})
 		return
 	}
-	if req.UserID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"code": "validation_error", "message": "user_id is required"})
+
+	// OpenAPI anyOf: at least one identifier must be provided.
+	if req.UserID == "" && req.DiscordUserID == "" && req.Email == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    "validation_error",
+			"message": "one of user_id, discord_user_id, or email is required",
+		})
+		return
+	}
+
+	// Input hygiene — validated before any store call.
+	if msg := validateInviteInputs(&req); msg != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "validation_error", "message": msg})
 		return
 	}
 
@@ -77,16 +95,16 @@ func (h *Handlers) InviteCollaborator(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": "failed to load space"})
 		return
 	}
-	_ = sp // used for existence verification
+	_ = sp // existence verification only
 
-	// Verify user exists.
-	user, err := h.store.GetUserByID(ctx, req.UserID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"code": "not_found", "message": "user not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": "failed to load user"})
+	// Resolve the collaborator user via the three-path lookup / create flow.
+	user, httpStatus, resolveMsg := resolveOrCreateCollaborator(ctx, h.store, &req)
+	if resolveMsg != "" {
+		c.JSON(httpStatus, gin.H{"code": "not_found", "message": resolveMsg})
+		return
+	}
+	if user == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": "failed to resolve collaborator"})
 		return
 	}
 
@@ -165,6 +183,169 @@ func (h *Handlers) InviteCollaborator(c *gin.Context) {
 
 	c.Header("Location", fmt.Sprintf("/v1/jobs/%s", jobID))
 	c.JSON(http.StatusAccepted, respBody)
+}
+
+// validateInviteInputs runs input hygiene checks on a parsed invite request.
+// Returns a non-empty message when any field fails validation; empty string on success.
+func validateInviteInputs(req *inviteCollaboratorRequest) string {
+	if req.Email != "" {
+		if msg := validateEmailFormat(req.Email); msg != "" {
+			return msg
+		}
+	}
+	if req.DiscordUserID != "" {
+		if !isNumericSnowflake(req.DiscordUserID) {
+			return "discord_user_id must be a numeric snowflake"
+		}
+	}
+	if req.DisplayName != nil {
+		if msg := rejectUnsafeRunes(*req.DisplayName); msg != "" {
+			return "display_name " + msg
+		}
+	}
+	return ""
+}
+
+// validateEmailFormat performs a basic structural check on an email address.
+// It does not do DNS resolution — it enforces the presence of exactly one "@"
+// with non-empty local and domain parts, and a dot in the domain part.
+func validateEmailFormat(email string) string {
+	parts := strings.SplitN(email, "@", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "email is not a valid email address"
+	}
+	if !strings.Contains(parts[1], ".") {
+		return "email is not a valid email address"
+	}
+	// Reject control characters in the email for the same reason as display_name.
+	for _, ch := range email {
+		if ch < 0x20 || ch == 0x7F || unicode.Is(unicode.Cf, ch) || unicode.Is(unicode.Co, ch) {
+			return "email contains disallowed characters"
+		}
+	}
+	return ""
+}
+
+// isNumericSnowflake returns true when s is a non-empty string of ASCII digits only.
+// Discord snowflake IDs are 64-bit integers serialised as decimal strings.
+func isNumericSnowflake(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, ch := range s {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveOrCreateCollaborator implements the three-path user resolution for InviteCollaborator.
+//
+// Priority:
+//  1. user_id present  — GetUserByID; 404 if absent.
+//  2. discord_user_id  — GetUserByDiscordID; create type=collaborator user if not found.
+//  3. email            — GetUserByEmail; create type=collaborator user if not found.
+//
+// UNIQUE conflict on create (race condition) is resolved by re-fetching the conflicting row.
+// Returns (user, 0, "") on success; (nil, httpStatus, message) on failure.
+func resolveOrCreateCollaborator(
+	ctx context.Context,
+	s store.Store,
+	req *inviteCollaboratorRequest,
+) (*domain.User, int, string) {
+	switch {
+	case req.UserID != "":
+		return resolveByUserID(ctx, s, req.UserID)
+	case req.DiscordUserID != "":
+		return resolveOrCreateByDiscordID(ctx, s, req)
+	default:
+		return resolveOrCreateByEmail(ctx, s, req)
+	}
+}
+
+func resolveByUserID(ctx context.Context, s store.Store, userID string) (*domain.User, int, string) {
+	user, err := s.GetUserByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, http.StatusNotFound, "user not found"
+		}
+		return nil, http.StatusInternalServerError, "failed to load user"
+	}
+	return user, 0, ""
+}
+
+func resolveOrCreateByDiscordID(
+	ctx context.Context,
+	s store.Store,
+	req *inviteCollaboratorRequest,
+) (*domain.User, int, string) {
+	user, err := s.GetUserByDiscordID(ctx, req.DiscordUserID)
+	if err == nil {
+		return user, 0, ""
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return nil, http.StatusInternalServerError, "failed to look up user by discord_user_id"
+	}
+
+	// User does not exist — create a collaborator row.
+	discordID := req.DiscordUserID
+	params := store.CreateUserParams{
+		Type:          domain.UserTypeCollaborator,
+		DiscordUserID: &discordID,
+		Email:         nilIfEmpty(req.Email),
+		DisplayName:   req.DisplayName,
+	}
+	user, err = s.CreateUser(ctx, params)
+	if err == nil {
+		return user, 0, ""
+	}
+
+	// Race: another request created the same discord_user_id concurrently — re-fetch.
+	if errors.Is(err, store.ErrConflict) {
+		user, err = s.GetUserByDiscordID(ctx, req.DiscordUserID)
+		if err == nil {
+			return user, 0, ""
+		}
+		return nil, http.StatusInternalServerError, "failed to resolve collaborator after conflict"
+	}
+	return nil, http.StatusInternalServerError, "failed to create collaborator"
+}
+
+func resolveOrCreateByEmail(
+	ctx context.Context,
+	s store.Store,
+	req *inviteCollaboratorRequest,
+) (*domain.User, int, string) {
+	user, err := s.GetUserByEmail(ctx, req.Email)
+	if err == nil {
+		return user, 0, ""
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return nil, http.StatusInternalServerError, "failed to look up user by email"
+	}
+
+	// User does not exist — create a collaborator row.
+	email := req.Email
+	params := store.CreateUserParams{
+		Type:        domain.UserTypeCollaborator,
+		Email:       &email,
+		DisplayName: req.DisplayName,
+	}
+	user, err = s.CreateUser(ctx, params)
+	if err == nil {
+		return user, 0, ""
+	}
+
+	// Race: another request created the same email concurrently — re-fetch.
+	if errors.Is(err, store.ErrConflict) {
+		user, err = s.GetUserByEmail(ctx, req.Email)
+		if err == nil {
+			return user, 0, ""
+		}
+		return nil, http.StatusInternalServerError, "failed to resolve collaborator after conflict"
+	}
+	return nil, http.StatusInternalServerError, "failed to create collaborator"
 }
 
 // buildConnectURL constructs the Discord OAuth2 authorization URL with CSRF state.
